@@ -48,6 +48,8 @@ def create_sglang_fun_asr_executor(
     enable_torch_compile: bool = False,
     enable_async_decode: bool = True,
     async_decode_min_batch_size: int = 2,
+    prefill_coalesce_requests: int = 0,
+    prefill_coalesce_wait_ms: float = 60.0,
     mm_attention_backend: str | None = None,
     enable_pre_lm_encoder: bool = True,
     pre_lm_cache_max_entries: int = 4096,
@@ -170,6 +172,8 @@ def create_sglang_fun_asr_executor(
             result_adapter=result_adapter,
             enable_async_decode=enable_async_decode,
             async_decode_min_batch_size=async_decode_min_batch_size,
+            prefill_coalesce_requests=prefill_coalesce_requests,
+            prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
             request_build_max_workers=request_build_max_workers,
             request_build_max_pending=request_build_max_pending,
             shutdown_callback=(
