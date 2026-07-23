@@ -104,6 +104,7 @@ Supported Models
    :caption: Benchmarks
 
    benchmarks/relay.md
+   benchmarks/qwen3_asr_rtx4090.md
 
 
 .. toctree::
