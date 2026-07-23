@@ -29,7 +29,7 @@ documentation change does not add or duplicate those implementation files.
 | --- | --- |
 | Platform | Linux 6.8, glibc 2.39 |
 | GPU | 1× NVIDIA GeForce RTX 4090, 24,564 MiB, SM89 |
-| GPU power limit | 400 W |
+| GPU power limit | 400 W current, 480 W VBIOS default |
 | Driver / CUDA | 590.48.01 / 13.0 |
 | PyTorch | 2.11.0+cu130 |
 | SGLang | 0.5.12.post1 |
@@ -199,6 +199,9 @@ No matching Qwen3-ASR H100 Chinese reference is currently published.
 - At least 7,080 MiB was free at the recorded soak stage boundaries.
 
 Resource samples were recorded every 200 ms.
+The highest sampled draw was 235.694 W in the quality sweep and 233.099 W in
+the stability run. The benchmark did not change the pre-existing 400 W limit,
+and neither workload approached it.
 
 The 1,800-second mixed workload completed 47,486/47,486 requests with zero
 unexpected errors:
