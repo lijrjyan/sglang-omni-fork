@@ -1,6 +1,6 @@
 # [Benchmark] Validate Qwen3-ASR 1.7B on one RTX 4090
 
-## Summary
+## Motivation
 
 This publishes a reproducible Qwen3-ASR 1.7B BF16 validation on one 24 GB
 RTX 4090. The result covers full SeedTTS English and Chinese quality sweeps,
@@ -10,7 +10,7 @@ mixed workload, and bounded cleanup.
 The claim is intentionally specific to the recorded Linux environment and
 frozen source, model, and dataset revisions.
 
-## Motivation
+### Validation rationale
 
 The consumer-GPU roadmap needs at least one complete ASR result on a single
 RTX 4090 before broader profiles or architecture claims are made. Model startup
@@ -18,7 +18,7 @@ alone is insufficient: the complete colocated pipeline must also preserve
 quality, remain within 24 GB, handle error and cancellation paths, sustain a
 mixed workload, and release its resources after shutdown.
 
-## Scope
+### Scope
 
 Included:
 
@@ -53,7 +53,7 @@ reproduction commands run without those dependencies.
 - Keep the implementation dependency explicit instead of duplicating the
   profile or benchmark harness from #1154 and #1155.
 
-## Environment
+### Environment
 
 | Item | Value |
 | --- | --- |
@@ -82,6 +82,12 @@ Validated runtime settings:
 - `max_running_requests=16`;
 - `mem_fraction_static=0.65`.
 
+## Related Issues
+
+- Roadmap: #1120
+- Reference validation report: #1151
+- Follow-up implementation tracking: #1152
+
 ## Accuracy Test
 
 The full SeedTTS evaluation completed 1,088/1,088 English clips and 2,020/2,020
@@ -98,7 +104,7 @@ The result page records three measured repetitions after warmup at concurrency
 1,800-second mixed workload. The detailed tables and reproduction commands are
 in the Results and Validation sections below.
 
-## Results
+### Results
 
 All measured repetitions completed without a reported skip or benchmark error.
 English processed 1,088/1,088 clips per repetition; Chinese processed
@@ -155,7 +161,7 @@ cancellation/reconnect events passed. Final health returned HTTP 200. SIGTERM
 cleanup left no listener or GPU compute process and returned the device to
 1 MiB.
 
-## Validation
+### Validation
 
 Fresh local verification recomputed the aggregate report from the canonical
 JSON artifacts and checked:
@@ -182,7 +188,7 @@ not be uploaded as the public artifact. Raw artifacts:
 `<PUBLIC_ARTIFACT_URL>`. Replace this placeholder only with a separately
 sanitized package and its post-sanitization checksums.
 
-## Limitations
+### Limitations
 
 - This validates one exact Linux, RTX 4090, and dependency stack; it does not
   claim support for every RTX 4090 host.
@@ -197,7 +203,7 @@ sanitized package and its post-sanitization checksums.
   per-request hypotheses for independent transcript-level recomputation is a
   useful future harness improvement, not part of this result-only change.
 
-## Test plan
+### Test plan
 
 - [x] Verify locked source, model, and dataset revisions.
 - [x] Run full SeedTTS EN and ZH at concurrency `1/2/4/8/16/32`.
@@ -211,26 +217,21 @@ sanitized package and its post-sanitization checksums.
 - [x] Recompute reported aggregates from canonical JSON.
 - [x] Verify raw-artifact and publication-package checksums.
 
-## Related Issues
-
-- Roadmap: #1120
-- Reference validation report: #1151
-- Follow-up implementation tracking: #1152
-
 ## Checklist
 
-- [x] Format documentation according to the repository style.
-- [x] Keep the change scoped to benchmark documentation.
-- [x] Provide quality, throughput, latency, memory, and stability results.
-- [x] Record exact environment and immutable input revisions.
-- [x] Document limitations and avoid unsupported architecture claims.
-- [x] Exclude provider identifiers, absolute remote paths, host addresses,
-      credentials, PIDs, IPC endpoints, and request UUIDs.
-- [x] Document the #1154/#1155 implementation dependency and #1152 umbrella
-      relationship.
-- [ ] Replace `<PUBLIC_ARTIFACT_URL>` before publishing.
-- [ ] Obtain maintainer review before treating this as an official support
-      claim.
+- [x] Format your code according with pre-commit.
+- [x] Add unit tests. (Not applicable: this is a documentation-only result
+      change; the exercised benchmark harness is tracked in #1155.)
+- [x] Update documentation / docstrings / example tutorials as needed.
+- [x] Provide throughput / latency benchmark results and accuracy evaluation
+      results as needed.
+- [ ] For reviewers: If you haven't made any contributions to this PR and are
+      only assisting with merging the main branch, please remove yourself as a
+      co-author when merging the PR.
+
+Before publication, replace `<PUBLIC_ARTIFACT_URL>` with the URL and checksum
+of the separately sanitized evidence package. Maintainer review is required
+before treating this recorded result as an official support claim.
 
 ## CI
 
