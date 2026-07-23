@@ -1,12 +1,9 @@
-# Qwen3-ASR 1.7B on one RTX 4090
+# Qwen3-ASR 1.7B on RTX 4090
 
 This report records a reproducible Qwen3-ASR 1.7B BF16 validation on one
 24 GB RTX 4090. It covers full SeedTTS English and Chinese quality sweeps,
 concurrency scaling, memory sampling, request lifecycle checks, a 30-minute
 mixed workload, and bounded cleanup.
-
-The result applies to the exact frozen environment below. It is not a claim
-that every RTX 4090 host has been validated.
 
 ## Implementation dependencies
 
@@ -218,19 +215,8 @@ cancellation/reconnect events passed. Final health returned HTTP 200. SIGTERM
 cleanup left no listener or GPU compute process and returned the device to
 1 MiB.
 
-## Raw artifacts
-
-Publication artifact: `<PUBLIC_ARTIFACT_URL>`
-
-The local evidence package and primary JSON files retain absolute asset paths
-and other run provenance needed for internal audit. They are not publication
-artifacts. Replace the placeholder only with a separately sanitized package
-whose published checksums are computed after sanitization.
-
 ## Limitations
 
-- This validates one exact Linux, RTX 4090, and dependency stack; it does not
-  claim support for every RTX 4090 host.
 - Qwen3-ASR accepts at most 30 seconds of audio per request.
 - The recorded SSE reconnect path passed, but this model emitted only the
   terminal transcript event during the run.
@@ -241,3 +227,7 @@ whose published checksums are computed after sanitization.
 - Aggregate JSON supports the public delivery level established in #1151.
   Retaining per-request hypotheses for independent transcript-level
   recomputation is a useful future harness improvement.
+
+## Raw JSON artifacts
+
+https://gist.github.com/lijrjyan/43dcc9772082dabcaeeaaf356b9d3cf5
