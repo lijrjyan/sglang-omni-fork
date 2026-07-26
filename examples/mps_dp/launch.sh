@@ -1,7 +1,8 @@
 #!/bin/bash
 # Launch N serving replicas on ONE GPU behind a private CUDA MPS daemon.
 # Companion to docs/basic_usage/mps_dp.md.
-# This is a tested example, not a production process supervisor.
+# The optional lifecycle supervisor is intended for tested single-host
+# deployments. It does not replace an external cluster orchestrator.
 #
 # Usage:
 #   CONFIG=examples/mps_dp/configs/higgs_h100_dp3.yaml GPU_ID=0 N=3 \
@@ -34,6 +35,13 @@
 #     zero-copy instead of loading their own copy. The leader owns the shared
 #     storage: if replica 0 dies, followers hold dangling mappings — always
 #     bring the whole run down and restart it together (down + up).
+#   ROUTER_PORT (8799), ROUTER_POLICY (least_request), ROUTER_ENABLED (1):
+#     launch a local Omni Router over the replica pool after all startup gates.
+#   SUPERVISE: restart failed replicas through the router/KV/MPS gates. Defaults
+#     to 1 without weight sharing and 0 with WEIGHT_SHARE=1. Individual restart
+#     is intentionally forbidden for a shared-weight group.
+#   SUPERVISOR_INTERVAL (5), SUPERVISOR_FAILURE_THRESHOLD (3): runtime health
+#     polling controls.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -45,6 +53,8 @@ HEALTH_TRIES=${HEALTH_TRIES:-50}
 HEALTH_INTERVAL=${HEALTH_INTERVAL:-6}
 DRAIN_TRIES=${DRAIN_TRIES:-40}
 DRAIN_INTERVAL=${DRAIN_INTERVAL:-3}
+ROUTER_HEALTH_TRIES=${ROUTER_HEALTH_TRIES:-30}
+ROUTER_HEALTH_INTERVAL=${ROUTER_HEALTH_INTERVAL:-1}
 readonly MPS_STARTUP_TIMEOUT_SECONDS=5
 readonly MPS_STARTUP_QUERY_TIMEOUT_SECONDS=1
 readonly MPS_STARTUP_POLL_INTERVAL_SECONDS=0.2
@@ -169,9 +179,23 @@ tracked_pids() {
   echo "$out"
 }
 
+tracked_service_pids() {
+  local state=$1 out="" p pid pgid start
+  [ -f "$state/services.tsv" ] || { echo "$out"; return 0; }
+  while IFS=$'\t' read -r _ pid pgid _ start; do
+    leader_identity_matches "$pid" "$start" || continue
+    for p in $(pgrep -g "$pgid" 2>/dev/null || true); do
+      pid_is_live "$p" && out+=" $p"
+    done
+  done < "$state/services.tsv"
+  echo "$out"
+}
+
 run_is_active() {
   local state=$1 port live
   live=$(tracked_pids "$state")
+  [ -n "${live// /}" ] && return 0
+  live=$(tracked_service_pids "$state")
   [ -n "${live// /}" ] && return 0
   mps_alive "$state" && return 0
   while IFS=$'\t' read -r _ _ _ port _; do
@@ -239,12 +263,44 @@ verify_attach() {
   return $fail
 }
 
+stop_services() {
+  # Stop the supervisor before the router and replicas so teardown cannot race
+  # an automatic restart. Rows are written router-first, supervisor-last.
+  local state=$1 name pid pgid log start t live
+  [ -f "$state/services.tsv" ] || return 0
+  while IFS=$'\t' read -r name pid pgid log start; do
+    leader_identity_matches "$pid" "$start" || continue
+    echo "stopping $name (pid $pid, log $log)"
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+  done < <(tac "$state/services.tsv")
+  for ((t=1; t<=DRAIN_TRIES; t++)); do
+    live=$(tracked_service_pids "$state")
+    [ -z "${live// /}" ] && return 0
+    sleep "$DRAIN_INTERVAL"
+  done
+  echo "warning: tracked router/supervisor services survived TERM; using SIGKILL on their recorded groups" >&2
+  while IFS=$'\t' read -r _ pid pgid _ start; do
+    leader_identity_matches "$pid" "$start" || continue
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+  done < <(tac "$state/services.tsv")
+  sleep 2
+  live=$(tracked_service_pids "$state")
+  [ -z "${live// /}" ] || {
+    echo "error: tracked service pids still alive:$live" >&2
+    return 1
+  }
+}
+
 teardown_state() {
   # Note (Jiaxin Deng): these GPUs are shared; teardown only signals processes recorded
   # in this run's state, never scans the whole GPU, and keeps the state directory
   # whenever cleanup cannot be confirmed, so nothing is hidden from inspection.
   local state=$1 keep=${2:-} leader_pid pgid leader_start t live raw control_pid=""
   [ -n "$state" ] && [ -f "$state/replicas.tsv" ] || die "invalid or missing run state '$state'"
+  stop_services "$state" || {
+    echo "state kept at $state — refusing to stop replicas while their supervisor may still be active" >&2
+    return 1
+  }
   control_pid=$(mps_control_pid "$state" || true)
   while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
     leader_identity_matches "$leader_pid" "$leader_start" || continue
@@ -317,13 +373,36 @@ up() {
   local model_name=${MODEL_NAME:-}
   local gpu=${GPU_ID:-0} n=${N:-3} base_port=${BASE_PORT:-8801} mf=${MF:-}
   local weight_share=${WEIGHT_SHARE:-0}
+  local router_enabled=${ROUTER_ENABLED:-1}
+  local router_port=${ROUTER_PORT:-8799}
+  local router_policy=${ROUTER_POLICY:-least_request}
+  local supervise=${SUPERVISE:-}
+  if [ -z "$supervise" ]; then
+    if [ "$weight_share" = 1 ]; then supervise=0; else supervise=1; fi
+  fi
   [[ "$weight_share" =~ ^[01]$ ]] || die "WEIGHT_SHARE must be 0 or 1, got '$weight_share'"
+  [[ "$router_enabled" =~ ^[01]$ ]] || die "ROUTER_ENABLED must be 0 or 1, got '$router_enabled'"
+  [[ "$supervise" =~ ^[01]$ ]] || die "SUPERVISE must be 0 or 1, got '$supervise'"
   [[ "$gpu" =~ ^[0-9]+$ ]] || die "GPU_ID must be a non-negative integer, got '$gpu'"
   [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "N must be a positive integer, got '$n'"
   [[ "$base_port" =~ ^[1-9][0-9]*$ ]] \
     || die "BASE_PORT must be a positive integer, got '$base_port'"
+  [[ "$router_port" =~ ^[1-9][0-9]*$ ]] \
+    || die "ROUTER_PORT must be a positive integer, got '$router_port'"
   ((base_port + n - 1 <= 65535)) \
     || die "ports $base_port through $((base_port+n-1)) exceed 65535"
+  ((router_port <= 65535)) || die "ROUTER_PORT must not exceed 65535"
+  if [ "$router_enabled" = 1 ] && ((router_port >= base_port && router_port < base_port+n)); then
+    die "ROUTER_PORT $router_port overlaps replica ports $base_port through $((base_port+n-1))"
+  fi
+  [ "$supervise" = 0 ] || [ "$router_enabled" = 1 ] \
+    || die "SUPERVISE=1 requires ROUTER_ENABLED=1"
+  [ "$supervise" = 0 ] || [ "$weight_share" = 0 ] \
+    || die "SUPERVISE=1 is unsafe with WEIGHT_SHARE=1; restart the whole shared-weight run"
+  case "$router_policy" in
+    round_robin|least_request|random) ;;
+    *) die "ROUTER_POLICY must be round_robin, least_request, or random, got '$router_policy'" ;;
+  esac
   [ -n "${CORE_BLOCKS:-}" ] || {
     echo "CORE_BLOCKS is required: N non-overlapping blocks on the GPU's NUMA node." >&2
     echo "Cores on that node: numactl -H" >&2
@@ -407,22 +486,30 @@ up() {
       die "port $port is already in use; pick another BASE_PORT"
     fi
   done
+  if [ "$router_enabled" = 1 ] \
+    && (exec 3<> "/dev/tcp/127.0.0.1/$router_port") 2>/dev/null; then
+    exec 3>&- 3<&-
+    die "router port $router_port is already in use; pick another ROUTER_PORT"
+  fi
 
   local uuid node run state
-  uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$gpu")
-  node=$(resolve_numa "$gpu")
   # Note (Jiaxin Deng): a caller (autodp) may pin RUN_ID so it can tear down exactly
   # the run it started, instead of rediscovering the newest dir.
   # Note (Yueying Li): RUN_ID becomes a single directory component under
   # gpu-$gpu; a separator or traversal sequence would relocate run state into
   # another GPU's namespace (or out of STATE_ROOT) and bypass the
-  # active/stale-run guards above, so restrict it to a run-* basename.
+  # active/stale-run guards above, so restrict it to a run-* basename before
+  # probing hardware or creating any resource.
   run="${RUN_ID:-run-$(date +%Y%m%d-%H%M%S)-$$}"
   [[ "$run" =~ ^run-[A-Za-z0-9_-]+$ ]] \
     || die "RUN_ID must be a single 'run-<suffix>' path component ([A-Za-z0-9_-]), got '$run'"
+  uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$gpu")
+  node=$(resolve_numa "$gpu")
   state=$STATE_ROOT/gpu-$gpu/$run
   mkdir -p "$state/logs" "$state/mps/pipe" "$state/mps/log"
   : > "$state/replicas.tsv"
+  : > "$state/services.tsv"
+  printf '[]\n' > "$state/replica_specs.json"
 
   # note(ratish): Without this trap, a later replica failure leaves earlier
   # replicas and the private MPS daemon running; keep the state for diagnosis.
@@ -438,6 +525,8 @@ up() {
     echo "base_port=$base_port"; echo "core_blocks=$CORE_BLOCKS"
     echo "max_total_tokens=${expected_max_total_tokens:-auto/profiled}"
     echo "weight_share=$weight_share"
+    echo "router_enabled=$router_enabled"; echo "router_port=$router_port"
+    echo "router_policy=$router_policy"; echo "supervise=$supervise"
   } > "$state/manifest"
   if [ "$weight_share" = 1 ]; then mkdir -p "$state/ipc_weights"; chmod 700 "$state/ipc_weights"; fi
 
@@ -482,14 +571,32 @@ up() {
     # memory profiling in testing, so replicas start sequentially behind a health
     # gate; setsid gives each replica its own process group so teardown can signal
     # exactly this run's process trees.
+    local replica_cmd=(
+      numactl "--cpunodebind=$node" "--membind=$node" -C "${blocks[$i]}"
+      "${serve_cmd[@]}" "${source_args[@]}" "${model_name_args[@]}" \
+        "${mem_args[@]}" "${extra_args[@]}" \
+        --host 127.0.0.1 --port "$port"
+    )
+    local spec_args=(
+      add-replica --state "$state" --index "$i" --port "$port" --log "$log"
+      --cwd "$PWD"
+      --env "CUDA_VISIBLE_DEVICES=$uuid"
+      --env "CUDA_MPS_PIPE_DIRECTORY=$state/mps/pipe"
+      --env "CUDA_MPS_LOG_DIRECTORY=$state/mps/log"
+      --env "SGLANG_OMNI_WEIGHT_SHARE=$ws_env"
+      --env "SGLANG_OMNI_WEIGHT_SHARE_RUN_ID=$run"
+      --env "SGLANG_OMNI_STRICT_PORT=1"
+    )
+    if [ -n "$expected_max_total_tokens" ]; then
+      spec_args+=(--expected-tokens "$expected_max_total_tokens")
+    fi
+    "$PYTHON_BIN" "$SCRIPT_DIR/supervisor.py" \
+      "${spec_args[@]}" -- "${replica_cmd[@]}"
     CUDA_VISIBLE_DEVICES="$uuid" \
     SGLANG_OMNI_WEIGHT_SHARE="$ws_env" \
     SGLANG_OMNI_WEIGHT_SHARE_RUN_ID="$run" \
     SGLANG_OMNI_STRICT_PORT=1 \
-    setsid numactl --cpunodebind="$node" --membind="$node" -C "${blocks[$i]}" \
-      "${serve_cmd[@]}" "${source_args[@]}" "${model_name_args[@]}" \
-        "${mem_args[@]}" "${extra_args[@]}" \
-        --host 127.0.0.1 --port "$port" > "$log" 2>&1 < /dev/null &
+    setsid "${replica_cmd[@]}" > "$log" 2>&1 < /dev/null &
     pid=$!
     leader_start=$(pid_start_time "$pid") \
       || die "replica $i exited before its process identity could be recorded"
@@ -529,8 +636,78 @@ up() {
     echo "warning: MpsRpc errors present in replica logs; bring the run down and restart" >&2
     exit 1
   fi
+
+  local router_url=""
+  if [ "$router_enabled" = 1 ]; then
+    router_url="http://127.0.0.1:$router_port"
+    local worker_urls=()
+    for ((i=0; i<n; i++)); do
+      worker_urls+=("http://127.0.0.1:$((base_port+i))")
+    done
+    local router_log=$state/logs/router.log
+    setsid "$PYTHON_BIN" -m sglang_omni_router.serve \
+      --host 127.0.0.1 --port "$router_port" \
+      --worker-urls "${worker_urls[@]}" \
+      --policy "$router_policy" \
+      --health-failure-threshold 1 \
+      --health-success-threshold 1 \
+      --health-check-interval-secs 2 \
+      --health-check-timeout-secs 2 \
+      > "$router_log" 2>&1 < /dev/null &
+    pid=$!
+    leader_start=$(pid_start_time "$pid") \
+      || die "router exited before its process identity could be recorded"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      router "$pid" "$pid" "$router_log" "$leader_start" >> "$state/services.tsv"
+    local router_ready=0
+    for ((t=1; t<=ROUTER_HEALTH_TRIES; t++)); do
+      if ! pid_is_live "$pid"; then
+        echo "router exited during startup; last log lines:" >&2
+        tail -n 12 "$router_log" >&2
+        exit 1
+      fi
+      code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 "$router_url/ready" || true)
+      [ "$code" = 200 ] && { router_ready=1; break; }
+      sleep "$ROUTER_HEALTH_INTERVAL"
+    done
+    [ "$router_ready" = 1 ] || {
+      echo "router did not report a routable worker; last log lines:" >&2
+      tail -n 12 "$router_log" >&2
+      exit 1
+    }
+    echo "router healthy on $router_url (policy $router_policy)"
+  fi
+
+  if [ "$supervise" = 1 ]; then
+    local supervisor_log=$state/logs/supervisor.log
+    setsid "$PYTHON_BIN" "$SCRIPT_DIR/supervisor.py" run \
+      --state "$state" \
+      --launch-script "$SCRIPT_DIR/launch.sh" \
+      --router-url "$router_url" \
+      --interval-secs "${SUPERVISOR_INTERVAL:-5}" \
+      --health-failure-threshold "${SUPERVISOR_FAILURE_THRESHOLD:-3}" \
+      --health-tries "$HEALTH_TRIES" \
+      --health-interval-secs "$HEALTH_INTERVAL" \
+      > "$supervisor_log" 2>&1 < /dev/null &
+    pid=$!
+    leader_start=$(pid_start_time "$pid") \
+      || die "supervisor exited before its process identity could be recorded"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      supervisor "$pid" "$pid" "$supervisor_log" "$leader_start" >> "$state/services.tsv"
+    sleep 1
+    pid_is_live "$pid" || {
+      echo "supervisor exited during startup; last log lines:" >&2
+      tail -n 12 "$supervisor_log" >&2
+      exit 1
+    }
+    echo "replica supervisor active (interval ${SUPERVISOR_INTERVAL:-5}s, failure threshold ${SUPERVISOR_FAILURE_THRESHOLD:-3})"
+  fi
+
   trap - EXIT
   echo "up: $n replicas on GPU $gpu; token cap ${expected_max_total_tokens:-auto/profiled}; weight_share=$weight_share; state: $state"
+  if [ "$router_enabled" = 1 ]; then
+    echo "shared ingress: $router_url (policy $router_policy)"
+  fi
   if [ "$weight_share" = 1 ]; then
     echo "weight sharing is ON: replica 0 owns the shared weights — never restart replicas individually; use down + up"
   fi
