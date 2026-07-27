@@ -159,10 +159,11 @@ class ReplicaSupervisor:
         try:
             self._terminate_replica(old)
             self._wait_for_port_release(spec.port)
+            log_offset = Path(spec.log).stat().st_size if Path(spec.log).exists() else 0
             replacement = self._launch_replica(spec)
             self._replace_replica_record(replacement)
             self._wait_for_health(spec, replacement)
-            self._validate_kv_capacity(spec)
+            self._validate_kv_capacity(spec, log_offset=log_offset)
             self._verify_mps_attach()
             self._set_router_disabled(spec, False)
         except Exception as exc:
@@ -336,11 +337,19 @@ class ReplicaSupervisor:
             f"after {self.health_tries} checks"
         )
 
-    def _validate_kv_capacity(self, spec: ReplicaSpec) -> None:
+    def _validate_kv_capacity(
+        self,
+        spec: ReplicaSpec,
+        *,
+        log_offset: int = 0,
+    ) -> None:
         if spec.expected_tokens is None:
             return
         resolved: int | None = None
-        for line in Path(spec.log).read_text(errors="replace").splitlines():
+        with Path(spec.log).open("rb") as stream:
+            stream.seek(log_offset)
+            current_generation_log = stream.read().decode(errors="replace")
+        for line in current_generation_log.splitlines():
             match = re.search(r"#tokens:\s*([0-9]+)", line)
             if match is not None:
                 resolved = int(match.group(1))

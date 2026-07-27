@@ -105,7 +105,7 @@ def test_restart_gate_orders_router_kv_attach_and_registration(
     monkeypatch.setattr(
         supervisor,
         "_validate_kv_capacity",
-        lambda _spec: events.append("kv"),
+        lambda _spec, **_kwargs: events.append("kv"),
     )
     monkeypatch.setattr(
         supervisor,
@@ -205,7 +205,7 @@ def test_failed_post_launch_gate_stops_replacement_and_keeps_worker_disabled(
     monkeypatch.setattr(
         supervisor,
         "_validate_kv_capacity",
-        lambda _spec: (_ for _ in ()).throw(RuntimeError("KV mismatch")),
+        lambda _spec, **_kwargs: (_ for _ in ()).throw(RuntimeError("KV mismatch")),
     )
 
     with pytest.raises(RuntimeError, match="KV mismatch"):
@@ -232,6 +232,29 @@ def test_kv_validation_uses_replacement_generation_latest_log_entry(
 
     with pytest.raises(RuntimeError, match="resolved 2048 KV tokens"):
         supervisor._validate_kv_capacity(spec)
+
+
+def test_kv_validation_does_not_reuse_previous_generation(
+    tmp_path: Path,
+) -> None:
+    supervisor = _supervisor(tmp_path)
+    log = tmp_path / "replica_0.log"
+    old_log = "old boot #tokens: 4096,\n"
+    log.write_text(old_log + "replacement reached health without KV marker\n")
+    spec = mps_dp_supervisor.ReplicaSpec(
+        index=0,
+        port=8801,
+        log=str(log),
+        expected_tokens=4096,
+        command=["true"],
+        env={},
+    )
+
+    with pytest.raises(RuntimeError, match="resolved None KV tokens"):
+        supervisor._validate_kv_capacity(
+            spec,
+            log_offset=len(old_log.encode()),
+        )
 
 
 def test_health_failures_restart_only_after_threshold(
