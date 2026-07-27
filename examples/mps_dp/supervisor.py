@@ -650,6 +650,34 @@ def _find_port_listener(port: int) -> ReplicaRecord | None:
     return None
 
 
+def _process_command(pid: int) -> list[str] | None:
+    try:
+        fields = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    return [os.fsdecode(field) for field in fields if field]
+
+
+def _expected_replica_command(state: Path, index: int) -> list[str] | None:
+    path = state / "replica_specs.json"
+    try:
+        payload = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, PermissionError):
+        return None
+    if not isinstance(payload, list):
+        return None
+    for item in payload:
+        if not isinstance(item, dict) or item.get("index") != index:
+            continue
+        command = item.get("command")
+        if not isinstance(command, list) or not all(
+            isinstance(part, str) for part in command
+        ):
+            return None
+        return command
+    return None
+
+
 def _append_event(state: Path, event: str, **fields: Any) -> None:
     payload = {"time_unix_s": time.time(), "event": event, **fields}
     with (state / "supervisor-events.jsonl").open(
@@ -688,6 +716,29 @@ def cleanup_pending_restarts(
             target = _find_pending_wrapper(pending.token)
             if target is None:
                 target = _find_port_listener(pending.port)
+                if target is not None:
+                    expected_command = _expected_replica_command(
+                        state,
+                        pending.index,
+                    )
+                    actual_command = _process_command(target.pid)
+                    if expected_command is None or actual_command != expected_command:
+                        _append_event(
+                            state,
+                            "pending_restart_identity_refused",
+                            replica=pending.index,
+                            token=pending.token,
+                            candidate_pid=target.pid,
+                            reason="port listener command does not match replica spec",
+                        )
+                        print(
+                            "warning: refusing to terminate PID "
+                            f"{target.pid} on replica {pending.index} port "
+                            f"{pending.port}: command does not match replica spec",
+                            file=sys.stderr,
+                        )
+                        target = None
+                        break
             if target is not None:
                 target = dataclasses.replace(
                     target,

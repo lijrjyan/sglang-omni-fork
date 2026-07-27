@@ -306,8 +306,9 @@ def test_cleanup_pending_restart_removes_stale_placeholder(tmp_path: Path) -> No
 
 
 @pytest.mark.skipif(os.name != "posix", reason="/proc port ownership requires Linux")
-def test_cleanup_pending_restart_without_pid_falls_back_to_port_owner(
+def test_cleanup_pending_restart_refuses_unrelated_port_owner(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     state = tmp_path / "gpu-0" / "run-test"
     pending_dir = state / "pending-restarts"
@@ -329,6 +330,21 @@ def test_cleanup_pending_restart_without_pid_falls_back_to_port_owner(
     )
     assert process.stdout is not None
     port = int(process.stdout.readline())
+    (state / "replica_specs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "index": 0,
+                    "port": port,
+                    "log": str(state / "logs" / "replica_0.log"),
+                    "expected_tokens": None,
+                    "command": ["python", "-m", "expected_server"],
+                    "env": {},
+                    "cwd": None,
+                }
+            ]
+        )
+    )
     pending_path = pending_dir / "replica_0.json"
     pending_path.write_text(
         json.dumps(
@@ -355,7 +371,83 @@ def test_cleanup_pending_restart_without_pid_falls_back_to_port_owner(
         process.wait(timeout=5)
 
     assert cleaned == [0]
-    assert not survived_cleanup
+    assert survived_cleanup
+    assert not pending_path.exists()
+    events = [
+        json.loads(line)
+        for line in (state / "supervisor-events.jsonl").read_text().splitlines()
+    ]
+    refused = [
+        event
+        for event in events
+        if event["event"] == "pending_restart_identity_refused"
+    ]
+    assert len(refused) == 1
+    assert refused[0]["candidate_pid"] == process.pid
+    assert refused[0]["replica"] == 0
+    assert f"refusing to terminate PID {process.pid}" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="/proc port ownership requires Linux")
+def test_cleanup_pending_restart_kills_matching_port_owner(tmp_path: Path) -> None:
+    state = tmp_path / "gpu-0" / "run-test"
+    pending_dir = state / "pending-restarts"
+    pending_dir.mkdir(parents=True)
+    server_code = (
+        "import socket, time; "
+        "s=socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(); "
+        "print(s.getsockname()[1], flush=True); time.sleep(300)"
+    )
+    command = [sys.executable, "-u", "-c", server_code]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    port = int(process.stdout.readline())
+    (state / "replica_specs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "index": 0,
+                    "port": port,
+                    "log": str(state / "logs" / "replica_0.log"),
+                    "expected_tokens": None,
+                    "command": command,
+                    "env": {},
+                    "cwd": None,
+                }
+            ]
+        )
+    )
+    pending_path = pending_dir / "replica_0.json"
+    pending_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "index": 0,
+                "port": port,
+                "log": str(state / "logs" / "replica_0.log"),
+                "token": "token-not-present-in-process-command",
+                "created_unix_s": time.time() - 60,
+                "pid": None,
+                "pgid": None,
+                "leader_start": None,
+            }
+        )
+    )
+
+    try:
+        cleaned = mps_dp_supervisor.cleanup_pending_restarts(state)
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+    assert cleaned == [0]
     assert not pending_path.exists()
 
 

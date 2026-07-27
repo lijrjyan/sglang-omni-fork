@@ -77,7 +77,7 @@ Stop new traffic, then run the teardown command printed by the launcher:
 bash examples/mps_dp/launch.sh down <RUN_ID>
 ```
 
-On a shared host, only touch processes you launched, and never treat "the GPU is empty" as the success condition. The launcher first stops the recorded supervisor and router so teardown cannot race a restart. It then consumes both pending-restart and active-replica ownership records, waits for their MPS clients to detach, and stops the private MPS daemon. It keeps the run state whenever cleanup cannot be confirmed.
+On a shared host, only touch processes you launched, and never treat "the GPU is empty" as the success condition. The launcher first stops the recorded supervisor and router so teardown cannot race a restart. It then consumes both pending-restart and active-replica ownership records, waits for their MPS clients to detach, and stops the private MPS daemon. If a pre-identification pending record requires fixed-port discovery, teardown terminates the listener only when its complete command line matches that replica's recorded serve command; a different or unverifiable command is recorded and left running. It keeps the run state whenever cleanup cannot be confirmed.
 
 Setting up and tearing down MPS is more involved than running a single replica, but in the pinned H100 Higgs tests the throughput gain was substantial. The table below shows the nominal completed-run ranges; the full accounting, including the failed and degraded runs, is in the case study.
 
