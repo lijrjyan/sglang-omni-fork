@@ -6,8 +6,10 @@ import importlib.util
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -37,6 +39,17 @@ def _supervisor(tmp_path: Path):
         health_interval_secs=0.01,
     )
     return supervisor
+
+
+def test_launch_manifest_records_driver_and_host_timezone() -> None:
+    launch_text = (REPO_ROOT / "examples" / "mps_dp" / "launch.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--query-gpu=driver_version" in launch_text
+    assert 'echo "driver_version=$driver_version"' in launch_text
+    assert 'echo "host_timezone=$host_timezone"' in launch_text
+    assert 'echo "started_at=$started_at"' in launch_text
 
 
 def test_restart_gate_orders_router_kv_attach_and_registration(
@@ -85,7 +98,19 @@ def test_restart_gate_orders_router_kv_attach_and_registration(
     monkeypatch.setattr(
         supervisor,
         "_launch_replica",
-        lambda _spec: events.append("launch") or new,
+        lambda _spec, _pending: events.append("launch") or new,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_prepare_pending_restart",
+        lambda _spec: events.append("pending_prepare") or object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_clear_pending_restart",
+        lambda _pending: events.append("pending_clear"),
+        raising=False,
     )
     monkeypatch.setattr(
         supervisor,
@@ -119,8 +144,10 @@ def test_restart_gate_orders_router_kv_attach_and_registration(
         "router_disable",
         "terminate",
         "port_release",
+        "pending_prepare",
         "launch",
         "record",
+        "pending_clear",
         "health",
         "kv",
         "mps_attach",
@@ -160,14 +187,229 @@ def test_failed_restart_keeps_worker_disabled(
     monkeypatch.setattr(supervisor, "_wait_for_port_release", lambda _port: None)
     monkeypatch.setattr(
         supervisor,
+        "_prepare_pending_restart",
+        lambda _spec: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        supervisor,
         "_launch_replica",
-        lambda _spec: (_ for _ in ()).throw(RuntimeError("launch failed")),
+        lambda _spec, _pending: (_ for _ in ()).throw(RuntimeError("launch failed")),
     )
 
     with pytest.raises(RuntimeError, match="launch failed"):
         supervisor.restart_replica(spec, old)
 
     assert disabled == [True]
+
+
+def test_router_disable_failure_is_classified_as_restart_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _supervisor(tmp_path)
+    spec = mps_dp_supervisor.ReplicaSpec(
+        index=0,
+        port=8801,
+        log=str(tmp_path / "replica_0.log"),
+        expected_tokens=None,
+        command=["false"],
+        env={},
+    )
+    old = mps_dp_supervisor.ReplicaRecord(0, 101, 101, 8801, spec.log, "old")
+    recorded: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        supervisor,
+        "_set_router_disabled",
+        lambda _spec, _disabled: (_ for _ in ()).throw(
+            RuntimeError("router unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_record_event",
+        lambda event, **fields: recorded.append((event, fields)),
+    )
+
+    with pytest.raises(RuntimeError, match="router unavailable"):
+        supervisor.restart_replica(spec, old)
+
+    assert [event for event, _fields in recorded] == [
+        "restart_started",
+        "restart_failed",
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_cleanup_pending_restart_terminates_uncommitted_replacement(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "gpu-0" / "run-test"
+    pending_dir = state / "pending-restarts"
+    pending_dir.mkdir(parents=True)
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        start_new_session=True,
+    )
+    start = mps_dp_supervisor._wait_for_start_time(process.pid)
+    pending = {
+        "schema_version": 1,
+        "index": 0,
+        "port": 8801,
+        "log": str(state / "logs" / "replica_0.log"),
+        "token": "test-pending-token",
+        "created_unix_s": time.time(),
+        "pid": process.pid,
+        "pgid": process.pid,
+        "leader_start": start,
+    }
+    pending_path = pending_dir / "replica_0.json"
+    pending_path.write_text(json.dumps(pending))
+
+    try:
+        cleaned = mps_dp_supervisor.cleanup_pending_restarts(state)
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+    assert cleaned == [0]
+    assert not pending_path.exists()
+
+
+def test_cleanup_pending_restart_removes_stale_placeholder(tmp_path: Path) -> None:
+    state = tmp_path / "gpu-0" / "run-test"
+    pending_dir = state / "pending-restarts"
+    pending_dir.mkdir(parents=True)
+    pending_path = pending_dir / "replica_1.json"
+    pending_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "index": 1,
+                "port": 8802,
+                "log": str(state / "logs" / "replica_1.log"),
+                "token": "stale-token",
+                "created_unix_s": time.time() - 60,
+                "pid": None,
+                "pgid": None,
+                "leader_start": None,
+            }
+        )
+    )
+
+    assert mps_dp_supervisor.cleanup_pending_restarts(state) == [1]
+    assert not pending_path.exists()
+
+
+def test_prepare_pending_restart_refuses_unreconciled_record(tmp_path: Path) -> None:
+    supervisor = _supervisor(tmp_path)
+    pending_path = supervisor.state / "pending-restarts" / "replica_0.json"
+    pending_path.parent.mkdir(parents=True)
+    pending_path.write_text("{}")
+    spec = mps_dp_supervisor.ReplicaSpec(
+        index=0,
+        port=8801,
+        log=str(supervisor.state / "logs" / "replica_0.log"),
+        expected_tokens=None,
+        command=["false"],
+        env={},
+    )
+
+    with pytest.raises(RuntimeError, match="unreconciled pending restart"):
+        supervisor._prepare_pending_restart(spec)
+
+
+def test_supervisor_reconciles_pending_before_first_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _supervisor(tmp_path)
+    events: list[str] = []
+    monkeypatch.setattr(
+        mps_dp_supervisor,
+        "cleanup_pending_restarts",
+        lambda state: events.append(f"cleanup:{state.name}") or [],
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_record_event",
+        lambda event, **_fields: events.append(event),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "check_once",
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        supervisor.run()
+
+    assert events == ["cleanup:run-test", "supervisor_started"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="launch.sh needs a POSIX shell")
+def test_down_consumes_pending_restart_ownership(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    state = state_root / "gpu-0" / "run-test"
+    pending_dir = state / "pending-restarts"
+    pending_dir.mkdir(parents=True)
+    (state / "replicas.tsv").write_text("")
+    (state / "services.tsv").write_text("")
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        start_new_session=True,
+    )
+    start = mps_dp_supervisor._wait_for_start_time(process.pid)
+    (pending_dir / "replica_0.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "index": 0,
+                "port": 8801,
+                "log": str(state / "logs" / "replica_0.log"),
+                "token": "down-pending-token",
+                "created_unix_s": time.time(),
+                "pid": process.pid,
+                "pgid": process.pid,
+                "leader_start": start,
+            }
+        )
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "STATE_ROOT": str(state_root),
+            "PYTHON_BIN": sys.executable,
+            "DRAIN_TRIES": "1",
+            "DRAIN_INTERVAL": "0.01",
+        }
+    )
+
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "examples" / "mps_dp" / "launch.sh"),
+                "down",
+                "run-test",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        survived_down = process.poll() is None
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not survived_down
+    assert not state.exists()
 
 
 def test_failed_post_launch_gate_stops_replacement_and_keeps_worker_disabled(
@@ -198,7 +440,23 @@ def test_failed_post_launch_gate_stops_replacement_and_keeps_worker_disabled(
         "_terminate_replica",
         lambda record: terminated.append(record.pid),
     )
-    monkeypatch.setattr(supervisor, "_launch_replica", lambda _spec: replacement)
+    monkeypatch.setattr(
+        supervisor,
+        "_prepare_pending_restart",
+        lambda _spec: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_clear_pending_restart",
+        lambda _pending: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_launch_replica",
+        lambda _spec, _pending: replacement,
+    )
     monkeypatch.setattr(supervisor, "_wait_for_port_release", lambda _port: None)
     monkeypatch.setattr(supervisor, "_replace_replica_record", lambda _record: None)
     monkeypatch.setattr(supervisor, "_wait_for_health", lambda _spec, _record: None)
@@ -377,6 +635,18 @@ HTTPServer(("127.0.0.1", 0), Handler).serve_forever()
         replacement = supervisor._load_replica_records()[0]
         assert supervisor._identity_matches(replacement)
         assert supervisor._health_ok(worker_port)
+        assert not (state / "pending-restarts" / "replica_0.json").exists()
+        lifecycle_events = [
+            json.loads(line)["event"]
+            for line in (state / "supervisor-events.jsonl").read_text().splitlines()
+        ]
+        assert lifecycle_events == [
+            "restart_started",
+            "pending_restart_prepared",
+            "pending_restart_identified",
+            "pending_restart_committed",
+            "restart_completed",
+        ]
         assert router_updates == [
             {"disabled": True, "is_dead": True},
             {"disabled": False, "is_dead": False},

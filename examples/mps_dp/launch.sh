@@ -301,6 +301,10 @@ teardown_state() {
     echo "state kept at $state — refusing to stop replicas while their supervisor may still be active" >&2
     return 1
   }
+  "$PYTHON_BIN" "$SCRIPT_DIR/supervisor.py" cleanup-pending --state "$state" || {
+    echo "state kept at $state — pending replacement cleanup failed" >&2
+    return 1
+  }
   control_pid=$(mps_control_pid "$state" || true)
   while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
     leader_identity_matches "$leader_pid" "$leader_start" || continue
@@ -492,7 +496,7 @@ up() {
     die "router port $router_port is already in use; pick another ROUTER_PORT"
   fi
 
-  local uuid node run state
+  local uuid node run state driver_version host_timezone started_at
   # Note (Jiaxin Deng): a caller (autodp) may pin RUN_ID so it can tear down exactly
   # the run it started, instead of rediscovering the newest dir.
   # Note (Yueying Li): RUN_ID becomes a single directory component under
@@ -504,6 +508,9 @@ up() {
   [[ "$run" =~ ^run-[A-Za-z0-9_-]+$ ]] \
     || die "RUN_ID must be a single 'run-<suffix>' path component ([A-Za-z0-9_-]), got '$run'"
   uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$gpu")
+  driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader -i "$gpu")
+  host_timezone=$(date +'%Z %:z')
+  started_at=$(date -Is)
   node=$(resolve_numa "$gpu")
   state=$STATE_ROOT/gpu-$gpu/$run
   mkdir -p "$state/logs" "$state/mps/pipe" "$state/mps/log"
@@ -519,6 +526,8 @@ up() {
   chmod 700 "$state/mps" "$state/mps/pipe" "$state/mps/log"
   {
     echo "run_id=$run"; echo "gpu_id=$gpu"; echo "gpu_uuid=$uuid"; echo "numa_node=$node"
+    echo "driver_version=$driver_version"; echo "host_timezone=$host_timezone"
+    echo "started_at=$started_at"
     echo "config=${config:-none}"; echo "model_path=$model_path_manifest"
     echo "model_name=${model_name:-from_config}"; echo "n=$n"
     echo "mem_fraction_static_cli_override=${mf:-none}"

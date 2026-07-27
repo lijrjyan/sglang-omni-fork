@@ -19,11 +19,13 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -67,6 +69,53 @@ class ReplicaRecord:
         return (
             f"{self.index}\t{self.pid}\t{self.pgid}\t{self.port}\t"
             f"{self.log}\t{self.leader_start}\n"
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class PendingRestart:
+    schema_version: int
+    index: int
+    port: int
+    log: str
+    token: str
+    created_unix_s: float
+    pid: int | None = None
+    pgid: int | None = None
+    leader_start: str | None = None
+
+    @classmethod
+    def from_path(cls, path: Path) -> "PendingRestart":
+        payload = json.loads(path.read_text())
+        if not isinstance(payload, dict):
+            raise ValueError(f"invalid pending restart record: {path}")
+        record = cls(**payload)
+        if record.schema_version != 1:
+            raise ValueError(
+                f"unsupported pending restart schema {record.schema_version}: {path}"
+            )
+        if record.index < 0 or record.port <= 0 or not record.token:
+            raise ValueError(f"invalid pending restart identity: {path}")
+        identity = (record.pid, record.pgid, record.leader_start)
+        if any(value is not None for value in identity) and not all(
+            value is not None for value in identity
+        ):
+            raise ValueError(f"incomplete pending restart process identity: {path}")
+        return record
+
+    def to_json(self) -> str:
+        return json.dumps(dataclasses.asdict(self), indent=2, sort_keys=True) + "\n"
+
+    def as_replica_record(self) -> ReplicaRecord | None:
+        if self.pid is None or self.pgid is None or self.leader_start is None:
+            return None
+        return ReplicaRecord(
+            index=self.index,
+            pid=self.pid,
+            pgid=self.pgid,
+            port=self.port,
+            log=self.log,
+            leader_start=self.leader_start,
         )
 
 
@@ -115,6 +164,7 @@ class ReplicaSupervisor:
 
     def run(self) -> None:
         with self.singleton_lock():
+            cleanup_pending_restarts(self.state)
             self._record_event("supervisor_started")
             while True:
                 try:
@@ -154,14 +204,18 @@ class ReplicaSupervisor:
         # This process holds the singleton lock for its full lifetime. Restarts
         # therefore cannot overlap CUDA-graph capture or memory profiling.
         self._record_event("restart_started", replica=spec.index, old_pid=old.pid)
-        self._set_router_disabled(spec, True)
         replacement: ReplicaRecord | None = None
+        pending: PendingRestart | None = None
         try:
+            self._set_router_disabled(spec, True)
             self._terminate_replica(old)
             self._wait_for_port_release(spec.port)
             log_offset = Path(spec.log).stat().st_size if Path(spec.log).exists() else 0
-            replacement = self._launch_replica(spec)
+            pending = self._prepare_pending_restart(spec)
+            replacement = self._launch_replica(spec, pending)
             self._replace_replica_record(replacement)
+            self._clear_pending_restart(pending)
+            pending = None
             self._wait_for_health(spec, replacement)
             self._validate_kv_capacity(spec, log_offset=log_offset)
             self._verify_mps_attach()
@@ -172,6 +226,8 @@ class ReplicaSupervisor:
             # stop the replacement so the next check retries the full chain.
             if replacement is not None:
                 self._terminate_replica(replacement)
+            if pending is not None:
+                cleanup_pending_restarts(self.state, indices={spec.index})
             self._record_event(
                 "restart_failed",
                 replica=spec.index,
@@ -212,16 +268,46 @@ class ReplicaSupervisor:
         content = "".join(records[index].to_tsv() for index in sorted(records))
         _atomic_write_text(self.state / "replicas.tsv", content)
 
-    def _identity_matches(self, record: ReplicaRecord) -> bool:
-        if not _pid_is_live(record.pid):
-            return False
-        try:
-            pgid = os.getpgid(record.pid)
-        except ProcessLookupError:
-            return False
-        return (
-            pgid == record.pgid and _pid_start_time(record.pid) == record.leader_start
+    def _prepare_pending_restart(self, spec: ReplicaSpec) -> PendingRestart:
+        pending = PendingRestart(
+            schema_version=1,
+            index=spec.index,
+            port=spec.port,
+            log=spec.log,
+            token=uuid.uuid4().hex,
+            created_unix_s=time.time(),
         )
+        path = _pending_restart_path(self.state, spec.index)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if path.exists():
+            raise RuntimeError(
+                f"replica {spec.index} has an unreconciled pending restart"
+            )
+        _atomic_write_text(path, pending.to_json())
+        self._record_event(
+            "pending_restart_prepared",
+            replica=spec.index,
+            token=pending.token,
+        )
+        return pending
+
+    def _clear_pending_restart(self, pending: PendingRestart) -> None:
+        path = _pending_restart_path(self.state, pending.index)
+        if path.exists():
+            current = PendingRestart.from_path(path)
+            if current.token != pending.token:
+                raise RuntimeError(
+                    f"pending restart token changed for replica {pending.index}"
+                )
+            path.unlink()
+        self._record_event(
+            "pending_restart_committed",
+            replica=pending.index,
+            token=pending.token,
+        )
+
+    def _identity_matches(self, record: ReplicaRecord) -> bool:
+        return _record_identity_matches(record)
 
     def _health_ok(self, port: int) -> bool:
         try:
@@ -275,33 +361,32 @@ class ReplicaSupervisor:
             ) from exc
 
     def _terminate_replica(self, record: ReplicaRecord) -> None:
-        if not self._identity_matches(record):
-            return
-        os.killpg(record.pgid, signal.SIGTERM)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            if not self._identity_matches(record):
-                return
-            time.sleep(0.2)
-        if self._identity_matches(record):
-            os.killpg(record.pgid, signal.SIGKILL)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if not self._identity_matches(record):
-                    return
-                time.sleep(0.1)
-            raise RuntimeError(
-                f"replica {record.index} process group {record.pgid} survived SIGKILL"
-            )
+        _terminate_record(record)
 
-    def _launch_replica(self, spec: ReplicaSpec) -> ReplicaRecord:
+    def _launch_replica(
+        self,
+        spec: ReplicaSpec,
+        pending: PendingRestart,
+    ) -> ReplicaRecord:
         environment = os.environ.copy()
         environment.update(spec.env)
         log_path = Path(spec.log)
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        pending_path = _pending_restart_path(self.state, spec.index)
+        wrapper_command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "exec-replica",
+            "--pending-record",
+            str(pending_path),
+            "--token",
+            pending.token,
+            "--",
+            *spec.command,
+        ]
         with log_path.open("ab", buffering=0) as log_file:
             process = subprocess.Popen(
-                spec.command,
+                wrapper_command,
                 cwd=spec.cwd,
                 env=environment,
                 stdin=subprocess.DEVNULL,
@@ -310,13 +395,28 @@ class ReplicaSupervisor:
                 start_new_session=True,
             )
         start_time = _wait_for_start_time(process.pid)
-        return ReplicaRecord(
+        replacement = ReplicaRecord(
             index=spec.index,
             pid=process.pid,
             pgid=process.pid,
             port=spec.port,
             log=spec.log,
             leader_start=start_time,
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            recorded = PendingRestart.from_path(pending_path)
+            if recorded.token != pending.token:
+                raise RuntimeError(
+                    f"pending restart token changed for replica {spec.index}"
+                )
+            if recorded.as_replica_record() == replacement:
+                return replacement
+            if not _pid_is_live(process.pid):
+                break
+            time.sleep(0.02)
+        raise RuntimeError(
+            f"replacement replica {spec.index} did not persist its pending identity"
         )
 
     def _wait_for_health(
@@ -419,6 +519,141 @@ def _wait_for_start_time(pid: int) -> str:
     raise RuntimeError(f"replica PID {pid} exited before identity was recorded")
 
 
+def _pending_restart_path(state: Path, index: int) -> Path:
+    return state / "pending-restarts" / f"replica_{index}.json"
+
+
+def _record_identity_matches(record: ReplicaRecord) -> bool:
+    if not _pid_is_live(record.pid):
+        return False
+    try:
+        pgid = os.getpgid(record.pid)
+    except ProcessLookupError:
+        return False
+    return pgid == record.pgid and _pid_start_time(record.pid) == record.leader_start
+
+
+def _terminate_record(record: ReplicaRecord) -> None:
+    if not _record_identity_matches(record):
+        return
+    os.killpg(record.pgid, signal.SIGTERM)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if not _record_identity_matches(record):
+            return
+        time.sleep(0.1)
+    if _record_identity_matches(record):
+        os.killpg(record.pgid, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not _record_identity_matches(record):
+                return
+            time.sleep(0.05)
+        raise RuntimeError(
+            f"pending replica {record.index} process group "
+            f"{record.pgid} survived SIGKILL"
+        )
+
+
+def _find_pending_wrapper(token: str) -> ReplicaRecord | None:
+    marker = token.encode()
+    for proc_path in Path("/proc").iterdir():
+        if not proc_path.name.isdigit():
+            continue
+        try:
+            if proc_path.stat().st_uid != os.geteuid():
+                continue
+        except (FileNotFoundError, PermissionError):
+            continue
+        pid = int(proc_path.name)
+        try:
+            command = (proc_path / "cmdline").read_bytes().split(b"\0")
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if marker not in command:
+            continue
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            continue
+        start = _pid_start_time(pid)
+        if start is None:
+            continue
+        return ReplicaRecord(
+            index=-1,
+            pid=pid,
+            pgid=pgid,
+            port=0,
+            log="",
+            leader_start=start,
+        )
+    return None
+
+
+def _append_event(state: Path, event: str, **fields: Any) -> None:
+    payload = {"time_unix_s": time.time(), "event": event, **fields}
+    with (state / "supervisor-events.jsonl").open(
+        "a",
+        encoding="utf-8",
+    ) as stream:
+        stream.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def cleanup_pending_restarts(
+    state: Path,
+    *,
+    indices: set[int] | None = None,
+    identity_grace_secs: float = 2,
+) -> list[int]:
+    state = state.resolve()
+    pending_dir = state / "pending-restarts"
+    if not pending_dir.exists():
+        return []
+    cleaned: list[int] = []
+    for path in sorted(pending_dir.glob("replica_*.json")):
+        pending = PendingRestart.from_path(path)
+        if indices is not None and pending.index not in indices:
+            continue
+        remaining_grace = max(
+            0,
+            identity_grace_secs - (time.time() - pending.created_unix_s),
+        )
+        deadline = time.monotonic() + remaining_grace
+        target: ReplicaRecord | None = None
+        while True:
+            pending = PendingRestart.from_path(path)
+            target = pending.as_replica_record()
+            if target is not None and _record_identity_matches(target):
+                break
+            target = _find_pending_wrapper(pending.token)
+            if target is not None:
+                target = dataclasses.replace(
+                    target,
+                    index=pending.index,
+                    port=pending.port,
+                    log=pending.log,
+                )
+                break
+            if time.monotonic() >= deadline:
+                target = None
+                break
+            time.sleep(0.05)
+        if target is not None:
+            _terminate_record(target)
+        path.unlink(missing_ok=True)
+        _append_event(
+            state,
+            "pending_restart_cleaned",
+            replica=pending.index,
+            token=pending.token,
+            terminated_pid=target.pid if target is not None else None,
+        )
+        cleaned.append(pending.index)
+    with contextlib.suppress(OSError):
+        pending_dir.rmdir()
+    return cleaned
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     with tempfile.NamedTemporaryFile(
         "w",
@@ -432,6 +667,37 @@ def _atomic_write_text(path: Path, content: str) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     temporary_path.replace(path)
+
+
+def _exec_replica(args: argparse.Namespace) -> None:
+    pending_path = args.pending_record.resolve()
+    pending = PendingRestart.from_path(pending_path)
+    if pending.token != args.token:
+        raise RuntimeError(
+            f"pending restart token mismatch for replica {pending.index}"
+        )
+    command = args.command
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise ValueError("replacement command must not be empty")
+    pid = os.getpid()
+    identified = dataclasses.replace(
+        pending,
+        pid=pid,
+        pgid=os.getpgid(pid),
+        leader_start=_wait_for_start_time(pid),
+    )
+    _atomic_write_text(pending_path, identified.to_json())
+    _append_event(
+        pending_path.parents[1],
+        "pending_restart_identified",
+        replica=pending.index,
+        token=pending.token,
+        pid=pid,
+        pgid=identified.pgid,
+    )
+    os.execvpe(command[0], command, os.environ)
 
 
 def _add_replica(args: argparse.Namespace) -> None:
@@ -486,6 +752,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser.add_argument("--env", action="append", default=[])
     add_parser.add_argument("command", nargs=argparse.REMAINDER)
 
+    exec_parser = subparsers.add_parser("exec-replica")
+    exec_parser.add_argument("--pending-record", type=Path, required=True)
+    exec_parser.add_argument("--token", required=True)
+    exec_parser.add_argument("command", nargs=argparse.REMAINDER)
+
+    cleanup_parser = subparsers.add_parser("cleanup-pending")
+    cleanup_parser.add_argument("--state", type=Path, required=True)
+
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("--state", type=Path, required=True)
     run_parser.add_argument("--launch-script", type=Path, required=True)
@@ -502,6 +776,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command_name == "add-replica":
         _add_replica(args)
+        return
+    if args.command_name == "exec-replica":
+        _exec_replica(args)
+        return
+    if args.command_name == "cleanup-pending":
+        cleanup_pending_restarts(args.state)
         return
     supervisor = ReplicaSupervisor(
         state=args.state,
