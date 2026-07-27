@@ -590,6 +590,66 @@ def _find_pending_wrapper(token: str) -> ReplicaRecord | None:
     return None
 
 
+def _listening_socket_inodes(port: int) -> set[str]:
+    inodes: set[str] = set()
+    for table_path in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        try:
+            lines = table_path.read_text().splitlines()[1:]
+        except (FileNotFoundError, PermissionError):
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) <= 9 or fields[3] != "0A":
+                continue
+            try:
+                local_port = int(fields[1].rsplit(":", 1)[1], 16)
+            except (IndexError, ValueError):
+                continue
+            if local_port == port:
+                inodes.add(fields[9])
+    return inodes
+
+
+def _find_port_listener(port: int) -> ReplicaRecord | None:
+    socket_targets = {f"socket:[{inode}]" for inode in _listening_socket_inodes(port)}
+    if not socket_targets:
+        return None
+    for proc_path in Path("/proc").iterdir():
+        if not proc_path.name.isdigit():
+            continue
+        try:
+            if proc_path.stat().st_uid != os.geteuid():
+                continue
+        except (FileNotFoundError, PermissionError):
+            continue
+        pid = int(proc_path.name)
+        try:
+            descriptors = (proc_path / "fd").iterdir()
+            owns_listener = any(
+                os.readlink(descriptor) in socket_targets for descriptor in descriptors
+            )
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if not owns_listener:
+            continue
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            continue
+        start = _pid_start_time(pid)
+        if start is None:
+            continue
+        return ReplicaRecord(
+            index=-1,
+            pid=pid,
+            pgid=pgid,
+            port=port,
+            log="",
+            leader_start=start,
+        )
+    return None
+
+
 def _append_event(state: Path, event: str, **fields: Any) -> None:
     payload = {"time_unix_s": time.time(), "event": event, **fields}
     with (state / "supervisor-events.jsonl").open(
@@ -626,6 +686,8 @@ def cleanup_pending_restarts(
             if target is not None and _record_identity_matches(target):
                 break
             target = _find_pending_wrapper(pending.token)
+            if target is None:
+                target = _find_port_listener(pending.port)
             if target is not None:
                 target = dataclasses.replace(
                     target,

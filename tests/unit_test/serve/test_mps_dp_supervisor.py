@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -302,6 +303,130 @@ def test_cleanup_pending_restart_removes_stale_placeholder(tmp_path: Path) -> No
 
     assert mps_dp_supervisor.cleanup_pending_restarts(state) == [1]
     assert not pending_path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="/proc port ownership requires Linux")
+def test_cleanup_pending_restart_without_pid_falls_back_to_port_owner(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "gpu-0" / "run-test"
+    pending_dir = state / "pending-restarts"
+    pending_dir.mkdir(parents=True)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import socket, time; "
+                "s=socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(); "
+                "print(s.getsockname()[1], flush=True); time.sleep(300)"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    port = int(process.stdout.readline())
+    pending_path = pending_dir / "replica_0.json"
+    pending_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "index": 0,
+                "port": port,
+                "log": str(state / "logs" / "replica_0.log"),
+                "token": "token-not-present-in-process-command",
+                "created_unix_s": time.time() - 60,
+                "pid": None,
+                "pgid": None,
+                "leader_start": None,
+            }
+        )
+    )
+
+    try:
+        cleaned = mps_dp_supervisor.cleanup_pending_restarts(state)
+        survived_cleanup = process.poll() is None
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+
+    assert cleaned == [0]
+    assert not survived_cleanup
+    assert not pending_path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fault injection requires fork")
+def test_crash_mid_restart_leaves_teardown_owned_replacement(tmp_path: Path) -> None:
+    supervisor = _supervisor(tmp_path)
+    state = supervisor.state
+    log = state / "logs" / "replica_0.log"
+    old = mps_dp_supervisor.ReplicaRecord(
+        0,
+        999999,
+        999999,
+        8801,
+        str(log),
+        "old",
+    )
+    (state / "replicas.tsv").write_text(old.to_tsv())
+    spec = mps_dp_supervisor.ReplicaSpec(
+        index=0,
+        port=8801,
+        log=str(log),
+        expected_tokens=None,
+        command=[sys.executable, "-c", "import time; time.sleep(300)"],
+        env={},
+    )
+
+    supervisor_pid = os.fork()
+    if supervisor_pid == 0:
+        try:
+            child_supervisor = _supervisor(tmp_path)
+            child_supervisor._set_router_disabled = lambda _spec, _disabled: None
+            child_supervisor._terminate_replica = lambda _record: None
+            child_supervisor._wait_for_port_release = lambda _port: None
+            child_supervisor._replace_replica_record = lambda _record: time.sleep(300)
+            child_supervisor.restart_replica(spec, old)
+        finally:
+            os._exit(1)
+
+    pending_path = state / "pending-restarts" / "replica_0.json"
+    replacement_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if pending_path.exists():
+                pending = json.loads(pending_path.read_text())
+                if pending.get("pid") is not None:
+                    replacement_pid = int(pending["pid"])
+                    break
+            time.sleep(0.02)
+        assert replacement_pid is not None
+        assert mps_dp_supervisor._pid_is_live(replacement_pid)
+        assert (state / "replicas.tsv").read_text() == old.to_tsv()
+
+        os.kill(supervisor_pid, signal.SIGKILL)
+        os.waitpid(supervisor_pid, 0)
+        supervisor_pid = -1
+
+        assert mps_dp_supervisor._pid_is_live(replacement_pid)
+        assert mps_dp_supervisor.cleanup_pending_restarts(state) == [0]
+        assert not mps_dp_supervisor._pid_is_live(replacement_pid)
+        assert not pending_path.exists()
+    finally:
+        if supervisor_pid > 0:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(supervisor_pid, signal.SIGKILL)
+            os.waitpid(supervisor_pid, 0)
+        if replacement_pid is not None and mps_dp_supervisor._pid_is_live(
+            replacement_pid
+        ):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(replacement_pid, signal.SIGKILL)
 
 
 def test_prepare_pending_restart_refuses_unreconciled_record(tmp_path: Path) -> None:
