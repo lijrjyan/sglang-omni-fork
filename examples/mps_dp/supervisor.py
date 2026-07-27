@@ -15,7 +15,9 @@ import dataclasses
 import fcntl
 import json
 import os
+import re
 import signal
+import socket
 import subprocess
 import tempfile
 import time
@@ -156,6 +158,7 @@ class ReplicaSupervisor:
         replacement: ReplicaRecord | None = None
         try:
             self._terminate_replica(old)
+            self._wait_for_port_release(spec.port)
             replacement = self._launch_replica(spec)
             self._replace_replica_record(replacement)
             self._wait_for_health(spec, replacement)
@@ -228,6 +231,18 @@ class ReplicaSupervisor:
                 return 200 <= response.status < 300
         except (OSError, urllib.error.URLError):
             return False
+
+    def _wait_for_port_release(self, port: int) -> None:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                try:
+                    probe.bind(("127.0.0.1", port))
+                except OSError:
+                    time.sleep(0.2)
+                    continue
+                return
+        raise TimeoutError(f"replica port {port} did not become available")
 
     def _set_router_disabled(self, spec: ReplicaSpec, disabled: bool) -> None:
         worker_url = f"http://127.0.0.1:{spec.port}"
@@ -326,12 +341,9 @@ class ReplicaSupervisor:
             return
         resolved: int | None = None
         for line in Path(spec.log).read_text(errors="replace").splitlines():
-            marker = "#tokens:"
-            if marker not in line:
-                continue
-            suffix = line.split(marker, 1)[1].strip().split()[0]
-            if suffix.isdigit():
-                resolved = int(suffix)
+            match = re.search(r"#tokens:\s*([0-9]+)", line)
+            if match is not None:
+                resolved = int(match.group(1))
         if resolved != spec.expected_tokens:
             raise RuntimeError(
                 f"replica {spec.index} resolved {resolved!r} KV tokens; "

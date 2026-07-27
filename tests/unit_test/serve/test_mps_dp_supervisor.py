@@ -89,6 +89,11 @@ def test_restart_gate_orders_router_kv_attach_and_registration(
     )
     monkeypatch.setattr(
         supervisor,
+        "_wait_for_port_release",
+        lambda _port: events.append("port_release"),
+    )
+    monkeypatch.setattr(
+        supervisor,
         "_replace_replica_record",
         lambda _record: events.append("record"),
     )
@@ -113,6 +118,7 @@ def test_restart_gate_orders_router_kv_attach_and_registration(
     assert events == [
         "router_disable",
         "terminate",
+        "port_release",
         "launch",
         "record",
         "health",
@@ -151,6 +157,7 @@ def test_failed_restart_keeps_worker_disabled(
         lambda _spec, value: disabled.append(value),
     )
     monkeypatch.setattr(supervisor, "_terminate_replica", lambda _record: None)
+    monkeypatch.setattr(supervisor, "_wait_for_port_release", lambda _port: None)
     monkeypatch.setattr(
         supervisor,
         "_launch_replica",
@@ -192,6 +199,7 @@ def test_failed_post_launch_gate_stops_replacement_and_keeps_worker_disabled(
         lambda record: terminated.append(record.pid),
     )
     monkeypatch.setattr(supervisor, "_launch_replica", lambda _spec: replacement)
+    monkeypatch.setattr(supervisor, "_wait_for_port_release", lambda _port: None)
     monkeypatch.setattr(supervisor, "_replace_replica_record", lambda _record: None)
     monkeypatch.setattr(supervisor, "_wait_for_health", lambda _spec, _record: None)
     monkeypatch.setattr(
@@ -212,7 +220,7 @@ def test_kv_validation_uses_replacement_generation_latest_log_entry(
 ) -> None:
     supervisor = _supervisor(tmp_path)
     log = tmp_path / "replica_0.log"
-    log.write_text("old boot #tokens: 4096\nnew boot #tokens: 2048\n")
+    log.write_text("old boot #tokens: 4096,\nnew boot #tokens: 2048,\n")
     spec = mps_dp_supervisor.ReplicaSpec(
         index=0,
         port=8801,
