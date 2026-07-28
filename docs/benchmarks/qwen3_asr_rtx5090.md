@@ -1,8 +1,8 @@
 # Qwen3-ASR 1.7B on one RTX 5090
 
-This page records an independent Qwen3-ASR 1.7B BF16 validation on one
-32 GB RTX 5090. It covers full SeedTTS English and Chinese quality sweeps,
-concurrency scaling, long audio, memory and power sampling, request lifecycle
+This page records an independent Qwen3-ASR 1.7B BF16 profile on one 32 GB
+RTX 5090. The profile evidence covers full SeedTTS English and Chinese quality
+sweeps, concurrency scaling, memory and power sampling, request lifecycle
 checks, a 30-minute mixed workload, and bounded cleanup.
 
 The complete benchmark report and exit criteria are recorded in #1212. This
@@ -55,19 +55,16 @@ Launch the colocated pipeline:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 sgl-omni serve \
-  --config examples/configs/qwen3_asr_rtx4090.yaml \
+  --config examples/configs/qwen3_asr_rtx5090.yaml \
   --model-path /path/to/Qwen3-ASR-1.7B \
   --model-name Qwen/Qwen3-ASR-1.7B \
   --host 127.0.0.1 \
-  --port 8000 \
-  --mem-fraction-static 0.65 \
-  --max-running-requests 16 \
-  --cuda-graph-max-bs 16
+  --port 8000
 ```
 
-The profile filename reflects its original 24 GB target. On the tested RTX
-5090, startup logs must report SM120 with FlashInfer and Triton rather than
-selecting an SM100-specific policy.
+The example configuration contains the validated memory, admission, and CUDA
+Graph limits. Startup logs must report SM120 with FlashInfer and Triton rather
+than selecting an SM100-specific policy.
 
 ## Quality and performance
 
@@ -102,30 +99,19 @@ the 0.0122 H100 BF16 reference reported in #1151.
 The complete 2,020-clip ZH quality range was 0.0063–0.0065. No matching
 published H100 Qwen3-ASR ZH reference is available.
 
-## Long audio
+## Long-audio evidence (not qualified)
 
-Post-#1176/#1193 validation used the unmodified
-`distil-whisper/librispeech_long` source cropped to 29.9, 30.1, 31, and
-60 seconds. `max_new_tokens=512` isolated input preservation from the
-128-token stage default.
-
-- 31 seconds: 3/3 HTTP 200 with the same 444-character, 80-word transcript;
-  warm latency was 0.648–0.661 seconds.
-- 60 seconds: 3/3 HTTP 200 with the same 812-character, 145-word transcript;
-  warm latency was 1.230–1.236 seconds.
-- 31- and 60-second concurrency `c=1/2/4/8`, three repeats per cell:
-  zero request errors, zero timeouts, and deterministic transcripts.
-- 124.91 seconds with the default 128-token output budget: 3/3 actionable
-  HTTP 400 responses before preprocessing because
-  `1637 prompt/audio tokens + 128 max_new_tokens > 1636`.
-- Long-audio concurrency cells recorded 22,932 MiB before and after cooldown,
-  with no retained-memory delta.
+Post-#1176/#1193 runs produced deterministic transcripts at 31 and 60 seconds,
+including concurrency `c=1/2/4/8`, with zero request errors or timeouts. A
+124.91-second request exceeded the configured context budget and returned an
+actionable HTTP 400 before preprocessing.
 
 The 29.9- and 30.1-second fixtures each returned 3/3 HTTP 200 but produced the
-same 427-character, 76-word transcript. The exact 30.1-second boundary fixture
-therefore did not independently prove recognizable content after 30.0
-seconds; that boundary case remains tracked by #1173 and is not an RTX 5090
-profile failure.
+same transcript. The independent verifier therefore records `REQUEST CHANGES`
+for `missing_30s_boundary_evidence`: this fixture did not prove recognizable
+content strictly after 30.0 seconds. This profile does not qualify long-audio
+correctness; #1173 tracks that contract. The 31- and 60-second observations are
+auxiliary evidence, not grounds for overriding the failed hard gate.
 
 ## Memory, startup, and stability
 
@@ -170,9 +156,10 @@ returned HTTP 200.
   transcription.
 - Three lifecycle cycles left no listener, descendant process, or GPU process.
 
-Behavior cards B01–B08 passed. B06 safely bounded an intentionally oversized
-CUDA Graph request from batch 8192 to 4096 without emitting a warning. The
-validated profile itself uses graph batches only through 16.
+Behavior cards B01–B05 and B07–B08 passed. B06 is conditional: it safely
+bounded an intentionally oversized CUDA Graph request from batch 8192 to 4096
+but emitted no reduction warning. The validated profile itself uses graph
+batches only through 16.
 
 ## Test evidence
 
@@ -181,12 +168,16 @@ validated profile itself uses graph batches only through 16.
   non-root user and passed 1/1.
 - FishAudio/dependency contracts: 46 passed.
 - Publication archive replay: 107/107 SHA256 entries passed.
+- Independent verifier: 11/12 hard gates passed; the long-audio boundary gate
+  records `REQUEST CHANGES`.
 
 ## Limitations
 
 - This validates BF16 on one RTX 5090/SM120 host. It does not validate NVFP4,
   FP8, quantization, TP, DP, multi-GPU, Windows, or WSL.
 - Concurrency 32 is queueing stress above the 16-request resident limit.
+- Long-audio correctness beyond 30 seconds is not qualified; the independent
+  verifier records `missing_30s_boundary_evidence`.
 - B06 bounded the oversized graph request without emitting a warning.
 - The recorded SSE path emitted only a terminal transcript event. Incremental
   partial-transcript cadence remains blocked by the current upstream

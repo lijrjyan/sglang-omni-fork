@@ -88,6 +88,7 @@ tests/
     │   ├── test_reference_encode.py
     │   └── test_request_builders.py
     ├── qwen3_asr/
+    │   ├── test_profile_config.py
     │   ├── test_pipeline.py
     │   └── test_request_builders.py
     ├── fun_asr/
@@ -377,6 +378,7 @@ that happened to contain an older version of the test.
     and deadlock-free), and concurrent remove_if/put state integrity.
 - `unit_test/qwen3_asr/`: Qwen3-ASR unit tests:
   - pipeline config and stage factory concurrency defaults
+  - checked-in RTX 5090 profile loading and runtime override resolution
   - single-source audio token length formula used by both processor and
     request builder paths
   - token-level result adapter marker handling, avoiding decode/encode
