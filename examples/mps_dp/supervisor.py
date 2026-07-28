@@ -141,6 +141,7 @@ class ReplicaSupervisor:
         self.health_tries = health_tries
         self.health_interval_secs = health_interval_secs
         self._health_failures: dict[int, int] = {}
+        self._last_attempted_index: int | None = None
 
     @contextlib.contextmanager
     def singleton_lock(self) -> Iterator[None]:
@@ -178,7 +179,7 @@ class ReplicaSupervisor:
 
     def check_once(self) -> None:
         records = self._load_replica_records()
-        for spec in self._load_specs():
+        for spec in self._sweep_order(self._load_specs()):
             record = records.get(spec.index)
             healthy = (
                 record is not None
@@ -196,9 +197,29 @@ class ReplicaSupervisor:
 
             if record is None:
                 raise RuntimeError(f"replica {spec.index} has no process record")
+            # Record the attempt before it can raise: a sweep aborted by a failed
+            # restart must still resume at the next replica, or one permanently
+            # unrestartable member starves every other member behind it.
+            self._last_attempted_index = spec.index
             self.restart_replica(spec, record)
             self._health_failures[spec.index] = 0
             records[spec.index] = self._load_replica_records()[spec.index]
+
+    def _sweep_order(self, specs: list[ReplicaSpec]) -> list[ReplicaSpec]:
+        # Round-robin: resume at the replica after the last one this supervisor
+        # attempted to restart, so repeated failures rotate instead of pinning
+        # every sweep to the lowest index.
+        if self._last_attempted_index is None:
+            return specs
+        offset = next(
+            (
+                position + 1
+                for position, spec in enumerate(specs)
+                if spec.index == self._last_attempted_index
+            ),
+            0,
+        )
+        return specs[offset:] + specs[:offset]
 
     def restart_replica(self, spec: ReplicaSpec, old: ReplicaRecord) -> None:
         # This process holds the singleton lock for its full lifetime. Restarts
@@ -218,7 +239,7 @@ class ReplicaSupervisor:
             pending = None
             self._wait_for_health(spec, replacement)
             self._validate_kv_capacity(spec, log_offset=log_offset)
-            self._verify_mps_attach()
+            self._verify_mps_attach(spec)
             self._set_router_disabled(spec, False)
         except Exception as exc:
             # A healthy HTTP endpoint is not sufficient to re-enter the pool.
@@ -459,11 +480,27 @@ class ReplicaSupervisor:
                 f"expected {spec.expected_tokens}"
             )
 
-    def _verify_mps_attach(self) -> None:
+    def _attach_scope(self, spec: ReplicaSpec) -> list[int]:
+        # The restarting replica is always gated. Peers are gated only while
+        # they are live and healthy: a peer that is dead or being replaced has
+        # no process group left to match an MPS client, so including it would
+        # make the gate structurally unpassable whenever more than one replica
+        # is down. An unexpectedly detached HEALTHY peer is still in scope and
+        # still fails the gate, so the single-fault property is unchanged.
+        scope = {spec.index}
+        for index, record in self._load_replica_records().items():
+            if index == spec.index:
+                continue
+            if self._identity_matches(record) and self._health_ok(record.port):
+                scope.add(index)
+        return sorted(scope)
+
+    def _verify_mps_attach(self, spec: ReplicaSpec) -> None:
         environment = os.environ.copy()
         environment["STATE_ROOT"] = str(self.state.parents[1])
+        scope = ",".join(str(index) for index in self._attach_scope(spec))
         result = subprocess.run(
-            ["bash", str(self.launch_script), "verify", self.state.name],
+            ["bash", str(self.launch_script), "verify", self.state.name, scope],
             env=environment,
             capture_output=True,
             text=True,

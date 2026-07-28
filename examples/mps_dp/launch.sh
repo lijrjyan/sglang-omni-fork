@@ -12,7 +12,10 @@
 #     CORE_BLOCKS="0-9 10-19 20-29" \
 #     bash examples/mps_dp/launch.sh up
 #   bash examples/mps_dp/launch.sh list
-#   bash examples/mps_dp/launch.sh verify [RUN_ID]
+#   bash examples/mps_dp/launch.sh verify [RUN_ID] [REPLICA_INDICES]
+#     REPLICA_INDICES: optional comma-separated subset to gate on. Replicas
+#     outside the subset are still mapped into the artifact but cannot fail the
+#     check, so a restart can be gated without members that are known dead.
 #   bash examples/mps_dp/launch.sh down [RUN_ID]
 #
 # Environment for `up` (defaults in parentheses):
@@ -49,6 +52,7 @@ STATE_ROOT=${STATE_ROOT:-/tmp/sglang-omni-same-gpu-dp/$UID}
 PYTHON_BIN=${PYTHON_BIN:-python}
 CMD=${1:-}
 RUN_ARG=${2:-}
+REPLICAS_ARG=${3:-}
 HEALTH_TRIES=${HEALTH_TRIES:-50}
 HEALTH_INTERVAL=${HEALTH_INTERVAL:-6}
 DRAIN_TRIES=${DRAIN_TRIES:-40}
@@ -218,8 +222,13 @@ mps_clients() {
 }
 
 verify_attach() {
-  local state=$1
+  # The optional index subset scopes the pass/fail decision only: every replica
+  # is still mapped into the artifact, but members outside the subset (killed,
+  # disabled, or mid-restart) cannot fail a check they structurally cannot pass.
+  local state=$1 scope=${2:-}
   [ -n "$state" ] && [ -f "$state/replicas.tsv" ] || die "invalid or missing run state '$state'"
+  local scoped=" "
+  [ -n "$scope" ] && scoped=" $(echo "$scope" | tr ',' ' ') "
   local art="$state/mps_attach.txt" fail=0 raw entry srv cl all=" " idx pid pgid port log
   : > "$art"
   if ! raw=$(mps_clients "$state"); then
@@ -246,6 +255,12 @@ verify_attach() {
   done
   while IFS=$'\t' read -r idx pid pgid port log; do
     local expected matched="" p
+    if [ "$scoped" != " " ]; then
+      case "$scoped" in
+        *" $idx "*) ;;
+        *) echo "replica $idx (port $port): out of verification scope" >> "$art"; continue;;
+      esac
+    fi
     expected=$(pgrep -g "$pgid" 2>/dev/null || true)
     for p in $expected; do
       case "$all" in *" $p "*) matched+="$p ";; esac
@@ -726,7 +741,7 @@ up() {
 case "$CMD" in
   up) up ;;
   down) st=$(resolve_state "$RUN_ARG") || exit 1; teardown_state "$st" ;;
-  verify) st=$(resolve_state "$RUN_ARG") || exit 1; verify_attach "$st" ;;
+  verify) st=$(resolve_state "$RUN_ARG") || exit 1; verify_attach "$st" "$REPLICAS_ARG" ;;
   list) find_runs ;;
-  *) die "usage: launch.sh up|down [RUN_ID]|verify [RUN_ID]|list" ;;
+  *) die "usage: launch.sh up|down [RUN_ID]|verify [RUN_ID] [REPLICA_INDICES]|list" ;;
 esac

@@ -136,7 +136,7 @@ def test_restart_gate_orders_router_kv_attach_and_registration(
     monkeypatch.setattr(
         supervisor,
         "_verify_mps_attach",
-        lambda: events.append("mps_attach"),
+        lambda _spec: events.append("mps_attach"),
     )
 
     supervisor.restart_replica(spec, old)
@@ -769,6 +769,164 @@ def test_health_failures_restart_only_after_threshold(
 
     supervisor.check_once()
     assert restarts == [0]
+
+
+def _replica_pair(tmp_path: Path):
+    specs = [
+        mps_dp_supervisor.ReplicaSpec(
+            index=index,
+            port=8801 + index,
+            log=str(tmp_path / f"replica_{index}.log"),
+            expected_tokens=None,
+            command=["python", "-m", "fake_server"],
+            env={},
+        )
+        for index in (0, 1)
+    ]
+    records = {
+        spec.index: mps_dp_supervisor.ReplicaRecord(
+            index=spec.index,
+            pid=101 + spec.index,
+            pgid=101 + spec.index,
+            port=spec.port,
+            log=spec.log,
+            leader_start="old-start",
+        )
+        for spec in specs
+    }
+    return specs, records
+
+
+def test_double_fault_restarts_both_replicas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round 4 livelock scenario: both replicas die at once, so every attach
+    # verification runs while a peer is dead. Both replicas must recover.
+    supervisor = _supervisor(tmp_path)
+    attached = tmp_path / "attached.txt"
+    attached.write_text("")
+    # Emulates launch.sh verify: a scoped replica with no attached MPS client
+    # fails the gate. Replicas outside the scope cannot fail it.
+    script = tmp_path / "verify.sh"
+    script.write_text(
+        "#!/bin/bash\n"
+        f'attached=" $(cat {attached}) "\n'
+        'for idx in $(echo "$3" | tr "," " "); do\n'
+        '  case "$attached" in\n'
+        '    *" $idx "*) ;;\n'
+        '    *) echo "replica $idx has no attached MPS client" >&2; exit 1;;\n'
+        "  esac\ndone\nexit 0\n"
+    )
+    script.chmod(0o755)
+    supervisor.launch_script = script
+    specs, records = _replica_pair(tmp_path)
+    healthy: set[int] = set()
+    attempts: list[int] = []
+
+    def fake_restart(spec, _record) -> None:
+        # The replacement process is up and attached; the peer may still be dead.
+        attempts.append(spec.index)
+        live = sorted(healthy | {spec.index})
+        attached.write_text(" ".join(str(index) for index in live))
+        supervisor._verify_mps_attach(spec)
+        healthy.add(spec.index)
+
+    monkeypatch.setattr(supervisor, "_load_specs", lambda: specs)
+    monkeypatch.setattr(supervisor, "_load_replica_records", lambda: dict(records))
+    monkeypatch.setattr(supervisor, "_identity_matches", lambda _record: True)
+    monkeypatch.setattr(
+        supervisor,
+        "_health_ok",
+        lambda port: (port - 8801) in healthy,
+    )
+    monkeypatch.setattr(supervisor, "restart_replica", fake_restart)
+
+    for _ in range(12):
+        with contextlib.suppress(RuntimeError):
+            supervisor.check_once()
+        if healthy == {0, 1}:
+            break
+
+    assert healthy == {0, 1}
+    assert set(attempts) == {0, 1}
+
+
+def test_sweep_rotates_after_a_failed_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _supervisor(tmp_path)
+    specs, records = _replica_pair(tmp_path)
+    attempts: list[int] = []
+
+    def always_fails(spec, _record) -> None:
+        attempts.append(spec.index)
+        raise RuntimeError("MPS attach verification failed")
+
+    monkeypatch.setattr(supervisor, "_load_specs", lambda: specs)
+    monkeypatch.setattr(supervisor, "_load_replica_records", lambda: dict(records))
+    monkeypatch.setattr(supervisor, "_identity_matches", lambda _record: True)
+    monkeypatch.setattr(supervisor, "_health_ok", lambda _port: False)
+    monkeypatch.setattr(supervisor, "restart_replica", always_fails)
+
+    # First sweep only accrues a health failure; each later sweep attempts one
+    # replica and aborts, so the attempts must alternate rather than pin to 0.
+    for _ in range(5):
+        with contextlib.suppress(RuntimeError):
+            supervisor.check_once()
+
+    assert attempts == [0, 1, 0, 1]
+
+
+def _scope_probe_script(tmp_path: Path, detached_index: int) -> Path:
+    script = tmp_path / "verify.sh"
+    script.write_text(
+        "#!/bin/bash\n"
+        'case " $(echo "$3" | tr "," " ") " in\n'
+        f'  *" {detached_index} "*)\n'
+        f'    echo "replica {detached_index} has no process in the MPS client list"'
+        " >&2; exit 1;;\nesac\nexit 0\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
+def test_attach_gate_still_detects_a_detached_healthy_peer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _supervisor(tmp_path)
+    supervisor.launch_script = _scope_probe_script(tmp_path, 1)
+    specs, records = _replica_pair(tmp_path)
+    monkeypatch.setattr(supervisor, "_load_specs", lambda: specs)
+    monkeypatch.setattr(supervisor, "_load_replica_records", lambda: dict(records))
+    monkeypatch.setattr(supervisor, "_identity_matches", lambda _record: True)
+    monkeypatch.setattr(supervisor, "_health_ok", lambda _port: True)
+
+    assert supervisor._attach_scope(specs[0]) == [0, 1]
+    with pytest.raises(RuntimeError, match="MPS attach verification failed"):
+        supervisor._verify_mps_attach(specs[0])
+
+
+def test_attach_gate_scope_excludes_a_dead_peer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _supervisor(tmp_path)
+    supervisor.launch_script = _scope_probe_script(tmp_path, 1)
+    specs, records = _replica_pair(tmp_path)
+    monkeypatch.setattr(supervisor, "_load_specs", lambda: specs)
+    monkeypatch.setattr(supervisor, "_load_replica_records", lambda: dict(records))
+    monkeypatch.setattr(
+        supervisor,
+        "_identity_matches",
+        lambda record: record.index == 0,
+    )
+    monkeypatch.setattr(supervisor, "_health_ok", lambda port: port == 8801)
+
+    assert supervisor._attach_scope(specs[0]) == [0]
+    supervisor._verify_mps_attach(specs[0])
 
 
 def test_singleton_lock_rejects_second_supervisor(tmp_path: Path) -> None:
