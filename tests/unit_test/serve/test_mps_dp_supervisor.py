@@ -1234,3 +1234,375 @@ def test_terminate_cleans_group_whose_leader_is_an_unreaped_zombie(
 
     assert leader_is_zombie
     assert not child_survived
+
+
+def _spawn_reapable_group(
+    tmp_path: Path,
+    *,
+    second_child: bool = False,
+    env_token: str | None = None,
+) -> tuple[subprocess.Popen[str], list[int]]:
+    """A process group whose leader this process can reap, like a replacement.
+
+    The supervisor is the parent of every replica it launches, so it reaps that
+    replica's leader itself within ~2s of the leader exiting — which is always
+    before the health threshold brings termination around. This helper
+    reproduces exactly that: the leader is a direct child here, so
+    ``leader.wait()`` removes its PID from the process table entirely, leaving
+    a group with live members and no leader entry at all.
+
+    The optional second child is spawned only after the caller creates a marker
+    file, which is how a member that appears *between* two membership refreshes
+    is modelled.
+    """
+    child_code = (
+        "import signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "open(sys.argv[1], 'w').write('ready'); "
+        "time.sleep(float(sys.argv[2]))"
+    )
+    leader_code = f"""
+import os, subprocess, sys, time
+def spawn(marker):
+    child = subprocess.Popen([sys.executable, "-u", "-c", {child_code!r}, marker, "300"])
+    while not os.path.exists(marker):
+        time.sleep(0.01)
+    print(child.pid, flush=True)
+spawn({str(tmp_path / "ready-a")!r})
+if {second_child!r}:
+    while not os.path.exists({str(tmp_path / "spawn-b")!r}):
+        time.sleep(0.01)
+    spawn({str(tmp_path / "ready-b")!r})
+time.sleep(300)
+"""
+    environment = os.environ.copy()
+    if env_token is not None:
+        environment[mps_dp_supervisor.RUN_TOKEN_ENV] = env_token
+    leader = subprocess.Popen(
+        [sys.executable, "-u", "-c", leader_code],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=environment,
+        start_new_session=True,
+    )
+    assert leader.stdout is not None
+    return leader, [int(leader.stdout.readline())]
+
+
+def _reap_leader(leader: subprocess.Popen[str]) -> None:
+    """Kill the leader and reap it, so its PID leaves the process table."""
+    leader.terminate()
+    leader.wait(timeout=10)
+    for _ in range(500):
+        if mps_dp_supervisor._pid_start_time(leader.pid) is None:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"leader {leader.pid} was never reaped")
+
+
+def _record_for(leader: subprocess.Popen[str], tmp_path: Path, start: str):
+    return mps_dp_supervisor.ReplicaRecord(
+        index=0,
+        pid=leader.pid,
+        pgid=leader.pid,
+        port=8801,
+        log=str(tmp_path / "replica_0.log"),
+        leader_start=start,
+    )
+
+
+def _cleanup(pids: list[int]) -> None:
+    for pid in pids:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_terminate_cleans_group_whose_leader_was_already_reaped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generation-2 case: the supervisor reaped its own replacement.
+
+    Ownership must be provable from the frozen member list alone. Before the
+    de-leadering fix this returned without sending a single signal, and the
+    surviving members kept their MPS client and device memory forever.
+    """
+    monkeypatch.setattr(mps_dp_supervisor, "TERMINATE_TERM_GRACE_SECS", 1)
+    state = tmp_path / "gpu-0" / "run-test"
+    state.mkdir(parents=True)
+    leader, children = _spawn_reapable_group(tmp_path)
+    record = _record_for(
+        leader, tmp_path, mps_dp_supervisor._wait_for_start_time(leader.pid)
+    )
+    frozen = mps_dp_supervisor.refresh_group_members(state, record)
+    _reap_leader(leader)
+
+    try:
+        # The leader-only proof is gone; the member list still carries it.
+        leader_proof = mps_dp_supervisor._record_group_is_owned(record)
+        member_proof = mps_dp_supervisor._group_is_owned(state, record)
+        mps_dp_supervisor._terminate_record(record, state=state)
+        survived = [pid for pid in children if mps_dp_supervisor._pid_is_live(pid)]
+    finally:
+        _cleanup(children)
+
+    assert sorted(pid for pid, _ in frozen) == sorted([leader.pid, *children])
+    assert leader_proof is False
+    assert member_proof is True
+    assert survived == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_terminate_reaches_a_member_that_appeared_since_the_last_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kill landing between two polls must not leave the newest member behind.
+
+    The persisted list is at most one refresh interval old, so a member forked
+    after that refresh is not in it. It is still reachable: one listed member
+    that is alive and still in the group proves the PGID cannot have been
+    recycled, which is what makes the group-wide signal safe.
+    """
+    monkeypatch.setattr(mps_dp_supervisor, "TERMINATE_TERM_GRACE_SECS", 1)
+    state = tmp_path / "gpu-0" / "run-test"
+    state.mkdir(parents=True)
+    leader, children = _spawn_reapable_group(tmp_path, second_child=True)
+    record = _record_for(
+        leader, tmp_path, mps_dp_supervisor._wait_for_start_time(leader.pid)
+    )
+    frozen = mps_dp_supervisor.refresh_group_members(state, record)
+    # ... and only now, after the refresh, does the second member appear.
+    (tmp_path / "spawn-b").write_text("go")
+    assert leader.stdout is not None
+    late_child = int(leader.stdout.readline())
+    children.append(late_child)
+    _reap_leader(leader)
+
+    try:
+        listed = [pid for pid, _ in mps_dp_supervisor._load_group_members(state, record)]
+        mps_dp_supervisor._terminate_record(record, state=state)
+        survived = [pid for pid in children if mps_dp_supervisor._pid_is_live(pid)]
+    finally:
+        _cleanup(children)
+
+    assert late_child not in listed
+    assert sorted(pid for pid, _ in frozen) == sorted([leader.pid, children[0]])
+    assert survived == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_reaped_leader_with_only_stale_members_proves_nothing_and_signals_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PID reuse must not be mistaken for a surviving member.
+
+    Two ways a persisted row can be about a different process than the one that
+    was frozen, both of which must leave the innocent process untouched:
+    a recycled PID (start time no longer matches) and a process that is alive
+    with a matching identity but is no longer in the recorded group.
+    """
+    monkeypatch.setattr(mps_dp_supervisor, "TERMINATE_TERM_GRACE_SECS", 1)
+    state = tmp_path / "gpu-0" / "run-test"
+    state.mkdir(parents=True)
+    leader, children = _spawn_reapable_group(tmp_path)
+    record = _record_for(
+        leader, tmp_path, mps_dp_supervisor._wait_for_start_time(leader.pid)
+    )
+    innocent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(300)",
+        ],
+        start_new_session=True,
+    )
+    innocent_start = mps_dp_supervisor._wait_for_start_time(innocent.pid)
+    _reap_leader(leader)
+    _cleanup(children)
+    for _ in range(500):
+        if not any(mps_dp_supervisor._pid_is_live(pid) for pid in children):
+            break
+        time.sleep(0.02)
+
+    try:
+        # (a) right PID, wrong process: the start time no longer matches.
+        mps_dp_supervisor._persist_group_members(
+            state, record, [(innocent.pid, "Thu Jan  1 00:00:00 1970")]
+        )
+        recycled_pid_proof = mps_dp_supervisor._group_is_owned(state, record)
+        mps_dp_supervisor._terminate_record(record, state=state)
+        # (b) right process, wrong group: identity matches but it left the group
+        # (here: never joined it), so the PGID could have been recycled.
+        mps_dp_supervisor._persist_group_members(
+            state, record, [(innocent.pid, innocent_start)]
+        )
+        foreign_group_proof = mps_dp_supervisor._group_is_owned(state, record)
+        mps_dp_supervisor._terminate_record(record, state=state)
+        innocent_survived = (
+            mps_dp_supervisor._pid_start_time(innocent.pid) == innocent_start
+        )
+    finally:
+        _cleanup([innocent.pid, *children])
+        innocent.wait(timeout=5)
+
+    assert recycled_pid_proof is False
+    assert foreign_group_proof is False
+    assert innocent_survived
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_terminate_is_a_no_op_once_every_frozen_member_is_gone(
+    tmp_path: Path,
+) -> None:
+    """The third state: not 'ownership unprovable' but 'the group is gone'."""
+    state = tmp_path / "gpu-0" / "run-test"
+    state.mkdir(parents=True)
+    leader, children = _spawn_reapable_group(tmp_path)
+    record = _record_for(
+        leader, tmp_path, mps_dp_supervisor._wait_for_start_time(leader.pid)
+    )
+    mps_dp_supervisor.refresh_group_members(state, record)
+    _reap_leader(leader)
+    _cleanup(children)
+    for _ in range(500):
+        if not any(mps_dp_supervisor._pid_is_live(pid) for pid in children):
+            break
+        time.sleep(0.02)
+
+    assert mps_dp_supervisor._group_is_owned(state, record) is False
+    # Must return quietly rather than raise: nothing survived anything.
+    mps_dp_supervisor._terminate_record(record, state=state)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_launch_token_proves_ownership_without_leader_or_member_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Second factor: the run token carried in the member's own environment.
+
+    This is the check a human had to perform by hand on the orphaned groups of
+    the previous round, made mechanical: no leader entry, no usable frozen
+    list, and the group is still provably this run's.
+    """
+    monkeypatch.setattr(mps_dp_supervisor, "TERMINATE_TERM_GRACE_SECS", 1)
+    state = tmp_path / "gpu-0" / "run-test"
+    state.mkdir(parents=True)
+    token = "round10-token"
+    (state / "replica_specs.json").write_text(
+        json.dumps(
+            [{"index": 0, "port": 8801, "env": {mps_dp_supervisor.RUN_TOKEN_ENV: token}}]
+        )
+    )
+    leader, children = _spawn_reapable_group(tmp_path, env_token=token)
+    record = _record_for(
+        leader, tmp_path, mps_dp_supervisor._wait_for_start_time(leader.pid)
+    )
+    _reap_leader(leader)
+
+    try:
+        # No member list was ever persisted, so only the token can prove this.
+        listed = mps_dp_supervisor._load_group_members(state, record)
+        owned = mps_dp_supervisor._group_is_owned(state, record)
+        mps_dp_supervisor._terminate_record(record, state=state)
+        survived = [pid for pid in children if mps_dp_supervisor._pid_is_live(pid)]
+    finally:
+        _cleanup(children)
+
+    assert listed == []
+    assert owned is True
+    assert survived == []
+
+
+LAUNCH_SCRIPT = REPO_ROOT / "examples" / "mps_dp" / "launch.sh"
+
+
+def _launch_sh(state: Path, script: str) -> subprocess.CompletedProcess[str]:
+    """Run a snippet against launch.sh's functions.
+
+    Sourcing with the `list` verb runs only find_runs, so the helper functions
+    become available without starting anything. `set +e` undoes the script's
+    `set -e` so a predicate returning non-zero is an answer, not an abort.
+    """
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{LAUNCH_SCRIPT}" list >/dev/null\nset +e\n{script}',
+        ],
+        env={**os.environ, "STATE_ROOT": str(state.parents[1])},
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_launch_sh_teardown_owns_a_group_whose_leader_was_reaped(
+    tmp_path: Path,
+) -> None:
+    """The teardown-side mirror: `down` must be able to clean an orphaned group.
+
+    launch.sh carried the same leader-gated guard as the supervisor, which is
+    why teardown could detect leaked groups and still not signal them. The
+    persisted member list has to give bash the same leaderless proof.
+    """
+    state = tmp_path / "gpu-0" / "run-test"
+    state.mkdir(parents=True)
+    leader, children = _spawn_reapable_group(tmp_path)
+    members_file = state / "group-members" / "replica_0.tsv"
+    frozen = _launch_sh(
+        state,
+        f'persist_group_members "{members_file}" {leader.pid}; echo rc=$?',
+    )
+    start = mps_dp_supervisor._wait_for_start_time(leader.pid)
+    _reap_leader(leader)
+
+    try:
+        probe = _launch_sh(
+            state,
+            f'group_is_owned {leader.pid} "{start}" {leader.pid}; echo leader=$?\n'
+            f'group_ownership_proven "{state}" "{members_file}" '
+            f'{leader.pid} "{start}" {leader.pid}; echo proven=$?\n'
+            f'persisted_group_members "{members_file}" {leader.pid} | wc -l',
+        )
+    finally:
+        _cleanup(children)
+
+    assert "rc=0" in frozen.stdout, frozen.stderr
+    # Leader-only proof fails, the member list still carries ownership.
+    assert "leader=1" in probe.stdout, probe.stdout + probe.stderr
+    assert "proven=0" in probe.stdout, probe.stdout + probe.stderr
+    assert probe.stdout.strip().splitlines()[-1].strip() == "2"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_launch_sh_run_token_proves_a_group_with_no_member_list(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "gpu-0" / "run-test"
+    state.mkdir(parents=True)
+    token = "round10-launch-token"
+    (state / "run_token").write_text(token + "\n")
+    leader, children = _spawn_reapable_group(tmp_path, env_token=token)
+    start = mps_dp_supervisor._wait_for_start_time(leader.pid)
+    _reap_leader(leader)
+
+    try:
+        probe = _launch_sh(
+            state,
+            f'group_ownership_proven "{state}" "{state}/group-members/replica_0.tsv" '
+            f'{leader.pid} "{start}" {leader.pid}; echo proven=$?',
+        )
+        wrong = _launch_sh(
+            state,
+            f'group_token_matches {leader.pid} not-this-run; echo other=$?',
+        )
+    finally:
+        _cleanup(children)
+
+    assert "proven=0" in probe.stdout, probe.stdout + probe.stderr
+    assert "other=1" in wrong.stdout, wrong.stdout + wrong.stderr
