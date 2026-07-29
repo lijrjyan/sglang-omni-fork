@@ -30,6 +30,9 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+TERMINATE_TERM_GRACE_SECS = 30
+TERMINATE_KILL_GRACE_SECS = 5
+
 
 @dataclasses.dataclass(frozen=True)
 class ReplicaSpec:
@@ -570,25 +573,78 @@ def _record_identity_matches(record: ReplicaRecord) -> bool:
     return pgid == record.pgid and _pid_start_time(record.pid) == record.leader_start
 
 
+def _member_identity_matches(member: tuple[int, str]) -> bool:
+    pid, start = member
+    return _pid_is_live(pid) and _pid_start_time(pid) == start
+
+
+def _freeze_group_members(record: ReplicaRecord) -> list[tuple[int, str]]:
+    # Snapshot (PID, start time) for every live member of the recorded group.
+    # Callers must hold a matching leader identity while this runs: a live
+    # leader is what proves the PGID is still this run's group and not a
+    # recycled one. The leader is always included so the member set can never
+    # be empty and silently satisfy the wait below.
+    members = [(record.pid, record.leader_start)]
+    for proc_path in Path("/proc").iterdir():
+        if not proc_path.name.isdigit():
+            continue
+        pid = int(proc_path.name)
+        if pid == record.pid:
+            continue
+        try:
+            if os.getpgid(pid) != record.pgid:
+                continue
+        except (ProcessLookupError, PermissionError):
+            continue
+        if not _pid_is_live(pid):
+            continue
+        start = _pid_start_time(pid)
+        if start is None:
+            continue
+        members.append((pid, start))
+    return members
+
+
+def _live_group_members(members: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    return [member for member in members if _member_identity_matches(member)]
+
+
 def _terminate_record(record: ReplicaRecord) -> None:
     if not _record_identity_matches(record):
         return
+    # The leader exiting is not proof that the group is gone: a stage process
+    # that ignores or is slow to handle SIGTERM keeps holding its MPS client
+    # and device memory while the leader's identity already stops matching.
+    # Freeze the whole membership first and wait on all of it, so a replacement
+    # can never be launched next to a surviving member of the group it replaces.
+    members = _freeze_group_members(record)
     os.killpg(record.pgid, signal.SIGTERM)
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + TERMINATE_TERM_GRACE_SECS
     while time.monotonic() < deadline:
-        if not _record_identity_matches(record):
+        if not _live_group_members(members):
             return
         time.sleep(0.1)
-    if _record_identity_matches(record):
-        os.killpg(record.pgid, signal.SIGKILL)
-        deadline = time.monotonic() + 5
+    survivors = _live_group_members(members)
+    if survivors:
+        # Per-PID KILL rather than killpg: once the leader is reaped its PID can
+        # be reused by an unrelated process that becomes the leader of a group
+        # carrying the same PGID number, so a group-wide KILL could reach a
+        # process this run never owned. Each frozen start time is re-verified
+        # immediately before the signal, which no PGID check can substitute for.
+        for pid, start in survivors:
+            if not _member_identity_matches((pid, start)):
+                continue
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+        deadline = time.monotonic() + TERMINATE_KILL_GRACE_SECS
         while time.monotonic() < deadline:
-            if not _record_identity_matches(record):
+            if not _live_group_members(members):
                 return
             time.sleep(0.05)
+        remaining = ",".join(str(pid) for pid, _ in _live_group_members(members))
         raise RuntimeError(
             f"pending replica {record.index} process group "
-            f"{record.pgid} survived SIGKILL"
+            f"{record.pgid} survived SIGKILL (members {remaining})"
         )
 
 

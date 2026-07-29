@@ -1031,3 +1031,157 @@ HTTPServer(("127.0.0.1", 0), Handler).serve_forever()
             os.killpg(replacement.pgid, signal.SIGTERM)
         router.shutdown()
         router.server_close()
+
+
+def _spawn_group_with_stubborn_child(
+    ready_marker: Path,
+    exit_after_secs: float,
+) -> tuple[subprocess.Popen[str], int]:
+    # Leader exits on SIGTERM; its child in the same process group ignores
+    # SIGTERM and only leaves on its own schedule (or on SIGKILL). This is the
+    # topology that a leader-only termination wait cannot clean up. The leader
+    # publishes the child PID only after the child's handler is installed, so a
+    # signal can never win a race against an interpreter that is still starting.
+    child_code = (
+        "import signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "open(sys.argv[1], 'w').write('ready'); "
+        "time.sleep(float(sys.argv[2]))"
+    )
+    leader_code = f"""
+import os, subprocess, sys, time
+child = subprocess.Popen([
+    sys.executable, "-u", "-c", {child_code!r},
+    {str(ready_marker)!r}, {str(exit_after_secs)!r},
+])
+while not os.path.exists({str(ready_marker)!r}):
+    time.sleep(0.01)
+print(child.pid, flush=True)
+time.sleep(300)
+"""
+    leader = subprocess.Popen(
+        [sys.executable, "-u", "-c", leader_code],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    assert leader.stdout is not None
+    child_pid = int(leader.stdout.readline())
+    return leader, child_pid
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_terminate_waits_for_group_member_after_leader_exits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mps_dp_supervisor, "TERMINATE_TERM_GRACE_SECS", 10)
+    supervisor = _supervisor(tmp_path)
+    leader, child_pid = _spawn_group_with_stubborn_child(tmp_path / "ready", 1.5)
+    leader_start = mps_dp_supervisor._wait_for_start_time(leader.pid)
+    old = mps_dp_supervisor.ReplicaRecord(
+        index=0,
+        pid=leader.pid,
+        pgid=leader.pid,
+        port=8801,
+        log=str(tmp_path / "replica_0.log"),
+        leader_start=leader_start,
+    )
+    spec = mps_dp_supervisor.ReplicaSpec(
+        index=0,
+        port=8801,
+        log=old.log,
+        expected_tokens=None,
+        command=["python", "-m", "fake_server"],
+        env={},
+    )
+    new = mps_dp_supervisor.ReplicaRecord(0, 202, 202, 8801, old.log, "new-start")
+    child_live_at_gate: list[bool] = []
+
+    def _launch(_spec: object, _pending: object) -> object:
+        child_live_at_gate.append(mps_dp_supervisor._pid_is_live(child_pid))
+        return new
+
+    for name, replacement in (
+        ("_set_router_disabled", lambda _spec, _disabled: None),
+        ("_launch_replica", _launch),
+        ("_prepare_pending_restart", lambda _spec: object()),
+        ("_clear_pending_restart", lambda _pending: None),
+        ("_wait_for_port_release", lambda _port: None),
+        ("_replace_replica_record", lambda _record: None),
+        ("_wait_for_health", lambda _spec, _record: None),
+        ("_validate_kv_capacity", lambda _spec, **_kwargs: None),
+        ("_verify_mps_attach", lambda _spec: None),
+    ):
+        monkeypatch.setattr(supervisor, name, replacement, raising=False)
+
+    try:
+        supervisor.restart_replica(spec, old)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(child_pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(leader.pid, signal.SIGKILL)
+        leader.wait(timeout=5)
+
+    assert not mps_dp_supervisor._pid_is_live(leader.pid)
+    assert not mps_dp_supervisor._pid_is_live(child_pid)
+    # The replacement must not reach any gate while a member of the group it
+    # replaces is still alive holding that replica's MPS client and memory.
+    assert child_live_at_gate == [False]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_terminate_kills_surviving_member_but_spares_a_reused_pid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mps_dp_supervisor, "TERMINATE_TERM_GRACE_SECS", 1)
+    monkeypatch.setattr(mps_dp_supervisor, "TERMINATE_KILL_GRACE_SECS", 5)
+    leader, child_pid = _spawn_group_with_stubborn_child(tmp_path / "ready", 300)
+    leader_start = mps_dp_supervisor._wait_for_start_time(leader.pid)
+    # Stands in for a PID recycled after the freeze: the number is in the frozen
+    # member list but the process behind it is no longer the one that was frozen.
+    innocent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(300)",
+        ],
+        start_new_session=True,
+    )
+    innocent_start = mps_dp_supervisor._wait_for_start_time(innocent.pid)
+    real_freeze = mps_dp_supervisor._freeze_group_members
+    monkeypatch.setattr(
+        mps_dp_supervisor,
+        "_freeze_group_members",
+        lambda record: [
+            *real_freeze(record),
+            (innocent.pid, "Thu Jan  1 00:00:00 1970"),
+        ],
+    )
+    record = mps_dp_supervisor.ReplicaRecord(
+        index=0,
+        pid=leader.pid,
+        pgid=leader.pid,
+        port=8801,
+        log=str(tmp_path / "replica_0.log"),
+        leader_start=leader_start,
+    )
+
+    try:
+        mps_dp_supervisor._terminate_record(record)
+        child_survived = mps_dp_supervisor._pid_is_live(child_pid)
+        innocent_survived = mps_dp_supervisor._pid_start_time(innocent.pid) == (
+            innocent_start
+        )
+    finally:
+        for pid in (child_pid, innocent.pid, leader.pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        innocent.wait(timeout=5)
+        leader.wait(timeout=5)
+
+    assert not child_survived
+    assert innocent_survived

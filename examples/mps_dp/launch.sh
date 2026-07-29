@@ -89,11 +89,44 @@ pid_start_time() {
   printf '%s\n' "$start_time"
 }
 
-leader_identity_matches() {
+pid_identity_matches() {
   local pid=$1 expected_start=$2 actual_start
   pid_is_live "$pid" || return 1
   actual_start=$(pid_start_time "$pid") || return 1
   [ "$actual_start" = "$expected_start" ]
+}
+
+frozen_group_members() {
+  # Snapshot PID and start time for every live member of a recorded group. The
+  # caller must have just matched the group leader's identity: a live leader is
+  # what proves this PGID is still this run's group rather than a recycled one.
+  local pgid=$1 p start
+  for p in $(pgrep -g "$pgid" 2>/dev/null || true); do
+    pid_is_live "$p" || continue
+    start=$(pid_start_time "$p") || continue
+    printf '%s\t%s\n' "$p" "$start"
+  done
+}
+
+live_frozen_members() {
+  local file=$1 out="" p start
+  [ -s "$file" ] || { echo "$out"; return 0; }
+  while IFS=$'\t' read -r p start; do
+    pid_identity_matches "$p" "$start" && out+=" $p"
+  done < "$file"
+  echo "$out"
+}
+
+kill_frozen_members() {
+  # Per-PID KILL rather than killpg: once a leader is reaped its PID can be
+  # reused by an unrelated process that becomes the leader of a group carrying
+  # the same PGID number, so a group-wide KILL could reach a process this run
+  # never owned. Each frozen start time is re-checked just before the signal.
+  local file=$1 p start
+  [ -s "$file" ] || return 0
+  while IFS=$'\t' read -r p start; do
+    pid_identity_matches "$p" "$start" && { kill -KILL "$p" 2>/dev/null || true; }
+  done < "$file"
 }
 
 mps_query() {
@@ -187,7 +220,7 @@ tracked_service_pids() {
   local state=$1 out="" p pid pgid start
   [ -f "$state/services.tsv" ] || { echo "$out"; return 0; }
   while IFS=$'\t' read -r _ pid pgid _ start; do
-    leader_identity_matches "$pid" "$start" || continue
+    pid_identity_matches "$pid" "$start" || continue
     for p in $(pgrep -g "$pgid" 2>/dev/null || true); do
       pid_is_live "$p" && out+=" $p"
     done
@@ -281,25 +314,31 @@ verify_attach() {
 stop_services() {
   # Stop the supervisor before the router and replicas so teardown cannot race
   # an automatic restart. Rows are written router-first, supervisor-last.
-  local state=$1 name pid pgid log start t live
+  local state=$1 name pid pgid log start t live members=$state/service-members.tsv
   [ -f "$state/services.tsv" ] || return 0
+  : > "$members"
   while IFS=$'\t' read -r name pid pgid log start; do
-    leader_identity_matches "$pid" "$start" || continue
+    pid_identity_matches "$pid" "$start" || continue
     echo "stopping $name (pid $pid, log $log)"
+    # Freeze membership before signalling. tracked_service_pids only reports
+    # groups whose leader identity still matches, so a leader that exits first
+    # would hide a TERM-ignoring child of the same group from every check below.
+    frozen_group_members "$pgid" >> "$members"
     kill -TERM -- "-$pgid" 2>/dev/null || true
   done < <(tac "$state/services.tsv")
   for ((t=1; t<=DRAIN_TRIES; t++)); do
-    live=$(tracked_service_pids "$state")
+    live="$(tracked_service_pids "$state")$(live_frozen_members "$members")"
     [ -z "${live// /}" ] && return 0
     sleep "$DRAIN_INTERVAL"
   done
   echo "warning: tracked router/supervisor services survived TERM; using SIGKILL on their recorded groups" >&2
   while IFS=$'\t' read -r _ pid pgid _ start; do
-    leader_identity_matches "$pid" "$start" || continue
+    pid_identity_matches "$pid" "$start" || continue
     kill -KILL -- "-$pgid" 2>/dev/null || true
   done < <(tac "$state/services.tsv")
+  kill_frozen_members "$members"
   sleep 2
-  live=$(tracked_service_pids "$state")
+  live="$(tracked_service_pids "$state")$(live_frozen_members "$members")"
   [ -z "${live// /}" ] || {
     echo "error: tracked service pids still alive:$live" >&2
     return 1
@@ -311,6 +350,7 @@ teardown_state() {
   # in this run's state, never scans the whole GPU, and keeps the state directory
   # whenever cleanup cannot be confirmed, so nothing is hidden from inspection.
   local state=$1 keep=${2:-} leader_pid pgid leader_start t live raw control_pid=""
+  local members=$state/replica-members.tsv
   [ -n "$state" ] && [ -f "$state/replicas.tsv" ] || die "invalid or missing run state '$state'"
   stop_services "$state" || {
     echo "state kept at $state — refusing to stop replicas while their supervisor may still be active" >&2
@@ -321,8 +361,14 @@ teardown_state() {
     return 1
   }
   control_pid=$(mps_control_pid "$state" || true)
+  : > "$members"
   while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
-    leader_identity_matches "$leader_pid" "$leader_start" || continue
+    pid_identity_matches "$leader_pid" "$leader_start" || continue
+    # tracked_pids already counts every member of a recorded group, so the wait
+    # below cannot be satisfied by the leader alone. The freeze exists for the
+    # last-resort KILL: signalling is leader-gated, so a group whose leader
+    # exits first would otherwise never be signalled at all.
+    frozen_group_members "$pgid" >> "$members"
     kill -TERM -- "-$pgid" 2>/dev/null || true
   done < "$state/replicas.tsv"
   for ((t=1; t<=DRAIN_TRIES; t++)); do
@@ -365,16 +411,17 @@ teardown_state() {
     echo "state kept at $state — inspect $state/mps_ctl.err and retry down" >&2
     return 1
   fi
-  live=$(tracked_pids "$state")
+  live="$(tracked_pids "$state")$(live_frozen_members "$members")"
   if [ -n "${live// /}" ]; then
     echo "warning: tracked non-client processes survived TERM; last-resort SIGKILL on tracked groups only" >&2
     while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
-      leader_identity_matches "$leader_pid" "$leader_start" || continue
+      pid_identity_matches "$leader_pid" "$leader_start" || continue
       kill -KILL -- "-$pgid" 2>/dev/null || true
     done < "$state/replicas.tsv"
+    kill_frozen_members "$members"
     sleep 2
   fi
-  live=$(tracked_pids "$state")
+  live="$(tracked_pids "$state")$(live_frozen_members "$members")"
   if [ -n "${live// /}" ]; then
     echo "error: tracked pids still alive:$live — state kept at $state" >&2
     return 1
