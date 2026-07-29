@@ -96,10 +96,24 @@ pid_identity_matches() {
   [ "$actual_start" = "$expected_start" ]
 }
 
+group_is_owned() {
+  # Weaker than pid_identity_matches on purpose, and the mirror of
+  # supervisor.py's _record_group_is_owned: the leader may already be a zombie.
+  # A zombie still occupies its PID, and a recorded PGID *is* the leader's PID,
+  # so while that entry exists no unrelated process can lead a group with this
+  # PGID. Requiring a *live* leader here would make an orphaned group
+  # unsignallable, which is exactly how members outlive their leader.
+  local pid=$1 expected_start=$2 expected_pgid=$3 actual_start actual_pgid
+  actual_start=$(pid_start_time "$pid") || return 1
+  [ "$actual_start" = "$expected_start" ] || return 1
+  actual_pgid=$(ps -o pgid= -p "$pid" 2>/dev/null) || return 1
+  [ "${actual_pgid// /}" = "$expected_pgid" ]
+}
+
 frozen_group_members() {
   # Snapshot PID and start time for every live member of a recorded group. The
-  # caller must have just matched the group leader's identity: a live leader is
-  # what proves this PGID is still this run's group rather than a recycled one.
+  # caller must have just proven ownership of the group (group_is_owned), which
+  # is what rules out a recycled PGID.
   local pgid=$1 p start
   for p in $(pgrep -g "$pgid" 2>/dev/null || true); do
     pid_is_live "$p" || continue
@@ -318,7 +332,7 @@ stop_services() {
   [ -f "$state/services.tsv" ] || return 0
   : > "$members"
   while IFS=$'\t' read -r name pid pgid log start; do
-    pid_identity_matches "$pid" "$start" || continue
+    group_is_owned "$pid" "$start" "$pgid" || continue
     echo "stopping $name (pid $pid, log $log)"
     # Freeze membership before signalling. tracked_service_pids only reports
     # groups whose leader identity still matches, so a leader that exits first
@@ -333,7 +347,7 @@ stop_services() {
   done
   echo "warning: tracked router/supervisor services survived TERM; using SIGKILL on their recorded groups" >&2
   while IFS=$'\t' read -r _ pid pgid _ start; do
-    pid_identity_matches "$pid" "$start" || continue
+    group_is_owned "$pid" "$start" "$pgid" || continue
     kill -KILL -- "-$pgid" 2>/dev/null || true
   done < <(tac "$state/services.tsv")
   kill_frozen_members "$members"
@@ -363,7 +377,7 @@ teardown_state() {
   control_pid=$(mps_control_pid "$state" || true)
   : > "$members"
   while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
-    pid_identity_matches "$leader_pid" "$leader_start" || continue
+    group_is_owned "$leader_pid" "$leader_start" "$pgid" || continue
     # tracked_pids already counts every member of a recorded group, so the wait
     # below cannot be satisfied by the leader alone. The freeze exists for the
     # last-resort KILL: signalling is leader-gated, so a group whose leader
@@ -415,7 +429,7 @@ teardown_state() {
   if [ -n "${live// /}" ]; then
     echo "warning: tracked non-client processes survived TERM; last-resort SIGKILL on tracked groups only" >&2
     while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
-      pid_identity_matches "$leader_pid" "$leader_start" || continue
+      group_is_owned "$leader_pid" "$leader_start" "$pgid" || continue
       kill -KILL -- "-$pgid" 2>/dev/null || true
     done < "$state/replicas.tsv"
     kill_frozen_members "$members"

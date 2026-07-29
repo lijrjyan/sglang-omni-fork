@@ -1185,3 +1185,52 @@ def test_terminate_kills_surviving_member_but_spares_a_reused_pid(
 
     assert not child_survived
     assert innocent_survived
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_terminate_cleans_group_whose_leader_is_an_unreaped_zombie(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leader that exits first must not hide its live siblings.
+
+    This is the shape a SIGTERM to the leader PID produces on a real replica:
+    by the time the supervisor reaches termination the leader is already gone,
+    and in an init-less container it is an unreapable zombie in front of stage
+    processes that still hold their MPS clients and device memory.
+    """
+    monkeypatch.setattr(mps_dp_supervisor, "TERMINATE_TERM_GRACE_SECS", 1)
+    leader, child_pid = _spawn_group_with_stubborn_child(tmp_path / "ready", 300)
+    leader_start = mps_dp_supervisor._wait_for_start_time(leader.pid)
+    record = mps_dp_supervisor.ReplicaRecord(
+        index=0,
+        pid=leader.pid,
+        pgid=leader.pid,
+        port=8801,
+        log=str(tmp_path / "replica_0.log"),
+        leader_start=leader_start,
+    )
+    # Kill only the leader and never reap it, so it stays a zombie exactly as
+    # it would under a container PID 1 that does not wait().
+    os.kill(leader.pid, signal.SIGKILL)
+    for _ in range(200):
+        if not mps_dp_supervisor._pid_is_live(leader.pid):
+            break
+        time.sleep(0.02)
+
+    try:
+        leader_is_zombie = (
+            Path(f"/proc/{leader.pid}/stat").read_text().rpartition(")")[2].split()[0]
+            == "Z"
+        )
+        assert not mps_dp_supervisor._record_identity_matches(record)
+        assert mps_dp_supervisor._record_group_is_owned(record)
+        mps_dp_supervisor._terminate_record(record)
+        child_survived = mps_dp_supervisor._pid_is_live(child_pid)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(child_pid, signal.SIGKILL)
+        leader.wait(timeout=5)
+
+    assert leader_is_zombie
+    assert not child_survived

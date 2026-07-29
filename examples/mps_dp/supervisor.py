@@ -573,6 +573,21 @@ def _record_identity_matches(record: ReplicaRecord) -> bool:
     return pgid == record.pgid and _pid_start_time(record.pid) == record.leader_start
 
 
+def _record_group_is_owned(record: ReplicaRecord) -> bool:
+    # Weaker than _record_identity_matches on purpose: the leader may already
+    # be a zombie. A zombie still occupies its PID, and the PGID *is* that PID,
+    # so no unrelated process can have become the leader of a group with this
+    # PGID while the entry is there. That is all the proof termination needs,
+    # and it is the common case: an init-less container never reaps, so a
+    # leader that exits first stays a zombie in front of live siblings.
+    if _pid_start_time(record.pid) != record.leader_start:
+        return False
+    try:
+        return os.getpgid(record.pid) == record.pgid
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def _member_identity_matches(member: tuple[int, str]) -> bool:
     pid, start = member
     return _pid_is_live(pid) and _pid_start_time(pid) == start
@@ -610,7 +625,7 @@ def _live_group_members(members: list[tuple[int, str]]) -> list[tuple[int, str]]
 
 
 def _terminate_record(record: ReplicaRecord) -> None:
-    if not _record_identity_matches(record):
+    if not _record_group_is_owned(record):
         return
     # The leader exiting is not proof that the group is gone: a stage process
     # that ignores or is slow to handle SIGTERM keeps holding its MPS client
@@ -618,7 +633,10 @@ def _terminate_record(record: ReplicaRecord) -> None:
     # Freeze the whole membership first and wait on all of it, so a replacement
     # can never be launched next to a surviving member of the group it replaces.
     members = _freeze_group_members(record)
-    os.killpg(record.pgid, signal.SIGTERM)
+    if not _live_group_members(members):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(record.pgid, signal.SIGTERM)
     deadline = time.monotonic() + TERMINATE_TERM_GRACE_SECS
     while time.monotonic() < deadline:
         if not _live_group_members(members):
