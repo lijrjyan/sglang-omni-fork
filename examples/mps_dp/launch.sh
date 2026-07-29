@@ -97,17 +97,100 @@ pid_identity_matches() {
 }
 
 group_is_owned() {
-  # Weaker than pid_identity_matches on purpose, and the mirror of
-  # supervisor.py's _record_group_is_owned: the leader may already be a zombie.
-  # A zombie still occupies its PID, and a recorded PGID *is* the leader's PID,
-  # so while that entry exists no unrelated process can lead a group with this
-  # PGID. Requiring a *live* leader here would make an orphaned group
-  # unsignallable, which is exactly how members outlive their leader.
+  # Leader-based ownership proof, the mirror of supervisor.py's
+  # _record_group_is_owned: the leader may already be a zombie. A zombie still
+  # occupies its PID, and a recorded PGID *is* the leader's PID, so while that
+  # entry exists no unrelated process can lead a group with this PGID.
+  # It is NOT sufficient by itself — once the leader is reaped this returns 1
+  # forever, which is what left orphaned groups unsignallable. Callers must use
+  # group_ownership_proven, which also accepts the two leaderless proofs below.
   local pid=$1 expected_start=$2 expected_pgid=$3 actual_start actual_pgid
   actual_start=$(pid_start_time "$pid") || return 1
   [ "$actual_start" = "$expected_start" ] || return 1
   actual_pgid=$(ps -o pgid= -p "$pid" 2>/dev/null) || return 1
   [ "${actual_pgid// /}" = "$expected_pgid" ]
+}
+
+pid_pgid() {
+  local out
+  out=$(ps -o pgid= -p "$1" 2>/dev/null) || return 1
+  printf '%s\n' "${out// /}"
+}
+
+group_members_file() {
+  # One persisted membership list per recorded group, keyed by kind and name so
+  # replicas and services never collide: $state/group-members/replica_0.tsv.
+  printf '%s/group-members/%s_%s.tsv\n' "$1" "$2" "$3"
+}
+
+persist_group_members() {
+  # Freeze (pgid, pid, start) for every live member of a group and write it
+  # atomically. The PGID is on every row so a list left over from an earlier
+  # generation of the same replica index can never be read as proof about the
+  # current one. Mirror of supervisor.py's _persist_group_members.
+  local file=$1 pgid=$2 tmp
+  mkdir -p "$(dirname "$file")" || return 1
+  tmp=$(mktemp "$(dirname "$file")/.$(basename "$file").XXXXXX") || return 1
+  frozen_group_members "$pgid" | sed "s/^/$pgid\t/" > "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+persisted_group_members() {
+  # Rows of the persisted list whose PGID column matches the recorded group,
+  # emitted in the pid<TAB>start form the frozen-member helpers consume.
+  local file=$1 expected_pgid=$2 pgid p start
+  [ -s "$file" ] || return 0
+  while IFS=$'\t' read -r pgid p start; do
+    [ "$pgid" = "$expected_pgid" ] || continue
+    printf '%s\t%s\n' "$p" "$start"
+  done < "$file"
+}
+
+members_prove_ownership() {
+  # A PGID cannot be recycled while any process still belongs to that group, so
+  # one persisted member that still matches its identity AND is still in the
+  # recorded group proves the whole group is this run's — with no reference to
+  # the leader at all. This is the fix for reaped leaders.
+  local file=$1 expected_pgid=$2 p start
+  [ -s "$file" ] || return 1
+  while IFS=$'\t' read -r p start; do
+    pid_identity_matches "$p" "$start" || continue
+    [ "$(pid_pgid "$p" || true)" = "$expected_pgid" ] || continue
+    return 0
+  done < <(persisted_group_members "$file" "$expected_pgid")
+  return 1
+}
+
+group_token_matches() {
+  # Second factor and the formalisation of by-hand orphan identification: a
+  # live process in the recorded group carrying this run's launch token belongs
+  # to this run whatever the process table says about the leader.
+  local pgid=$1 token=${2:-} p
+  [ -n "$token" ] || return 1
+  for p in $(pgrep -g "$pgid" 2>/dev/null || true); do
+    pid_is_live "$p" || continue
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null \
+      | grep -qxF "SGLANG_OMNI_MPS_DP_RUN_TOKEN=$token" && return 0
+  done
+  return 1
+}
+
+run_token() {
+  local file=$1/run_token
+  [ -r "$file" ] || return 0
+  head -n 1 "$file" 2>/dev/null | tr -d '[:space:]'
+}
+
+group_ownership_proven() {
+  # Three states, and only the third means "do nothing":
+  #   zombie leader  -> group_is_owned (PID still taken, PGID still ours)
+  #   reaped leader  -> a persisted member still in the group, or a token match
+  #   all gone       -> no proof at all; the group no longer exists
+  # Usage: group_ownership_proven <state> <members-file> <pid> <start> <pgid>
+  local state=$1 file=$2 pid=$3 start=$4 pgid=$5
+  group_is_owned "$pid" "$start" "$pgid" && return 0
+  members_prove_ownership "$file" "$pgid" && return 0
+  group_token_matches "$pgid" "$(run_token "$state")"
 }
 
 frozen_group_members() {
@@ -231,10 +314,15 @@ tracked_pids() {
 }
 
 tracked_service_pids() {
-  local state=$1 out="" p pid pgid start
+  # A reaped leader must not hide its own live group from the drain checks:
+  # when the leader identity is gone, the persisted membership list is what
+  # still proves the group belongs to this run.
+  local state=$1 out="" p name pid pgid start
   [ -f "$state/services.tsv" ] || { echo "$out"; return 0; }
-  while IFS=$'\t' read -r _ pid pgid _ start; do
-    pid_identity_matches "$pid" "$start" || continue
+  while IFS=$'\t' read -r name pid pgid _ start; do
+    pid_identity_matches "$pid" "$start" \
+      || members_prove_ownership "$(group_members_file "$state" service "$name")" "$pgid" \
+      || continue
     for p in $(pgrep -g "$pgid" 2>/dev/null || true); do
       pid_is_live "$p" && out+=" $p"
     done
@@ -332,12 +420,18 @@ stop_services() {
   [ -f "$state/services.tsv" ] || return 0
   : > "$members"
   while IFS=$'\t' read -r name pid pgid log start; do
-    group_is_owned "$pid" "$start" "$pgid" || continue
+    group_ownership_proven "$state" \
+      "$(group_members_file "$state" service "$name")" "$pid" "$start" "$pgid" \
+      || continue
     echo "stopping $name (pid $pid, log $log)"
-    # Freeze membership before signalling. tracked_service_pids only reports
-    # groups whose leader identity still matches, so a leader that exits first
-    # would hide a TERM-ignoring child of the same group from every check below.
+    # Freeze membership before signalling, merging in the persisted list so a
+    # member that has just become a zombie is still waited on rather than
+    # assumed gone. Group-wide TERM is safe because ownership was proven from
+    # something still *in* the group, and a PGID cannot be recycled while the
+    # group has a member.
     frozen_group_members "$pgid" >> "$members"
+    persisted_group_members \
+      "$(group_members_file "$state" service "$name")" "$pgid" >> "$members"
     kill -TERM -- "-$pgid" 2>/dev/null || true
   done < <(tac "$state/services.tsv")
   for ((t=1; t<=DRAIN_TRIES; t++)); do
@@ -346,8 +440,10 @@ stop_services() {
     sleep "$DRAIN_INTERVAL"
   done
   echo "warning: tracked router/supervisor services survived TERM; using SIGKILL on their recorded groups" >&2
-  while IFS=$'\t' read -r _ pid pgid _ start; do
-    group_is_owned "$pid" "$start" "$pgid" || continue
+  while IFS=$'\t' read -r name pid pgid _ start; do
+    group_ownership_proven "$state" \
+      "$(group_members_file "$state" service "$name")" "$pid" "$start" "$pgid" \
+      || continue
     kill -KILL -- "-$pgid" 2>/dev/null || true
   done < <(tac "$state/services.tsv")
   kill_frozen_members "$members"
@@ -363,7 +459,7 @@ teardown_state() {
   # Note (Jiaxin Deng): these GPUs are shared; teardown only signals processes recorded
   # in this run's state, never scans the whole GPU, and keeps the state directory
   # whenever cleanup cannot be confirmed, so nothing is hidden from inspection.
-  local state=$1 keep=${2:-} leader_pid pgid leader_start t live raw control_pid=""
+  local state=$1 keep=${2:-} idx leader_pid pgid leader_start t live raw control_pid=""
   local members=$state/replica-members.tsv
   [ -n "$state" ] && [ -f "$state/replicas.tsv" ] || die "invalid or missing run state '$state'"
   stop_services "$state" || {
@@ -376,13 +472,17 @@ teardown_state() {
   }
   control_pid=$(mps_control_pid "$state" || true)
   : > "$members"
-  while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
-    group_is_owned "$leader_pid" "$leader_start" "$pgid" || continue
+  while IFS=$'\t' read -r idx leader_pid pgid _ _ leader_start; do
+    group_ownership_proven "$state" \
+      "$(group_members_file "$state" replica "$idx")" \
+      "$leader_pid" "$leader_start" "$pgid" || continue
     # tracked_pids already counts every member of a recorded group, so the wait
     # below cannot be satisfied by the leader alone. The freeze exists for the
-    # last-resort KILL: signalling is leader-gated, so a group whose leader
-    # exits first would otherwise never be signalled at all.
+    # last-resort KILL; the persisted list is merged in so a member that has
+    # just become a zombie is still waited on.
     frozen_group_members "$pgid" >> "$members"
+    persisted_group_members \
+      "$(group_members_file "$state" replica "$idx")" "$pgid" >> "$members"
     kill -TERM -- "-$pgid" 2>/dev/null || true
   done < "$state/replicas.tsv"
   for ((t=1; t<=DRAIN_TRIES; t++)); do
@@ -428,8 +528,10 @@ teardown_state() {
   live="$(tracked_pids "$state")$(live_frozen_members "$members")"
   if [ -n "${live// /}" ]; then
     echo "warning: tracked non-client processes survived TERM; last-resort SIGKILL on tracked groups only" >&2
-    while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
-      group_is_owned "$leader_pid" "$leader_start" "$pgid" || continue
+    while IFS=$'\t' read -r idx leader_pid pgid _ _ leader_start; do
+      group_ownership_proven "$state" \
+        "$(group_members_file "$state" replica "$idx")" \
+        "$leader_pid" "$leader_start" "$pgid" || continue
       kill -KILL -- "-$pgid" 2>/dev/null || true
     done < "$state/replicas.tsv"
     kill_frozen_members "$members"
@@ -572,7 +674,7 @@ up() {
     die "router port $router_port is already in use; pick another ROUTER_PORT"
   fi
 
-  local uuid node run state driver_version host_timezone started_at
+  local uuid node run state driver_version host_timezone started_at token
   # Note (Jiaxin Deng): a caller (autodp) may pin RUN_ID so it can tear down exactly
   # the run it started, instead of rediscovering the newest dir.
   # Note (Yueying Li): RUN_ID becomes a single directory component under
@@ -593,6 +695,14 @@ up() {
   : > "$state/replicas.tsv"
   : > "$state/services.tsv"
   printf '[]\n' > "$state/replica_specs.json"
+  mkdir -p "$state/group-members"
+  # Per-run launch token. It goes into every replica's environment so that a
+  # member of a recorded group can be recognised as this run's through
+  # /proc/<pid>/environ, which needs neither the leader nor a frozen list.
+  token=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  [ -n "$token" ] || die "could not generate a run token"
+  printf '%s\n' "$token" > "$state/run_token"
+  chmod 600 "$state/run_token"
 
   # note(ratish): Without this trap, a later replica failure leaves earlier
   # replicas and the private MPS daemon running; keep the state for diagnosis.
@@ -671,6 +781,7 @@ up() {
       --env "SGLANG_OMNI_WEIGHT_SHARE=$ws_env"
       --env "SGLANG_OMNI_WEIGHT_SHARE_RUN_ID=$run"
       --env "SGLANG_OMNI_STRICT_PORT=1"
+      --env "SGLANG_OMNI_MPS_DP_RUN_TOKEN=$token"
     )
     if [ -n "$expected_max_total_tokens" ]; then
       spec_args+=(--expected-tokens "$expected_max_total_tokens")
@@ -681,6 +792,7 @@ up() {
     SGLANG_OMNI_WEIGHT_SHARE="$ws_env" \
     SGLANG_OMNI_WEIGHT_SHARE_RUN_ID="$run" \
     SGLANG_OMNI_STRICT_PORT=1 \
+    SGLANG_OMNI_MPS_DP_RUN_TOKEN="$token" \
     setsid "${replica_cmd[@]}" > "$log" 2>&1 < /dev/null &
     pid=$!
     leader_start=$(pid_start_time "$pid") \
@@ -703,6 +815,12 @@ up() {
       tail -n 8 "$log" >&2
       exit 1
     fi
+    # Registration-time freeze, taken after the health gate so the group is
+    # fully populated. The supervisor refreshes this list on every health poll;
+    # with SUPERVISE=0 this snapshot is the only one, which is why it is taken
+    # here and not at spawn time when only the leader exists.
+    persist_group_members "$(group_members_file "$state" replica "$i")" "$pid" \
+      || die "replica $i is healthy but its group membership could not be recorded"
     echo "replica $i healthy on port $port (cores ${blocks[$i]})"
     resolved_tokens=""
     resolved_tokens=$(grep -m1 -oE '#tokens:[[:space:]]*[0-9]+' "$log" \
@@ -760,6 +878,8 @@ up() {
       tail -n 12 "$router_log" >&2
       exit 1
     }
+    persist_group_members "$(group_members_file "$state" service router)" "$pid" \
+      || die "router is healthy but its group membership could not be recorded"
     echo "router healthy on $router_url (policy $router_policy)"
   fi
 
@@ -785,6 +905,8 @@ up() {
       tail -n 12 "$supervisor_log" >&2
       exit 1
     }
+    persist_group_members "$(group_members_file "$state" service supervisor)" "$pid" \
+      || die "supervisor is running but its group membership could not be recorded"
     echo "replica supervisor active (interval ${SUPERVISOR_INTERVAL:-5}s, failure threshold ${SUPERVISOR_FAILURE_THRESHOLD:-3})"
   fi
 

@@ -33,6 +33,12 @@ from typing import Any
 TERMINATE_TERM_GRACE_SECS = 30
 TERMINATE_KILL_GRACE_SECS = 5
 
+# Directory under a run's state holding one frozen membership list per replica.
+GROUP_MEMBERS_DIRNAME = "group-members"
+# Injected into every replica's environment so a group member can be recognised
+# as belonging to this run even when no recorded identity is left to compare.
+RUN_TOKEN_ENV = "SGLANG_OMNI_MPS_DP_RUN_TOKEN"
+
 
 @dataclasses.dataclass(frozen=True)
 class ReplicaSpec:
@@ -191,6 +197,12 @@ class ReplicaSupervisor:
             )
             if healthy:
                 self._health_failures[spec.index] = 0
+                # Re-freeze the group's membership on every poll of a healthy
+                # replica. The leader is what makes the scan trustworthy, and
+                # the leader is exactly what disappears when the replica is
+                # later terminated, so the proof has to be captured while it
+                # still exists. One /proc scan per replica per interval.
+                refresh_group_members(self.state, record)
                 continue
 
             failures = self._health_failures.get(spec.index, 0) + 1
@@ -238,6 +250,10 @@ class ReplicaSupervisor:
             pending = self._prepare_pending_restart(spec)
             replacement = self._launch_replica(spec, pending)
             self._replace_replica_record(replacement)
+            # Registration-time freeze: from here on the replacement's group is
+            # provable without its leader, which the supervisor will reap the
+            # moment that leader exits.
+            refresh_group_members(self.state, replacement)
             self._clear_pending_restart(pending)
             pending = None
             self._wait_for_health(spec, replacement)
@@ -385,7 +401,7 @@ class ReplicaSupervisor:
             ) from exc
 
     def _terminate_replica(self, record: ReplicaRecord) -> None:
-        _terminate_record(record)
+        _terminate_record(record, state=self.state)
 
     def _launch_replica(
         self,
@@ -574,12 +590,16 @@ def _record_identity_matches(record: ReplicaRecord) -> bool:
 
 
 def _record_group_is_owned(record: ReplicaRecord) -> bool:
-    # Weaker than _record_identity_matches on purpose: the leader may already
-    # be a zombie. A zombie still occupies its PID, and the PGID *is* that PID,
-    # so no unrelated process can have become the leader of a group with this
-    # PGID while the entry is there. That is all the proof termination needs,
-    # and it is the common case: an init-less container never reaps, so a
-    # leader that exits first stays a zombie in front of live siblings.
+    # Leader-based ownership proof. Weaker than _record_identity_matches on
+    # purpose: the leader may already be a zombie. A zombie still occupies its
+    # PID, and the PGID *is* that PID, so no unrelated process can have become
+    # the leader of a group with this PGID while the entry is there.
+    #
+    # This proof alone is NOT sufficient (see _group_is_owned): once the leader
+    # is reaped its process-table entry disappears, and on any host with an
+    # init that waits — which includes the supervisor itself for every replica
+    # it launches — that happens within ~2s of the leader exiting, long before
+    # the health threshold brings termination around.
     if _pid_start_time(record.pid) != record.leader_start:
         return False
     try:
@@ -593,21 +613,32 @@ def _member_identity_matches(member: tuple[int, str]) -> bool:
     return _pid_is_live(pid) and _pid_start_time(pid) == start
 
 
-def _freeze_group_members(record: ReplicaRecord) -> list[tuple[int, str]]:
-    # Snapshot (PID, start time) for every live member of the recorded group.
-    # Callers must hold a matching leader identity while this runs: a live
-    # leader is what proves the PGID is still this run's group and not a
-    # recycled one. The leader is always included so the member set can never
-    # be empty and silently satisfy the wait below.
-    members = [(record.pid, record.leader_start)]
+def _member_is_in_group(member: tuple[int, str], pgid: int) -> bool:
+    # Identity plus current group membership. A PGID cannot be recycled while
+    # any process still belongs to that group, so one member that both matches
+    # its frozen identity and is still in the recorded group proves the whole
+    # group is this run's — with no reference to the leader at all.
+    if not _member_identity_matches(member):
+        return False
+    try:
+        return os.getpgid(member[0]) == pgid
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _group_members_path(state: Path, index: int) -> Path:
+    return state / GROUP_MEMBERS_DIRNAME / f"replica_{index}.tsv"
+
+
+def _scan_group_members(pgid: int) -> list[tuple[int, str]]:
+    """Live members of `pgid` right now, as (pid, start time) pairs."""
+    members: list[tuple[int, str]] = []
     for proc_path in Path("/proc").iterdir():
         if not proc_path.name.isdigit():
             continue
         pid = int(proc_path.name)
-        if pid == record.pid:
-            continue
         try:
-            if os.getpgid(pid) != record.pgid:
+            if os.getpgid(pid) != pgid:
                 continue
         except (ProcessLookupError, PermissionError):
             continue
@@ -620,21 +651,189 @@ def _freeze_group_members(record: ReplicaRecord) -> list[tuple[int, str]]:
     return members
 
 
+def _persist_group_members(
+    state: Path,
+    record: ReplicaRecord,
+    members: list[tuple[int, str]],
+) -> None:
+    # The PGID is stored on every row so a list left over from an earlier
+    # generation of the same replica index can never be read as proof about
+    # the current one: the reader drops every row whose PGID does not match.
+    path = _group_members_path(state, record.index)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _atomic_write_text(
+        path,
+        "".join(f"{record.pgid}\t{pid}\t{start}\n" for pid, start in members),
+    )
+
+
+def _load_group_members(state: Path, record: ReplicaRecord) -> list[tuple[int, str]]:
+    if record.index < 0:
+        return []
+    try:
+        lines = _group_members_path(state, record.index).read_text().splitlines()
+    except (FileNotFoundError, PermissionError, OSError):
+        return []
+    members: list[tuple[int, str]] = []
+    for line in lines:
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != 3:
+            continue
+        try:
+            pgid, pid = int(fields[0]), int(fields[1])
+        except ValueError:
+            continue
+        if pgid != record.pgid:
+            continue
+        members.append((pid, fields[2]))
+    return members
+
+
+def refresh_group_members(state: Path, record: ReplicaRecord) -> list[tuple[int, str]]:
+    """Re-freeze and persist the membership of a replica's process group.
+
+    Called at every supervisor health poll and immediately after a replacement
+    is recorded, so the list on disk never trails the live group by more than
+    one interval. Refreshing is only meaningful while ownership is still
+    provable; otherwise the existing list is the best evidence there is and
+    must not be overwritten by a scan that could pick up a recycled PGID.
+    """
+    if not _group_is_owned(state, record):
+        return []
+    members = _freeze_group_members(record)
+    with contextlib.suppress(OSError):
+        _persist_group_members(state, record, members)
+    return members
+
+
+def _expected_run_token(state: Path, index: int) -> str | None:
+    try:
+        payload = json.loads((state / "replica_specs.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, PermissionError, OSError):
+        return None
+    if not isinstance(payload, list):
+        return None
+    for item in payload:
+        if not isinstance(item, dict) or item.get("index") != index:
+            continue
+        environment = item.get("env")
+        if not isinstance(environment, dict):
+            return None
+        token = environment.get(RUN_TOKEN_ENV)
+        return token if isinstance(token, str) and token else None
+    return None
+
+
+def _process_run_token(pid: int) -> str | None:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return None
+    for entry in raw.split(b"\0"):
+        key, separator, value = entry.partition(b"=")
+        if separator and key.decode(errors="replace") == RUN_TOKEN_ENV:
+            return value.decode(errors="replace")
+    return None
+
+
+def _token_proves_group(state: Path, record: ReplicaRecord) -> bool:
+    # Second factor, and the formalisation of the identity checks a human has
+    # to perform by hand today: a live process that is in the recorded group
+    # *and* carries this replica's launch token belongs to this run whatever
+    # the process table says about the leader or the frozen list.
+    token = _expected_run_token(state, record.index)
+    if token is None:
+        return False
+    return any(
+        _process_run_token(pid) == token for pid, _ in _scan_group_members(record.pgid)
+    )
+
+
+def _group_is_owned(state: Path | None, record: ReplicaRecord) -> bool:
+    """Is the recorded process group provably still this run's?
+
+    Three states have to be told apart, and only the third means "do nothing":
+
+    * **zombie leader** — the leader exited but nothing has reaped it. Its PID
+      (which is the PGID) is still taken, so the group is provably ours. This
+      is what an init-less container produces.
+    * **reaped leader** — the leader is gone from the process table entirely.
+      The leader proves nothing any more, but a frozen member that still
+      matches its identity *and* is still in the group does: a PGID cannot be
+      reused while the group is non-empty. The launch token gives the same
+      proof independently. This is the normal case on any host with an init
+      that reaps, and for every replacement the supervisor itself launches.
+    * **all gone** — no leader entry, no frozen member alive, no token match.
+      The group no longer exists; there is nothing to signal. This is a true
+      "gone", not the old "ownership could not be proven".
+    """
+    if _record_group_is_owned(record):
+        return True
+    if state is None:
+        return False
+    if any(
+        _member_is_in_group(member, record.pgid)
+        for member in _load_group_members(state, record)
+    ):
+        return True
+    return _token_proves_group(state, record)
+
+
+def _freeze_group_members(record: ReplicaRecord) -> list[tuple[int, str]]:
+    # Snapshot (PID, start time) for every live member of the recorded group.
+    # Callers must have proven ownership of the group first (_group_is_owned),
+    # which is what rules out a recycled PGID. The leader is always included so
+    # the member set can never be empty and silently satisfy the wait below;
+    # when the leader has already been reaped its entry simply never matches.
+    members = [(record.pid, record.leader_start)]
+    members.extend(
+        (pid, start)
+        for pid, start in _scan_group_members(record.pgid)
+        if pid != record.pid
+    )
+    return members
+
+
 def _live_group_members(members: list[tuple[int, str]]) -> list[tuple[int, str]]:
     return [member for member in members if _member_identity_matches(member)]
 
 
-def _terminate_record(record: ReplicaRecord) -> None:
-    if not _record_group_is_owned(record):
+def _termination_targets(
+    state: Path | None,
+    record: ReplicaRecord,
+) -> list[tuple[int, str]]:
+    # Ownership has already been proven, so every process currently in the
+    # recorded group is this run's and belongs in the target set. The persisted
+    # list is merged in as well: it can name a member that has just become a
+    # zombie, which must still be waited on rather than assumed gone.
+    members = dict(_freeze_group_members(record))
+    for pid, start in _scan_group_members(record.pgid):
+        members.setdefault(pid, start)
+    if state is not None:
+        for pid, start in _load_group_members(state, record):
+            members.setdefault(pid, start)
+    return sorted(members.items())
+
+
+def _terminate_record(record: ReplicaRecord, *, state: Path | None = None) -> None:
+    if not _group_is_owned(state, record):
+        # All three ownership proofs failed, which means the group is gone —
+        # not merely unprovable. Nothing to signal.
         return
     # The leader exiting is not proof that the group is gone: a stage process
     # that ignores or is slow to handle SIGTERM keeps holding its MPS client
     # and device memory while the leader's identity already stops matching.
     # Freeze the whole membership first and wait on all of it, so a replacement
     # can never be launched next to a surviving member of the group it replaces.
-    members = _freeze_group_members(record)
+    members = _termination_targets(state, record)
     if not _live_group_members(members):
         return
+    # Group-wide TERM is safe here precisely because ownership was proven from
+    # something that is still *in* the group: a PGID cannot be recycled while
+    # the group has a member, so this signal cannot reach a foreign process.
+    # It is also what catches a member forked since the last refresh.
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(record.pgid, signal.SIGTERM)
     deadline = time.monotonic() + TERMINATE_TERM_GRACE_SECS
@@ -863,7 +1062,7 @@ def cleanup_pending_restarts(
                 break
             time.sleep(0.05)
         if target is not None:
-            _terminate_record(target)
+            _terminate_record(target, state=state)
         path.unlink(missing_ok=True)
         _append_event(
             state,
