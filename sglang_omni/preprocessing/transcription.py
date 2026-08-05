@@ -212,8 +212,19 @@ def stitch_transcripts(
         if not piece:
             continue
         if stitched and index > 0 and overlap_info[index - 1] > 0:
-            stitched_units = _transcript_units(stitched)
-            piece_units = _transcript_units(piece)
+            # Match on content units only: ASR often attaches sentence-final
+            # punctuation to the first chunk's tail ("...在此。" vs "在此奉劝"),
+            # and a punctuation unit would block the exact suffix-prefix match.
+            stitched_units = [
+                unit
+                for unit in _transcript_units(stitched)
+                if not _is_punctuation_only(unit.normalized)
+            ]
+            piece_units = [
+                unit
+                for unit in _transcript_units(piece)
+                if not _is_punctuation_only(unit.normalized)
+            ]
             unit_budget = math.ceil(
                 float(overlap_info[index - 1]) * _MAX_STITCH_UNITS_PER_OVERLAP_SECOND
             )
@@ -286,6 +297,12 @@ def _is_cjk_character(character: str) -> bool:
         or 0x20000 <= codepoint <= 0x2FA1F
         or 0x3040 <= codepoint <= 0x30FF
         or 0xAC00 <= codepoint <= 0xD7AF
+    )
+
+
+def _is_punctuation_only(normalized: str) -> bool:
+    return bool(normalized) and all(
+        unicodedata.category(character).startswith("P") for character in normalized
     )
 
 

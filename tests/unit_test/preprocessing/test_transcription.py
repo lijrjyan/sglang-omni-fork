@@ -320,3 +320,18 @@ def test_plan_chunks_early_silence_boundary_keeps_starts_valid() -> None:
         previous_start = chunk.start_sample
     assert chunks[0] == transcription.Chunk(0, 5)
     assert chunks[-1].end_sample == 100
+
+
+def test_stitch_dedup_ignores_sentence_final_punctuation_units() -> None:
+    """A100 regression: chunk 1 tail '在此。' must still match chunk 2's '在此…'."""
+    stitched = transcription.stitch_transcripts(
+        ["在此。", "在此奉劝大家，别乱打美白针。"], [2.0]
+    )
+    assert stitched == "在此。奉劝大家，别乱打美白针。"
+
+
+def test_stitch_dedup_ignores_punctuation_in_latin_overlap() -> None:
+    stitched = transcription.stitch_transcripts(
+        ["We learned a lot today.", "today, and there will be a quiz"], [2.0]
+    )
+    assert stitched == "We learned a lot today. and there will be a quiz"
