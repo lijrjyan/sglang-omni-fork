@@ -71,11 +71,26 @@ print(resp.json()["text"])
 | `language` | string | `en` | Language hint; `zh`/`cn` select Chinese, other values use English prompting |
 | `response_format` | string | `json` | `json`, `verbose_json`, or `text` |
 | `temperature` | float | `0.01` effective | Sampling temperature; `0` is converted to near-greedy `0.01` |
+| `max_new_tokens` | integer | automatic | Explicit positive transcription-token budget |
 
 `verbose_json` is accepted, but currently returns the same minimal JSON shape as `json`:
 `{"text": "..."}`.
 
-`max_new_tokens` is supported inside the model request builder, but the public transcription endpoint does not currently expose it as a form field. The route uses the ASR stage default unless the pipeline is configured another way.
+## Long Audio
+
+The default stage is sized for Qwen3-ASR's native 1200-second single-forward
+envelope. It preserves the complete mel sequence (`truncation=False`) and does
+not split or stitch transcripts. When `max_new_tokens` is omitted, the output
+budget keeps the upstream Qwen vLLM 4096-token floor and grows to 12000 tokens
+at 1200 seconds so that the upstream default does not become a flat long-audio
+ceiling. The context and prefill limits include the corresponding 15600 audio
+tokens plus the actual tokenized prompt overhead.
+
+Operators can pin `max_new_tokens` or change the guaranteed native envelope
+with the ASR stage's `max_audio_s` factory argument. A request-level
+`max_new_tokens` takes precedence over the operator default. The scheduler
+still clamps an oversized explicit request to the real per-request context and
+KV capacity instead of rejecting a request that otherwise fits.
 
 ## Benchmarking
 
@@ -103,3 +118,6 @@ the transcriber for the TTS and talker WER stages.
 - The endpoint accepts one uploaded file per request.
 - `prompt` is accepted by the HTTP endpoint for OpenAI compatibility, but Qwen3-ASR currently ignores it.
 - Audio is resampled to 16 kHz before transcription.
+- The automatic output budget is a bounded guard, not an EOS guarantee for
+  pathological or highly repetitive audio. Set `max_new_tokens` explicitly
+  when a workload needs a larger budget and the configured context permits it.
