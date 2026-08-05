@@ -7,6 +7,10 @@ from types import SimpleNamespace
 
 import sglang_omni.models.qwen3_asr.stages as qwen3_asr_stages
 from sglang_omni.models.qwen3_asr.config import Qwen3ASRPipelineConfig
+from sglang_omni.models.qwen3_asr.request_builders import (
+    QWEN3_ASR_MAX_AUDIO_SECONDS,
+    qwen3_asr_num_audio_tokens,
+)
 from sglang_omni.models.qwen3_asr.stages import create_sglang_qwen3_asr_executor
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from tests.unit_test.fakes import FakeServerArgs
@@ -22,6 +26,8 @@ def test_qwen3_asr_config_uses_batched_stage_with_32_running_requests() -> None:
     assert config.stages[0].factory.endswith("create_sglang_qwen3_asr_executor")
     assert config.stages[0].factory_args["device"] == "cuda:0"
     assert config.stages[0].factory_args["max_running_requests"] == 32
+    assert config.stages[0].factory_args["max_audio_s"] == 1200.0
+    assert "max_new_tokens" not in config.stages[0].factory_args
     assert config.stages[0].factory_args["request_build_max_workers"] == 2
     assert config.stages[0].factory_args["request_build_max_pending"] == 16
     assert "request_build_max_backlog" not in config.stages[0].factory_args
@@ -37,6 +43,8 @@ def test_qwen3_asr_stage_default_allows_32_running_requests() -> None:
     assert signature.parameters["max_running_requests"].default == 32
     assert signature.parameters["request_build_max_workers"].default == 2
     assert signature.parameters["request_build_max_pending"].default == 16
+    assert signature.parameters["max_audio_s"].default == QWEN3_ASR_MAX_AUDIO_SECONDS
+    assert signature.parameters["max_new_tokens"].default is None
     assert "request_build_max_backlog" not in signature.parameters
 
 
@@ -67,11 +75,20 @@ def test_qwen3_asr_stage_default_enables_async_decode() -> None:
 
 def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
     build_kwargs: dict[str, object] = {}
+    captured: dict[str, object] = {}
+
+    class _StageTokenizer:
+        def __call__(self, text, *, add_special_tokens=False):
+            assert not add_special_tokens
+            audio_pad_count = text.count("<|audio_pad|>")
+            return SimpleNamespace(
+                input_ids=[11] + [42] * audio_pad_count + [12, 13, 14]
+            )
 
     monkeypatch.setattr(
         qwen3_asr_stages.AutoTokenizer,
         "from_pretrained",
-        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: _StageTokenizer(),
     )
     monkeypatch.setattr(
         qwen3_asr_stages.AutoFeatureExtractor,
@@ -106,6 +123,7 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
     )
 
     def _fake_server_args_builder(model_path, context_length, **overrides):
+        captured["context_length"] = context_length
         build_kwargs.update(overrides)
         server_args = FakeServerArgs(**overrides)
         server_args.cuda_graph_config = SimpleNamespace(
@@ -145,6 +163,11 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
         async_decode_min_batch_size=4,
     )
 
+    max_audio_tokens = qwen3_asr_num_audio_tokens(1200 * 100)
+    assert max_audio_tokens == 15600
+    assert captured["context_length"] == max_audio_tokens + 4 + 12000 + 2
+    assert build_kwargs["max_prefill_tokens"] == max_audio_tokens + 4
+    assert build_kwargs["chunked_prefill_size"] == max_audio_tokens + 4
     assert build_kwargs["cuda_graph_max_bs"] == 32
     assert build_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
     assert scheduler.enable_async_decode is False

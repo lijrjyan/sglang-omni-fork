@@ -15,8 +15,10 @@ into those positions. So request_builder must:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Callable
 
 import torch
@@ -38,6 +40,13 @@ logger = logging.getLogger(__name__)
 
 _SAMPLE_RATE = 16000
 
+# Qwen's native wrapper keeps each clip in one model forward up to 1200 seconds.
+# Longer inputs are split by that wrapper, but SGLang-Omni deliberately does not
+# add a second transcript stitching policy here.
+QWEN3_ASR_MAX_AUDIO_SECONDS = 1200.0
+QWEN3_ASR_UPSTREAM_MAX_NEW_TOKENS = 4096
+_OUTPUT_TOKENS_PER_AUDIO_SECOND = 10
+
 _AUDIO_START = "<|audio_start|>"
 _AUDIO_PAD = "<|audio_pad|>"
 _AUDIO_END = "<|audio_end|>"
@@ -46,6 +55,7 @@ _ASR_TEXT = "<asr_text>"
 
 @dataclass
 class Qwen3ASRRequestData(SGLangARRequestData):
+    enforce_request_limits: bool = True
     prompt_token_ids: list[int] | None = None
     output_ids: list[int] | None = None
     audio_duration_s: float = 0.0
@@ -87,10 +97,63 @@ def _encode_literal(tokenizer: Any, text: str) -> list[int]:
     return list(input_ids)
 
 
+def build_qwen3_asr_prompt_ids(
+    tokenizer: Any, num_audio_tokens: int, language: str
+) -> list[int]:
+    prompt = (
+        f"<|im_start|>user\n"
+        f"{_AUDIO_START}{_AUDIO_PAD * num_audio_tokens}{_AUDIO_END}"
+        f"<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+    # Qwen3-ASR needs the same forced assistant prefix as upstream qwen_asr.
+    prompt += f"language {language}{_ASR_TEXT}"
+    return list(tokenizer(prompt, add_special_tokens=False).input_ids)
+
+
+def qwen3_asr_prompt_overhead_tokens(tokenizer: Any) -> int:
+    """Tokenized non-audio portion of the native ASR prompt."""
+    return len(build_qwen3_asr_prompt_ids(tokenizer, 0, "English"))
+
+
+def qwen3_asr_auto_output_budget(audio_duration_s: float) -> int:
+    """Keep the upstream floor while avoiding a flat long-audio ceiling."""
+    if not math.isfinite(audio_duration_s) or audio_duration_s < 0:
+        raise ValueError("audio duration must be a finite non-negative number")
+    return max(
+        QWEN3_ASR_UPSTREAM_MAX_NEW_TOKENS,
+        math.ceil(audio_duration_s * _OUTPUT_TOKENS_PER_AUDIO_SECOND),
+    )
+
+
+def _positive_max_new_tokens(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError("max_new_tokens must be a positive integer")
+    result = int(value)
+    if result < 1:
+        raise ValueError("max_new_tokens must be a positive integer")
+    return result
+
+
+def qwen3_asr_request_output_budget(
+    params: dict[str, Any],
+    *,
+    audio_duration_s: float,
+    default_max_new_tokens: int | None,
+) -> int:
+    """Resolve request > operator > duration-aware automatic precedence."""
+    explicit = params.get("max_new_tokens")
+    if explicit is not None:
+        return _positive_max_new_tokens(explicit)
+    if default_max_new_tokens is not None:
+        return _positive_max_new_tokens(default_max_new_tokens)
+    return qwen3_asr_auto_output_budget(audio_duration_s)
+
+
 def make_qwen3_asr_scheduler_adapters(
     *,
     tokenizer: Any,
-    max_new_tokens: int,
+    max_new_tokens: int | None,
     feature_extractor: Any = None,
 ) -> tuple[
     Callable[[StagePayload], Qwen3ASRRequestData], Callable[[Any], StagePayload]
@@ -102,20 +165,6 @@ def make_qwen3_asr_scheduler_adapters(
     eos_token_id = int(tokenizer.eos_token_id)
     vocab_size = int(tokenizer.vocab_size)
     asr_text_token_ids = _encode_literal(tokenizer, _ASR_TEXT)
-
-    def _build_prompt_ids(num_audio_tokens: int, language: str) -> list[int]:
-        prompt = (
-            f"<|im_start|>user\n"
-            f"{_AUDIO_START}{_AUDIO_PAD * num_audio_tokens}{_AUDIO_END}"
-            f"<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
-        # Qwen3-ASR needs a forced prefix "language <Lang><asr_text>" on the
-        # assistant turn; the model then generates only the transcription after
-        # <asr_text>. Without it the (small) model emits the language tag then
-        # stops. Upstream qwen_asr does the same (_build_text_prompt).
-        prompt = prompt + f"language {language}<asr_text>"
-        return tokenizer(prompt, add_special_tokens=False).input_ids
 
     def request_builder(payload: StagePayload) -> Qwen3ASRRequestData:
         params = payload.request.params or {}
@@ -164,7 +213,9 @@ def make_qwen3_asr_scheduler_adapters(
         forced_language = {"zh": "Chinese", "cn": "Chinese"}.get(
             lang_raw, "Chinese" if lang_raw.startswith("zh") else "English"
         )
-        input_ids = _build_prompt_ids(num_audio_tokens, forced_language)
+        input_ids = build_qwen3_asr_prompt_ids(
+            tokenizer, num_audio_tokens, forced_language
+        )
 
         audio_item = MultimodalDataItem(
             modality=Modality.AUDIO,
@@ -206,7 +257,11 @@ def make_qwen3_asr_scheduler_adapters(
             # Qwen3-ASR degenerates under pure-greedy (emits only the language
             # tag then EOS); upstream uses 0.01 near-greedy.
             temperature = 0.01
-        request_max_new_tokens = int(params.get("max_new_tokens") or max_new_tokens)
+        request_max_new_tokens = qwen3_asr_request_output_budget(
+            params,
+            audio_duration_s=audio_duration_s,
+            default_max_new_tokens=max_new_tokens,
+        )
         logger.debug(
             f"[qwen3-asr] sampling temp={temperature} "
             f"max_new_tokens={request_max_new_tokens} params={dict(params)}"
@@ -278,6 +333,12 @@ def make_qwen3_asr_scheduler_adapters(
 
 
 __all__ = [
+    "QWEN3_ASR_MAX_AUDIO_SECONDS",
+    "QWEN3_ASR_UPSTREAM_MAX_NEW_TOKENS",
     "Qwen3ASRRequestData",
+    "build_qwen3_asr_prompt_ids",
     "make_qwen3_asr_scheduler_adapters",
+    "qwen3_asr_auto_output_budget",
+    "qwen3_asr_prompt_overhead_tokens",
+    "qwen3_asr_request_output_budget",
 ]

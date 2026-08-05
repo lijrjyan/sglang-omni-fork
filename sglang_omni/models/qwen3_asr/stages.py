@@ -3,14 +3,20 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from transformers import AutoFeatureExtractor, AutoTokenizer
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.qwen3_asr.audio_lengths import qwen3_asr_num_audio_tokens
 from sglang_omni.models.qwen3_asr.request_builders import (
+    QWEN3_ASR_MAX_AUDIO_SECONDS,
     make_qwen3_asr_scheduler_adapters,
+    qwen3_asr_auto_output_budget,
+    qwen3_asr_prompt_overhead_tokens,
+    qwen3_asr_request_output_budget,
 )
 from sglang_omni.scheduling.bootstrap import (
     create_sglang_infrastructure_defer_cuda_graph,
@@ -33,7 +39,8 @@ def create_sglang_qwen3_asr_executor(
     device: str = "cuda:0",
     dtype: str = "float16",
     max_running_requests: int = 32,
-    max_new_tokens: int = 256,
+    max_audio_s: float = QWEN3_ASR_MAX_AUDIO_SECONDS,
+    max_new_tokens: int | None = None,
     mem_fraction_static: float | None = None,
     mm_embedding_cache_size_bytes: int = 0,
     enable_torch_compile: bool = False,
@@ -45,6 +52,10 @@ def create_sglang_qwen3_asr_executor(
     server_args_overrides: dict[str, Any] | None = None,
 ):
 
+    max_audio_s = float(max_audio_s)
+    if not math.isfinite(max_audio_s) or max_audio_s <= 0:
+        raise ValueError("max_audio_s must be a finite positive number")
+
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -52,15 +63,31 @@ def create_sglang_qwen3_asr_executor(
         model_path, trust_remote_code=True
     )
 
-    encoder_token_count = int(feature_extractor.nb_max_frames // 2)
+    max_mel_frames = math.ceil(max_audio_s * 100)
+    max_audio_tokens = qwen3_asr_num_audio_tokens(max_mel_frames)
+    prompt_overhead_tokens = qwen3_asr_prompt_overhead_tokens(tokenizer)
+    max_input_tokens = max_audio_tokens + prompt_overhead_tokens
+    max_output_tokens = (
+        qwen3_asr_request_output_budget(
+            {},
+            audio_duration_s=max_audio_s,
+            default_max_new_tokens=max_new_tokens,
+        )
+        if max_new_tokens is not None
+        else qwen3_asr_auto_output_budget(max_audio_s)
+    )
+    # SGLang reserves one token below context_length and one additional token
+    # in init_req_max_new_tokens. Include both so the advertised output budget
+    # survives scheduler admission unchanged at the 1200-second boundary.
+    context_length = max_input_tokens + max_output_tokens + 2
 
     defaults: dict[str, Any] = {
         "disable_cuda_graph": False,
         "disable_overlap_schedule": True,
         "enable_torch_compile": enable_torch_compile,
         "mem_fraction_static": mem_fraction_static,
-        "max_prefill_tokens": 4096,
-        "chunked_prefill_size": 4096,
+        "max_prefill_tokens": max_input_tokens,
+        "chunked_prefill_size": max_input_tokens,
         "sampling_backend": "pytorch",
         "dtype": dtype,
     }
@@ -70,15 +97,17 @@ def create_sglang_qwen3_asr_executor(
         sm_version = get_visible_gpu_sm_version(gpu_id)
         if sm_version is not None and sm_version >= 100:
             defaults["mm_attention_backend"] = "triton_attn"
+    incoming_overrides = dict(server_args_overrides or {})
+    context_length = int(incoming_overrides.pop("context_length", context_length))
     overrides = build_generation_batch_overrides(
         max_running_requests=max_running_requests,
-        server_args_overrides=server_args_overrides,
+        server_args_overrides=incoming_overrides,
         **defaults,
     )
 
     server_args = build_sglang_server_args(
         model_path,
-        context_length=encoder_token_count + int(max_new_tokens) + 8,
+        context_length=context_length,
         **overrides,
     )
     validate_generation_batch_policy(
@@ -86,14 +115,17 @@ def create_sglang_qwen3_asr_executor(
         server_args=server_args,
     )
 
-    want_cuda_graph, (
-        model_worker,
-        tree_cache,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-        prefill_mgr,
-        decode_mgr,
-        model_config,
+    (
+        want_cuda_graph,
+        (
+            model_worker,
+            tree_cache,
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            prefill_mgr,
+            decode_mgr,
+            model_config,
+        ),
     ) = create_sglang_infrastructure_defer_cuda_graph(
         server_args,
         gpu_id,

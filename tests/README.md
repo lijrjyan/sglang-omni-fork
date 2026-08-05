@@ -385,6 +385,8 @@ that happened to contain an older version of the test.
     and `--decode-mode async|sync` CLI overrides
   - single-source audio token length formula used by both processor and
     request builder paths
+  - native 1,200-second feature preservation, duration-aware output budgets,
+    context/prefill sizing, and explicit token-budget validation
   - token-level result adapter marker handling, avoiding decode/encode
     text round-trips for byte-level BPE output.
 - `unit_test/fun_asr/`: Fun-ASR-Nano unit tests:
