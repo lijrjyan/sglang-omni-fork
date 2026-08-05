@@ -7,16 +7,16 @@ from types import SimpleNamespace
 
 import sglang_omni.models.qwen3_asr.stages as qwen3_asr_stages
 from sglang_omni.cli.serve import apply_asr_chunking_cli_overrides
-from sglang_omni.models.qwen3_asr.config import Qwen3ASRPipelineConfig
 from sglang_omni.models.qwen3_asr.chunking import (
     QWEN3_ASR_AUTO_CHUNK_DEFAULT,
     QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
     QWEN3_ASR_CHUNK_WINDOW_SECONDS,
 )
+from sglang_omni.models.qwen3_asr.config import Qwen3ASRPipelineConfig
 from sglang_omni.models.qwen3_asr.stages import create_sglang_qwen3_asr_executor
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
-from tests.unit_test.fakes import FakeServerArgs
 from sglang_omni.serve.launcher import _transcription_chunking_kwargs
+from tests.unit_test.fakes import FakeServerArgs
 
 
 def test_qwen3_asr_config_uses_batched_stage_with_32_running_requests() -> None:

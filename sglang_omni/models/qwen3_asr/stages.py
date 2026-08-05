@@ -54,7 +54,6 @@ def create_sglang_qwen3_asr_executor(
     asr_chunk_overlap_seconds: float = QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
     server_args_overrides: dict[str, Any] | None = None,
 ):
-
     validate_qwen3_asr_chunking(asr_chunk_max_seconds, asr_chunk_overlap_seconds)
 
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0

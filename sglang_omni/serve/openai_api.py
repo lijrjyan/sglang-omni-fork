@@ -70,7 +70,6 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
-from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
 from sglang_omni.preprocessing.transcription import (
     DEFAULT_TARGET_SAMPLE_RATE,
     Chunk,
@@ -78,6 +77,7 @@ from sglang_omni.preprocessing.transcription import (
     plan_chunks,
     stitch_transcripts,
 )
+from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
     AdminRequestBase,
@@ -1846,9 +1846,8 @@ def _register_transcriptions(app: FastAPI) -> None:
 
         adapter = resolve_adapter(getattr(app.state, "architectures", None))
         text = adapter.postprocess_text(text)
-        # Chunk-local timestamps are intentionally not remapped in F1. The
-        # endpoint's current plain-text/minimal-JSON contract is preserved;
-        # timestamp-bearing chunk aggregation belongs to a follow-up.
+        # Chunked responses aggregate text only because timestamp-bearing
+        # formats require remapping each chunk to the original timeline.
         usage = (
             TranscriptionUsage(seconds=math.ceil(duration_s))
             if duration_s > 0

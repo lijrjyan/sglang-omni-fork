@@ -166,14 +166,12 @@ def test_prepare_audio_accepts_http_url(monkeypatch) -> None:
 
 
 def test_prepare_audio_resamples_and_downmixes_like_before() -> None:
-    # 8 kHz clip: resampled to the 16 kHz target, so duration is preserved
     prepared = prepare_audio(
         _payload({"audio_bytes": _wav_bytes(num_samples=800, sample_rate=8000)}),
         source_name="Test",
     )
     assert prepared.duration_s == pytest.approx(0.1)
 
-    # stereo clip: downmixed to mono at the same length
     prepared = prepare_audio(
         _payload({"audio_bytes": _wav_bytes(num_channels=2)}), source_name="Test"
     )

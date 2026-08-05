@@ -157,8 +157,8 @@ def make_qwen3_asr_scheduler_adapters(
             return_tensors="pt",
             return_attention_mask=True,
             padding="longest",
-            # note (Junnan Li): Qwen3-ASR's encoder accepts mel sequences beyond
-            # Whisper's 30-second window, so preprocessing must not truncate them.
+            # note (Junnan Li): Qwen3-ASR accepts variable-length mel inputs, so
+            # Whisper's 30-second preprocessing truncation must stay disabled.
             truncation=False,
         )
         features = extracted.input_features

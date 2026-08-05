@@ -5,9 +5,8 @@ from __future__ import annotations
 
 QWEN3_ASR_AUTO_CHUNK_DEFAULT = True
 
-# This is the safe window admitted by the current deployed context sizing in
-# stages.py. It is not the model's native envelope; when that capacity grows,
-# this model-owned constant is the single default that needs to change.
+# The serving context currently admits 30-second requests, which is smaller
+# than Qwen3-ASR's native audio envelope.
 QWEN3_ASR_CHUNK_WINDOW_SECONDS = 30.0
 QWEN3_ASR_CHUNK_OVERLAP_SECONDS = 2.0
 
