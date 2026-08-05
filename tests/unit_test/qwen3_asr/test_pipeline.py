@@ -5,6 +5,9 @@ from __future__ import annotations
 import inspect
 from types import SimpleNamespace
 
+import pytest
+import typer
+
 import sglang_omni.models.qwen3_asr.stages as qwen3_asr_stages
 from sglang_omni.cli.serve import apply_asr_chunking_cli_overrides
 from sglang_omni.models.qwen3_asr.chunking import (
@@ -205,3 +208,47 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
     assert build_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
     assert scheduler.enable_async_decode is False
     assert scheduler.async_decode_min_batch_size == 4
+
+
+def test_qwen3_asr_launcher_chunking_respects_runtime_overrides() -> None:
+    """The endpoint must see the same resolved policy as the worker factory."""
+    config = Qwen3ASRPipelineConfig(model_path="Qwen/Qwen3-ASR-1.7B")
+    config.stages[0].factory_args.update(
+        {
+            "asr_auto_chunk": False,
+            "asr_chunk_max_seconds": 45.0,
+            "asr_chunk_overlap_seconds": 3.0,
+        }
+    )
+    config.runtime_overrides = {
+        "asr": {
+            "asr_auto_chunk": True,
+            "asr_chunk_max_seconds": 30.0,
+            "asr_chunk_overlap_seconds": 2.0,
+        }
+    }
+
+    assert _transcription_chunking_kwargs(config) == {
+        "asr_auto_chunk": True,
+        "asr_chunk_max_seconds": 30.0,
+        "asr_chunk_overlap_seconds": 2.0,
+    }
+
+
+def test_qwen3_asr_cli_chunking_validation_uses_model_validator() -> None:
+    config = Qwen3ASRPipelineConfig(model_path="Qwen/Qwen3-ASR-1.7B")
+
+    with pytest.raises(typer.BadParameter, match="must be positive"):
+        apply_asr_chunking_cli_overrides(
+            config,
+            asr_auto_chunk=None,
+            asr_chunk_max_seconds=-1.0,
+            asr_chunk_overlap_seconds=None,
+        )
+    with pytest.raises(typer.BadParameter, match="smaller than"):
+        apply_asr_chunking_cli_overrides(
+            config,
+            asr_auto_chunk=None,
+            asr_chunk_max_seconds=10.0,
+            asr_chunk_overlap_seconds=10.0,
+        )

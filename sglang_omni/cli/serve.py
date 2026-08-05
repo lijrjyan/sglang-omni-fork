@@ -4,6 +4,11 @@ import logging
 from typing import Annotated, Literal, NoReturn
 
 import typer
+from sglang_omni.models.qwen3_asr.chunking import (
+    QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
+    QWEN3_ASR_CHUNK_WINDOW_SECONDS,
+    validate_qwen3_asr_chunking,
+)
 import yaml
 
 from sglang_omni.config import (
@@ -877,12 +882,8 @@ def apply_asr_chunking_cli_overrides(
     if asr_auto_chunk is not None:
         updates["asr_auto_chunk"] = bool(asr_auto_chunk)
     if asr_chunk_max_seconds is not None:
-        if asr_chunk_max_seconds <= 0:
-            raise typer.BadParameter("--asr-chunk-max-seconds must be positive")
         updates["asr_chunk_max_seconds"] = float(asr_chunk_max_seconds)
     if asr_chunk_overlap_seconds is not None:
-        if asr_chunk_overlap_seconds < 0:
-            raise typer.BadParameter("--asr-chunk-overlap-seconds must be non-negative")
         updates["asr_chunk_overlap_seconds"] = float(asr_chunk_overlap_seconds)
     if not updates:
         return pipeline_config
@@ -898,17 +899,23 @@ def apply_asr_chunking_cli_overrides(
     for stage in matching_stages:
         effective = dict(stage.factory_args or {})
         effective.update(updates)
-        max_seconds = effective.get("asr_chunk_max_seconds")
-        overlap_seconds = effective.get("asr_chunk_overlap_seconds")
-        if (
-            max_seconds is not None
-            and overlap_seconds is not None
-            and float(overlap_seconds) >= float(max_seconds)
-        ):
-            raise typer.BadParameter(
-                "--asr-chunk-overlap-seconds must be smaller than "
-                "--asr-chunk-max-seconds"
+        # Single validation source: the model-owned validator. The CLI layer
+        # only translates its ValueError into a typer.BadParameter.
+        try:
+            validate_qwen3_asr_chunking(
+                float(
+                    effective.get(
+                        "asr_chunk_max_seconds", QWEN3_ASR_CHUNK_WINDOW_SECONDS
+                    )
+                ),
+                float(
+                    effective.get(
+                        "asr_chunk_overlap_seconds", QWEN3_ASR_CHUNK_OVERLAP_SECONDS
+                    )
+                ),
             )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
     _apply_factory_args_updates(pipeline_config, matching_stages, updates)
     return pipeline_config
 

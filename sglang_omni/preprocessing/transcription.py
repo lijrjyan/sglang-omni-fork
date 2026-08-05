@@ -187,7 +187,9 @@ def plan_chunks(
         if end == num_samples:
             break
         previous_end = end
-        start = end - overlap_samples
+        # An early silence boundary can sit at or before the overlap width;
+        # clamp so every start stays in-range and strictly increases.
+        start = max(end - overlap_samples, start + 1)
     return chunks
 
 

@@ -301,3 +301,22 @@ def test_stitch_transcripts_ignores_empty_pieces() -> None:
     assert stitch_transcripts(["", "hello world", "", "world again"], [1, 1, 1]) == (
         "hello world again"
     )
+
+
+def test_plan_chunks_early_silence_boundary_keeps_starts_valid() -> None:
+    """A silence point at or before the overlap width must not slip negative."""
+    chunks = transcription.plan_chunks(
+        num_samples=100,
+        sample_rate=1,
+        max_window_s=35.0,
+        overlap_s=10.0,
+        vad_boundaries=[5],
+    )
+
+    previous_start = -1
+    for chunk in chunks:
+        assert 0 <= chunk.start_sample < chunk.end_sample <= 100
+        assert chunk.start_sample > previous_start
+        previous_start = chunk.start_sample
+    assert chunks[0] == transcription.Chunk(0, 5)
+    assert chunks[-1].end_sample == 100

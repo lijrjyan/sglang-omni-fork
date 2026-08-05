@@ -39,6 +39,7 @@ from pydantic import BaseModel
 
 from sglang_omni.client import Client
 from sglang_omni.config import PipelineConfig
+from sglang_omni.config.runtime import resolve_stage_static_factory_args
 from sglang_omni.models.model_capabilities import get_model_capabilities
 from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
@@ -193,7 +194,12 @@ def _transcription_chunking_kwargs(
         ),
         None,
     )
-    factory_args = dict(entry_stage.factory_args or {}) if entry_stage else {}
+    if entry_stage is None:
+        return {}
+    # Use the standard resolver so runtime_overrides win here exactly as they
+    # do for the worker-side factory; reading factory_args directly can hand
+    # the endpoint a different policy than the stage actually runs with.
+    factory_args = resolve_stage_static_factory_args(entry_stage, pipeline_config)
     keys = (
         "asr_auto_chunk",
         "asr_chunk_max_seconds",
