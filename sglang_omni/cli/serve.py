@@ -5,7 +5,6 @@ from typing import Annotated, Literal, NoReturn
 
 import typer
 from sglang_omni.models.qwen3_asr.chunking import (
-    QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
     QWEN3_ASR_CHUNK_WINDOW_SECONDS,
     validate_qwen3_asr_chunking,
 )
@@ -876,15 +875,12 @@ def apply_asr_chunking_cli_overrides(
     *,
     asr_auto_chunk: bool | None,
     asr_chunk_max_seconds: float | None,
-    asr_chunk_overlap_seconds: float | None,
 ) -> PipelineConfig:
     updates: dict[str, object] = {}
     if asr_auto_chunk is not None:
         updates["asr_auto_chunk"] = bool(asr_auto_chunk)
     if asr_chunk_max_seconds is not None:
         updates["asr_chunk_max_seconds"] = float(asr_chunk_max_seconds)
-    if asr_chunk_overlap_seconds is not None:
-        updates["asr_chunk_overlap_seconds"] = float(asr_chunk_overlap_seconds)
     if not updates:
         return pipeline_config
 
@@ -894,7 +890,7 @@ def apply_asr_chunking_cli_overrides(
     if not matching_stages:
         _raise_unsupported_flag(
             pipeline_config,
-            "--asr-auto-chunk/--asr-chunk-max-seconds/--asr-chunk-overlap-seconds",
+            "--asr-auto-chunk/--asr-chunk-max-seconds",
         )
     for stage in matching_stages:
         effective = dict(stage.factory_args or {})
@@ -907,12 +903,7 @@ def apply_asr_chunking_cli_overrides(
                     effective.get(
                         "asr_chunk_max_seconds", QWEN3_ASR_CHUNK_WINDOW_SECONDS
                     )
-                ),
-                float(
-                    effective.get(
-                        "asr_chunk_overlap_seconds", QWEN3_ASR_CHUNK_OVERLAP_SECONDS
-                    )
-                ),
+                )
             )
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
@@ -1246,14 +1237,6 @@ def serve(
             help="Override the hard maximum duration of each ASR chunk.",
         ),
     ] = None,
-    asr_chunk_overlap_seconds: Annotated[
-        float | None,
-        typer.Option(
-            "--asr-chunk-overlap-seconds",
-            min=0.0,
-            help="Override the overlap duration between adjacent ASR chunks.",
-        ),
-    ] = None,
     decode_mode: Annotated[
         str | None,
         typer.Option(
@@ -1414,7 +1397,6 @@ def serve(
         merged_config,
         asr_auto_chunk=asr_auto_chunk,
         asr_chunk_max_seconds=asr_chunk_max_seconds,
-        asr_chunk_overlap_seconds=asr_chunk_overlap_seconds,
     )
     generation_server_args_overrides: dict[str, object] = {}
     if max_running_requests is not None:

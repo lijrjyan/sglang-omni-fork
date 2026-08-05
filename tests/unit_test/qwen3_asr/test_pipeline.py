@@ -12,7 +12,6 @@ import sglang_omni.models.qwen3_asr.stages as qwen3_asr_stages
 from sglang_omni.cli.serve import apply_asr_chunking_cli_overrides
 from sglang_omni.models.qwen3_asr.chunking import (
     QWEN3_ASR_AUTO_CHUNK_DEFAULT,
-    QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
     QWEN3_ASR_CHUNK_WINDOW_SECONDS,
 )
 from sglang_omni.models.qwen3_asr.config import Qwen3ASRPipelineConfig
@@ -36,7 +35,7 @@ def test_qwen3_asr_config_uses_batched_stage_with_32_running_requests() -> None:
     assert config.stages[0].factory_args["request_build_max_pending"] == 16
     assert config.stages[0].factory_args["asr_auto_chunk"] is True
     assert config.stages[0].factory_args["asr_chunk_max_seconds"] == 30.0
-    assert config.stages[0].factory_args["asr_chunk_overlap_seconds"] == 2.0
+    assert "asr_chunk_overlap_seconds" not in config.stages[0].factory_args
     assert "request_build_max_backlog" not in config.stages[0].factory_args
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("Qwen3ASRForConditionalGeneration")
@@ -87,9 +86,7 @@ def test_qwen3_asr_stage_owns_auto_chunk_defaults() -> None:
     assert signature.parameters["asr_chunk_max_seconds"].default == (
         QWEN3_ASR_CHUNK_WINDOW_SECONDS
     )
-    assert signature.parameters["asr_chunk_overlap_seconds"].default == (
-        QWEN3_ASR_CHUNK_OVERLAP_SECONDS
-    )
+    assert "asr_chunk_overlap_seconds" not in signature.parameters
 
 
 def test_qwen3_asr_cli_chunking_overrides_take_priority() -> None:
@@ -99,13 +96,12 @@ def test_qwen3_asr_cli_chunking_overrides_take_priority() -> None:
         config,
         asr_auto_chunk=False,
         asr_chunk_max_seconds=45.0,
-        asr_chunk_overlap_seconds=3.0,
     )
 
     assert result is config
     assert config.stages[0].factory_args["asr_auto_chunk"] is False
     assert config.stages[0].factory_args["asr_chunk_max_seconds"] == 45.0
-    assert config.stages[0].factory_args["asr_chunk_overlap_seconds"] == 3.0
+    assert "asr_chunk_overlap_seconds" not in config.stages[0].factory_args
 
 
 def test_qwen3_asr_launcher_forwards_resolved_chunking_policy() -> None:
@@ -114,13 +110,11 @@ def test_qwen3_asr_launcher_forwards_resolved_chunking_policy() -> None:
         config,
         asr_auto_chunk=False,
         asr_chunk_max_seconds=45.0,
-        asr_chunk_overlap_seconds=3.0,
     )
 
     assert _transcription_chunking_kwargs(config) == {
         "asr_auto_chunk": False,
         "asr_chunk_max_seconds": 45.0,
-        "asr_chunk_overlap_seconds": 3.0,
     }
 
 
@@ -217,21 +211,18 @@ def test_qwen3_asr_launcher_chunking_respects_runtime_overrides() -> None:
         {
             "asr_auto_chunk": False,
             "asr_chunk_max_seconds": 45.0,
-            "asr_chunk_overlap_seconds": 3.0,
         }
     )
     config.runtime_overrides = {
         "asr": {
             "asr_auto_chunk": True,
             "asr_chunk_max_seconds": 30.0,
-            "asr_chunk_overlap_seconds": 2.0,
         }
     }
 
     assert _transcription_chunking_kwargs(config) == {
         "asr_auto_chunk": True,
         "asr_chunk_max_seconds": 30.0,
-        "asr_chunk_overlap_seconds": 2.0,
     }
 
 
@@ -243,12 +234,4 @@ def test_qwen3_asr_cli_chunking_validation_uses_model_validator() -> None:
             config,
             asr_auto_chunk=None,
             asr_chunk_max_seconds=-1.0,
-            asr_chunk_overlap_seconds=None,
-        )
-    with pytest.raises(typer.BadParameter, match="smaller than"):
-        apply_asr_chunking_cli_overrides(
-            config,
-            asr_auto_chunk=None,
-            asr_chunk_max_seconds=10.0,
-            asr_chunk_overlap_seconds=10.0,
         )

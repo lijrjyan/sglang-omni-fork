@@ -83,7 +83,6 @@ def _app(client, *, enabled: bool):
         model_name="Qwen/Qwen3-ASR-1.7B",
         asr_auto_chunk=enabled,
         asr_chunk_max_seconds=4.0,
-        asr_chunk_overlap_seconds=1.0,
     )
 
 
@@ -102,8 +101,8 @@ async def _call(app, audio_bytes: bytes, *, stream: bool = False):
 
 
 @pytest.mark.asyncio
-async def test_endpoint_auto_chunks_and_stitches_long_audio() -> None:
-    client = _TranscriptionClient(["hello boundary", "boundary world", "world done"])
+async def test_endpoint_auto_chunks_and_joins_long_audio() -> None:
+    client = _TranscriptionClient(["hello boundary", "world done"])
 
     response = await _call(_app(client, enabled=True), _wav_bytes(8.0))
 
@@ -112,7 +111,7 @@ async def test_endpoint_auto_chunks_and_stitches_long_audio() -> None:
         "text": "hello boundary world done",
         "usage": {"type": "duration", "seconds": 8},
     }
-    assert len(client.requests) == 3
+    assert len(client.requests) == 2
     assert all(
         _probe_audio_duration(request.prompt["audio_bytes"]) <= 4.0
         for request in client.requests
@@ -145,8 +144,8 @@ async def test_endpoint_rejects_long_audio_when_auto_chunk_disabled() -> None:
 
 
 @pytest.mark.asyncio
-async def test_endpoint_streams_stitched_long_audio() -> None:
-    client = _TranscriptionClient(["hello boundary", "boundary world", "world done"])
+async def test_endpoint_streams_joined_long_audio() -> None:
+    client = _TranscriptionClient(["hello boundary", "world done"])
 
     response = await _call(_app(client, enabled=True), _wav_bytes(8.0), stream=True)
     body = "".join([line async for line in response.body_iterator])
@@ -164,7 +163,7 @@ async def test_endpoint_abandons_remaining_chunks_and_returns_500_on_child_failu
     client = _FailingTranscriptionClient(["first chunk"])
 
     with pytest.raises(HTTPException) as exc_info:
-        await _call(_app(client, enabled=True), _wav_bytes(8.0))
+        await _call(_app(client, enabled=True), _wav_bytes(12.0))
 
     assert exc_info.value.status_code == 500
     assert "child completion failed" in exc_info.value.detail

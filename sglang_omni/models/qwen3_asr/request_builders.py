@@ -35,7 +35,6 @@ from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from .audio_lengths import qwen3_asr_num_audio_tokens
 from .chunking import (
     QWEN3_ASR_AUTO_CHUNK_DEFAULT,
-    QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
     QWEN3_ASR_CHUNK_WINDOW_SECONDS,
     validate_qwen3_asr_chunking,
 )
@@ -100,14 +99,13 @@ def make_qwen3_asr_scheduler_adapters(
     feature_extractor: Any = None,
     asr_auto_chunk: bool = QWEN3_ASR_AUTO_CHUNK_DEFAULT,
     asr_chunk_max_seconds: float = QWEN3_ASR_CHUNK_WINDOW_SECONDS,
-    asr_chunk_overlap_seconds: float = QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
     sample_rate: int = _SAMPLE_RATE,
 ) -> tuple[
     Callable[[StagePayload], Qwen3ASRRequestData], Callable[[Any], StagePayload]
 ]:
     if feature_extractor is None:
         raise ValueError("Qwen3-ASR processor is missing a feature_extractor")
-    validate_qwen3_asr_chunking(asr_chunk_max_seconds, asr_chunk_overlap_seconds)
+    validate_qwen3_asr_chunking(asr_chunk_max_seconds)
 
     audio_pad_token_id = int(tokenizer.convert_tokens_to_ids(_AUDIO_PAD))
     eos_token_id = int(tokenizer.eos_token_id)

@@ -203,7 +203,6 @@ def _transcription_chunking_kwargs(
     keys = (
         "asr_auto_chunk",
         "asr_chunk_max_seconds",
-        "asr_chunk_overlap_seconds",
     )
     if "asr_chunk_max_seconds" not in factory_args:
         return {}

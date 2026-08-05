@@ -374,7 +374,7 @@ that happened to contain an older version of the test.
   - ASR audio source compatibility, duration/fingerprint derivation, and
     resampling/downmix behavior
   - exact-sample long-audio chunk planning, silence-boundary preference,
-    hard-window fallback, overlap, and transcript de-duplication.
+    non-overlapping hard-window fallback, and language-aware text joining.
 - `unit_test/models/`: Model registry and cross-model contract tests:
   - static TTS `ModelCapabilities` declarations, registry lookup, aliases, and
     launcher startup logging.
@@ -397,7 +397,7 @@ that happened to contain an older version of the test.
     short-audio path preservation, and explicit over-window rejection when
     chunking is disabled.
 - `unit_test/serve/test_asr_auto_chunk.py`: OpenAI-compatible transcription tests:
-  - long-audio chunk orchestration and overlap-aware multilingual text stitching
+  - non-overlapping long-audio chunk orchestration and multilingual text joining
   - unchanged single-request handling at or below the configured model window
   - explicit HTTP 400 behavior when long-audio auto chunking is disabled
   - whole-request HTTP 500 failure with remaining chunks abandoned after a child

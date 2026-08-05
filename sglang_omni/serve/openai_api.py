@@ -234,7 +234,6 @@ def create_app(
     architectures: list[str] | None = None,
     asr_auto_chunk: bool | None = None,
     asr_chunk_max_seconds: float | None = None,
-    asr_chunk_overlap_seconds: float = 0.0,
 ) -> FastAPI:
     """Create a FastAPI application with OpenAI-compatible endpoints.
 
@@ -263,7 +262,6 @@ def create_app(
         architectures: Model architectures used by transcription adapters.
         asr_auto_chunk: Optional model-owned long-audio chunking toggle.
         asr_chunk_max_seconds: Hard maximum duration for each ASR chunk.
-        asr_chunk_overlap_seconds: Overlap between adjacent ASR chunks.
 
     Returns:
         Configured FastAPI application.
@@ -288,7 +286,6 @@ def create_app(
     app.state.architectures = [a for a in (architectures or []) if a]
     app.state.asr_auto_chunk = asr_auto_chunk
     app.state.asr_chunk_max_seconds = asr_chunk_max_seconds
-    app.state.asr_chunk_overlap_seconds = asr_chunk_overlap_seconds
     app.state.realtime_enabled = enable_realtime
     app.state.supports_realtime_audio_output = supports_realtime_audio_output
     app.state.speaker_sample_store = SpeakerSampleStore()
@@ -1696,7 +1693,6 @@ def _register_transcriptions(app: FastAPI) -> None:
             chunk_plan = _plan_transcription_chunks(
                 chunk_waveform,
                 chunk_max_s,
-                app.state.asr_chunk_overlap_seconds,
             )
         if chunk_plan is not None and stream:
             base_request = build_transcription_generate_request(
@@ -1871,14 +1867,12 @@ def _register_transcriptions(app: FastAPI) -> None:
 def _plan_transcription_chunks(
     waveform: Any,
     max_window_s: float,
-    overlap_s: float,
 ) -> list[Chunk]:
     vad_boundaries = detect_silence_boundaries(waveform, DEFAULT_TARGET_SAMPLE_RATE)
     return plan_chunks(
         len(waveform),
         DEFAULT_TARGET_SAMPLE_RATE,
         max_window_s,
-        overlap_s,
         vad_boundaries,
     )
 
@@ -1913,11 +1907,7 @@ async def _complete_auto_chunked_transcription(
             request_id=f"{request_id}-chunk-{index}",
         )
         pieces.append(result.text)
-    overlap_seconds = [
-        (previous.end_sample - current.start_sample) / DEFAULT_TARGET_SAMPLE_RATE
-        for previous, current in zip(chunks, chunks[1:])
-    ]
-    return stitch_transcripts(pieces, overlap_seconds)
+    return stitch_transcripts(pieces)
 
 
 async def _completed_transcription_stream(

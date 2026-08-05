@@ -28,7 +28,6 @@ from sglang_omni.utils.gpu_compat import get_visible_gpu_sm_version
 
 from .chunking import (
     QWEN3_ASR_AUTO_CHUNK_DEFAULT,
-    QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
     QWEN3_ASR_CHUNK_WINDOW_SECONDS,
     validate_qwen3_asr_chunking,
 )
@@ -51,10 +50,9 @@ def create_sglang_qwen3_asr_executor(
     request_build_max_pending: int | None = 16,
     asr_auto_chunk: bool = QWEN3_ASR_AUTO_CHUNK_DEFAULT,
     asr_chunk_max_seconds: float = QWEN3_ASR_CHUNK_WINDOW_SECONDS,
-    asr_chunk_overlap_seconds: float = QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
     server_args_overrides: dict[str, Any] | None = None,
 ):
-    validate_qwen3_asr_chunking(asr_chunk_max_seconds, asr_chunk_overlap_seconds)
+    validate_qwen3_asr_chunking(asr_chunk_max_seconds)
 
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
@@ -130,7 +128,6 @@ def create_sglang_qwen3_asr_executor(
         max_new_tokens=max_new_tokens,
         asr_auto_chunk=asr_auto_chunk,
         asr_chunk_max_seconds=asr_chunk_max_seconds,
-        asr_chunk_overlap_seconds=asr_chunk_overlap_seconds,
     )
 
     return OmniScheduler(

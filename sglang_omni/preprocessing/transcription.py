@@ -14,7 +14,6 @@ sources beyond the default payload keys (e.g. MOSS-Transcribe-Diarize).
 
 from __future__ import annotations
 
-import math
 import unicodedata
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Sequence
@@ -75,18 +74,6 @@ class Chunk:
         return self.end_sample - self.start_sample
 
 
-# Conservative upper bound for either CJK characters or whitespace-delimited
-# words produced by ASR during one second of overlapped audio.
-_MAX_STITCH_UNITS_PER_OVERLAP_SECOND = 20
-
-
-@dataclass(frozen=True)
-class _TranscriptUnit:
-    normalized: str
-    start: int
-    end: int
-
-
 def detect_silence_boundaries(
     waveform: np.ndarray,
     sample_rate: int,
@@ -144,23 +131,17 @@ def plan_chunks(
     num_samples: int,
     sample_rate: int,
     max_window_s: float,
-    overlap_s: float,
     vad_boundaries: Sequence[int],
 ) -> list[Chunk]:
-    """Plan exact half-open windows, preferring silence before each hard limit."""
+    """Plan non-overlapping windows, preferring silence before each hard limit."""
 
     if num_samples < 0:
         raise ValueError("num_samples must be non-negative")
     if sample_rate <= 0:
         raise ValueError("sample_rate must be positive")
     max_samples = round(max_window_s * sample_rate)
-    overlap_samples = round(overlap_s * sample_rate)
     if max_samples <= 0:
         raise ValueError("max_window_s must produce at least one sample")
-    if overlap_samples < 0:
-        raise ValueError("overlap_s must be non-negative")
-    if overlap_samples >= max_samples:
-        raise ValueError("overlap_s must be smaller than max_window_s")
     if num_samples == 0:
         return []
     if num_samples <= max_samples:
@@ -171,104 +152,31 @@ def plan_chunks(
     )
     chunks: list[Chunk] = []
     start = 0
-    previous_end = 0
     while start < num_samples:
         hard_end = min(start + max_samples, num_samples)
         if hard_end == num_samples:
             end = hard_end
         else:
             candidates = [
-                boundary
-                for boundary in boundaries
-                if previous_end < boundary <= hard_end
+                boundary for boundary in boundaries if start < boundary <= hard_end
             ]
             end = candidates[-1] if candidates else hard_end
         chunks.append(Chunk(start, end))
         if end == num_samples:
             break
-        previous_end = end
-        # An early silence boundary can sit at or before the overlap width;
-        # clamp so every start stays in-range and strictly increases.
-        start = max(end - overlap_samples, start + 1)
+        start = end
     return chunks
 
 
-def stitch_transcripts(
-    pieces: Sequence[str], overlap_info: Sequence[int | float | bool]
-) -> str:
-    """Join chunk text with bounded exact suffix-prefix overlap removal.
-
-    CJK text is split into individual characters while whitespace-delimited
-    text is split into words. The overlap duration bounds how many units may be
-    compared, so repeated text outside the audio overlap is never guessed away.
-    """
-
-    if len(overlap_info) != max(len(pieces) - 1, 0):
-        raise ValueError("overlap_info must have one entry per adjacent piece")
-
+def stitch_transcripts(pieces: Sequence[str]) -> str:
+    """Join chunk text with a language-aware separator and no de-duplication."""
     stitched = ""
-    for index, piece in enumerate(pieces):
+    for piece in pieces:
         piece = piece.strip()
         if not piece:
             continue
-        if stitched and index > 0 and overlap_info[index - 1] > 0:
-            # Match on content units only: ASR often attaches sentence-final
-            # punctuation to the first chunk's tail ("...在此。" vs "在此奉劝"),
-            # and a punctuation unit would block the exact suffix-prefix match.
-            stitched_units = [
-                unit
-                for unit in _transcript_units(stitched)
-                if not _is_punctuation_only(unit.normalized)
-            ]
-            piece_units = [
-                unit
-                for unit in _transcript_units(piece)
-                if not _is_punctuation_only(unit.normalized)
-            ]
-            unit_budget = math.ceil(
-                float(overlap_info[index - 1]) * _MAX_STITCH_UNITS_PER_OVERLAP_SECOND
-            )
-            max_match = min(len(stitched_units), len(piece_units), unit_budget)
-            duplicate_units = 0
-            for count in range(max_match, 0, -1):
-                if [unit.normalized for unit in stitched_units[-count:]] == [
-                    unit.normalized for unit in piece_units[:count]
-                ]:
-                    duplicate_units = count
-                    break
-            if duplicate_units == len(piece_units):
-                piece = ""
-            elif duplicate_units:
-                piece = piece[piece_units[duplicate_units].start :].lstrip()
-        if piece:
-            stitched += _transcript_separator(stitched, piece) + piece
+        stitched += _transcript_separator(stitched, piece) + piece
     return stitched
-
-
-def _transcript_units(text: str) -> list[_TranscriptUnit]:
-    units: list[_TranscriptUnit] = []
-    word_start: int | None = None
-
-    def append_word(end: int) -> None:
-        nonlocal word_start
-        if word_start is None:
-            return
-        word = text[word_start:end]
-        units.append(_TranscriptUnit(_normalize_word(word), word_start, end))
-        word_start = None
-
-    for index, character in enumerate(text):
-        if character.isspace():
-            append_word(index)
-        elif _is_cjk_character(character):
-            append_word(index)
-            units.append(
-                _TranscriptUnit(character.casefold(), index, index + len(character))
-            )
-        elif word_start is None:
-            word_start = index
-    append_word(len(text))
-    return units
 
 
 def _transcript_separator(previous: str, current: str) -> str:
@@ -298,23 +206,6 @@ def _is_cjk_character(character: str) -> bool:
         or 0x3040 <= codepoint <= 0x30FF
         or 0xAC00 <= codepoint <= 0xD7AF
     )
-
-
-def _is_punctuation_only(normalized: str) -> bool:
-    return bool(normalized) and all(
-        unicodedata.category(character).startswith("P") for character in normalized
-    )
-
-
-def _normalize_word(word: str) -> str:
-    start = 0
-    end = len(word)
-    while start < end and unicodedata.category(word[start]).startswith("P"):
-        start += 1
-    while end > start and unicodedata.category(word[end - 1]).startswith("P"):
-        end -= 1
-    normalized = word[start:end]
-    return (normalized or word).casefold()
 
 
 def prepare_audio(
