@@ -223,9 +223,8 @@ def test_qwen3_asr_request_builder_accepts_native_1200_second_envelope(
             attention_mask=torch.ones((1, num_mel_frames), dtype=torch.long),
         )
 
-    # A zero-stride view represents 1200 seconds without reserving a 77 MB
-    # waveform. Fingerprinting is patched because ndarray.tobytes() would
-    # materialize that view, which is unrelated to this length-contract test.
+    # note (Junnan Li): Avoid materializing the full waveform so this boundary
+    # test remains memory-light.
     audio = np.broadcast_to(
         np.zeros(1, dtype=np.float32), (sample_rate * audio_duration_s,)
     )

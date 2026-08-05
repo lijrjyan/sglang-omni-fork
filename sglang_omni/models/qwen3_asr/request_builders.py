@@ -40,9 +40,8 @@ logger = logging.getLogger(__name__)
 
 _SAMPLE_RATE = 16000
 
-# Qwen's native wrapper keeps each clip in one model forward up to 1200 seconds.
-# Longer inputs are split by that wrapper, but SGLang-Omni deliberately does not
-# add a second transcript stitching policy here.
+# note (Junnan Li): 1200 seconds is the largest clip handled by Qwen's native
+# single-forward path; longer inputs require transcript stitching.
 QWEN3_ASR_MAX_AUDIO_SECONDS = 1200.0
 QWEN3_ASR_UPSTREAM_MAX_NEW_TOKENS = 4096
 _OUTPUT_TOKENS_PER_AUDIO_SECOND = 10
@@ -106,7 +105,8 @@ def build_qwen3_asr_prompt_ids(
         f"<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
-    # Qwen3-ASR needs the same forced assistant prefix as upstream qwen_asr.
+    # note (Junnan Li): Match upstream's forced prefix so decoding starts after
+    # the ASR marker instead of regenerating the language header.
     prompt += f"language {language}{_ASR_TEXT}"
     return list(tokenizer(prompt, add_special_tokens=False).input_ids)
 
@@ -141,7 +141,7 @@ def qwen3_asr_request_output_budget(
     audio_duration_s: float,
     default_max_new_tokens: int | None,
 ) -> int:
-    """Resolve request > operator > duration-aware automatic precedence."""
+    """Honor explicit budgets while keeping long audio safe by default."""
     explicit = params.get("max_new_tokens")
     if explicit is not None:
         return _positive_max_new_tokens(explicit)

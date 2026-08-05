@@ -6,11 +6,9 @@ import inspect
 from types import SimpleNamespace
 
 import sglang_omni.models.qwen3_asr.stages as qwen3_asr_stages
+from sglang_omni.models.qwen3_asr.audio_lengths import qwen3_asr_num_audio_tokens
 from sglang_omni.models.qwen3_asr.config import Qwen3ASRPipelineConfig
-from sglang_omni.models.qwen3_asr.request_builders import (
-    QWEN3_ASR_MAX_AUDIO_SECONDS,
-    qwen3_asr_num_audio_tokens,
-)
+from sglang_omni.models.qwen3_asr.request_builders import QWEN3_ASR_MAX_AUDIO_SECONDS
 from sglang_omni.models.qwen3_asr.stages import create_sglang_qwen3_asr_executor
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from tests.unit_test.fakes import FakeServerArgs

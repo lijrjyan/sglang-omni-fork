@@ -14,7 +14,6 @@ from sglang_omni.models.qwen3_asr.audio_lengths import qwen3_asr_num_audio_token
 from sglang_omni.models.qwen3_asr.request_builders import (
     QWEN3_ASR_MAX_AUDIO_SECONDS,
     make_qwen3_asr_scheduler_adapters,
-    qwen3_asr_auto_output_budget,
     qwen3_asr_prompt_overhead_tokens,
     qwen3_asr_request_output_budget,
 )
@@ -67,18 +66,13 @@ def create_sglang_qwen3_asr_executor(
     max_audio_tokens = qwen3_asr_num_audio_tokens(max_mel_frames)
     prompt_overhead_tokens = qwen3_asr_prompt_overhead_tokens(tokenizer)
     max_input_tokens = max_audio_tokens + prompt_overhead_tokens
-    max_output_tokens = (
-        qwen3_asr_request_output_budget(
-            {},
-            audio_duration_s=max_audio_s,
-            default_max_new_tokens=max_new_tokens,
-        )
-        if max_new_tokens is not None
-        else qwen3_asr_auto_output_budget(max_audio_s)
+    max_output_tokens = qwen3_asr_request_output_budget(
+        {},
+        audio_duration_s=max_audio_s,
+        default_max_new_tokens=max_new_tokens,
     )
-    # SGLang reserves one token below context_length and one additional token
-    # in init_req_max_new_tokens. Include both so the advertised output budget
-    # survives scheduler admission unchanged at the 1200-second boundary.
+    # note (Junnan Li): Two scheduler-reserved tokens keep the configured
+    # output budget available at the maximum input length.
     context_length = max_input_tokens + max_output_tokens + 2
 
     defaults: dict[str, Any] = {

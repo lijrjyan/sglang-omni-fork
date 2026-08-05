@@ -78,13 +78,11 @@ print(resp.json()["text"])
 
 ## Long Audio
 
-The default stage is sized for Qwen3-ASR's native 1200-second single-forward
-envelope. It preserves the complete mel sequence (`truncation=False`) and does
-not split or stitch transcripts. When `max_new_tokens` is omitted, the output
-budget keeps the upstream Qwen vLLM 4096-token floor and grows to 12000 tokens
-at 1200 seconds so that the upstream default does not become a flat long-audio
-ceiling. The context and prefill limits include the corresponding 15600 audio
-tokens plus the actual tokenized prompt overhead.
+The default stage supports Qwen3-ASR's native 1200-second single-forward
+envelope without truncation or transcript stitching. Its automatic output
+budget keeps the upstream 4096-token floor and grows to 12000 tokens at that
+boundary. Context and prefill capacity include the corresponding 15600 audio
+tokens and tokenized prompt overhead.
 
 Operators can pin `max_new_tokens` or change the guaranteed native envelope
 with the ASR stage's `max_audio_s` factory argument. A request-level
