@@ -42,6 +42,9 @@ _ASYNC_DECODE_SUPPORTED_MODELS = (
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
 )
+_QWEN_ASR_FACTORY = (
+    "sglang_omni.models.qwen3_asr.stages.create_sglang_qwen3_asr_executor"
+)
 
 
 def launch_server(*args: object, **kwargs: object) -> object:
@@ -863,6 +866,53 @@ def apply_decode_mode_cli_overrides(
     return pipeline_config
 
 
+def apply_asr_chunking_cli_overrides(
+    pipeline_config: PipelineConfig,
+    *,
+    asr_auto_chunk: bool | None,
+    asr_chunk_max_seconds: float | None,
+    asr_chunk_overlap_seconds: float | None,
+) -> PipelineConfig:
+    updates: dict[str, object] = {}
+    if asr_auto_chunk is not None:
+        updates["asr_auto_chunk"] = bool(asr_auto_chunk)
+    if asr_chunk_max_seconds is not None:
+        if asr_chunk_max_seconds <= 0:
+            raise typer.BadParameter("--asr-chunk-max-seconds must be positive")
+        updates["asr_chunk_max_seconds"] = float(asr_chunk_max_seconds)
+    if asr_chunk_overlap_seconds is not None:
+        if asr_chunk_overlap_seconds < 0:
+            raise typer.BadParameter("--asr-chunk-overlap-seconds must be non-negative")
+        updates["asr_chunk_overlap_seconds"] = float(asr_chunk_overlap_seconds)
+    if not updates:
+        return pipeline_config
+
+    matching_stages = [
+        stage for stage in pipeline_config.stages if stage.factory == _QWEN_ASR_FACTORY
+    ]
+    if not matching_stages:
+        _raise_unsupported_flag(
+            pipeline_config,
+            "--asr-auto-chunk/--asr-chunk-max-seconds/--asr-chunk-overlap-seconds",
+        )
+    for stage in matching_stages:
+        effective = dict(stage.factory_args or {})
+        effective.update(updates)
+        max_seconds = effective.get("asr_chunk_max_seconds")
+        overlap_seconds = effective.get("asr_chunk_overlap_seconds")
+        if (
+            max_seconds is not None
+            and overlap_seconds is not None
+            and float(overlap_seconds) >= float(max_seconds)
+        ):
+            raise typer.BadParameter(
+                "--asr-chunk-overlap-seconds must be smaller than "
+                "--asr-chunk-max-seconds"
+            )
+    _apply_factory_args_updates(pipeline_config, matching_stages, updates)
+    return pipeline_config
+
+
 def apply_torch_compile_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
@@ -1143,8 +1193,7 @@ def serve(
             "--talker-torch-compile",
             "--talker_torch_compile",
             help=(
-                "torch.compile mode for supported SGLang talker stage: "
-                "default|on|off."
+                "torch.compile mode for supported SGLang talker stage: default|on|off."
             ),
         ),
     ] = "default",
@@ -1172,6 +1221,32 @@ def serve(
             help="Mount the OpenAI Realtime WebSocket endpoint at /v1/realtime.",
         ),
     ] = False,
+    asr_auto_chunk: Annotated[
+        bool | None,
+        typer.Option(
+            "--asr-auto-chunk/--no-asr-auto-chunk",
+            help=(
+                "Enable or disable model-owned long-audio chunking for "
+                "supported ASR pipelines."
+            ),
+        ),
+    ] = None,
+    asr_chunk_max_seconds: Annotated[
+        float | None,
+        typer.Option(
+            "--asr-chunk-max-seconds",
+            min=0.001,
+            help="Override the hard maximum duration of each ASR chunk.",
+        ),
+    ] = None,
+    asr_chunk_overlap_seconds: Annotated[
+        float | None,
+        typer.Option(
+            "--asr-chunk-overlap-seconds",
+            min=0.0,
+            help="Override the overlap duration between adjacent ASR chunks.",
+        ),
+    ] = None,
     decode_mode: Annotated[
         str | None,
         typer.Option(
@@ -1327,6 +1402,12 @@ def serve(
         merged_config,
         decode_mode=decode_mode,
         async_lookahead_min_batch_size=async_lookahead_min_batch_size,
+    )
+    merged_config = apply_asr_chunking_cli_overrides(
+        merged_config,
+        asr_auto_chunk=asr_auto_chunk,
+        asr_chunk_max_seconds=asr_chunk_max_seconds,
+        asr_chunk_overlap_seconds=asr_chunk_overlap_seconds,
     )
     generation_server_args_overrides: dict[str, object] = {}
     if max_running_requests is not None:

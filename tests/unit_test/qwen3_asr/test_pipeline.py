@@ -6,10 +6,17 @@ import inspect
 from types import SimpleNamespace
 
 import sglang_omni.models.qwen3_asr.stages as qwen3_asr_stages
+from sglang_omni.cli.serve import apply_asr_chunking_cli_overrides
 from sglang_omni.models.qwen3_asr.config import Qwen3ASRPipelineConfig
+from sglang_omni.models.qwen3_asr.chunking import (
+    QWEN3_ASR_AUTO_CHUNK_DEFAULT,
+    QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
+    QWEN3_ASR_CHUNK_WINDOW_SECONDS,
+)
 from sglang_omni.models.qwen3_asr.stages import create_sglang_qwen3_asr_executor
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from tests.unit_test.fakes import FakeServerArgs
+from sglang_omni.serve.launcher import _transcription_chunking_kwargs
 
 
 def test_qwen3_asr_config_uses_batched_stage_with_32_running_requests() -> None:
@@ -24,6 +31,9 @@ def test_qwen3_asr_config_uses_batched_stage_with_32_running_requests() -> None:
     assert config.stages[0].factory_args["max_running_requests"] == 32
     assert config.stages[0].factory_args["request_build_max_workers"] == 2
     assert config.stages[0].factory_args["request_build_max_pending"] == 16
+    assert config.stages[0].factory_args["asr_auto_chunk"] is True
+    assert config.stages[0].factory_args["asr_chunk_max_seconds"] == 30.0
+    assert config.stages[0].factory_args["asr_chunk_overlap_seconds"] == 2.0
     assert "request_build_max_backlog" not in config.stages[0].factory_args
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("Qwen3ASRForConditionalGeneration")
@@ -63,6 +73,52 @@ def test_qwen3_asr_stage_default_enables_async_decode() -> None:
 
     assert signature.parameters["enable_async_decode"].default is True
     assert signature.parameters["async_decode_min_batch_size"].default == 2
+
+
+def test_qwen3_asr_stage_owns_auto_chunk_defaults() -> None:
+    signature = inspect.signature(create_sglang_qwen3_asr_executor)
+
+    assert signature.parameters["asr_auto_chunk"].default is (
+        QWEN3_ASR_AUTO_CHUNK_DEFAULT
+    )
+    assert signature.parameters["asr_chunk_max_seconds"].default == (
+        QWEN3_ASR_CHUNK_WINDOW_SECONDS
+    )
+    assert signature.parameters["asr_chunk_overlap_seconds"].default == (
+        QWEN3_ASR_CHUNK_OVERLAP_SECONDS
+    )
+
+
+def test_qwen3_asr_cli_chunking_overrides_take_priority() -> None:
+    config = Qwen3ASRPipelineConfig(model_path="Qwen/Qwen3-ASR-1.7B")
+
+    result = apply_asr_chunking_cli_overrides(
+        config,
+        asr_auto_chunk=False,
+        asr_chunk_max_seconds=45.0,
+        asr_chunk_overlap_seconds=3.0,
+    )
+
+    assert result is config
+    assert config.stages[0].factory_args["asr_auto_chunk"] is False
+    assert config.stages[0].factory_args["asr_chunk_max_seconds"] == 45.0
+    assert config.stages[0].factory_args["asr_chunk_overlap_seconds"] == 3.0
+
+
+def test_qwen3_asr_launcher_forwards_resolved_chunking_policy() -> None:
+    config = Qwen3ASRPipelineConfig(model_path="Qwen/Qwen3-ASR-1.7B")
+    apply_asr_chunking_cli_overrides(
+        config,
+        asr_auto_chunk=False,
+        asr_chunk_max_seconds=45.0,
+        asr_chunk_overlap_seconds=3.0,
+    )
+
+    assert _transcription_chunking_kwargs(config) == {
+        "asr_auto_chunk": False,
+        "asr_chunk_max_seconds": 45.0,
+        "asr_chunk_overlap_seconds": 3.0,
+    }
 
 
 def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:

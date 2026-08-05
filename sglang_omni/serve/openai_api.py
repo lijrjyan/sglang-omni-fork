@@ -27,6 +27,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing, suppress
+from dataclasses import replace
 from typing import Any, AsyncIterator
 
 from fastapi import (
@@ -60,6 +61,7 @@ from sglang_omni.client import (
 from sglang_omni.client.audio import (
     DEFAULT_SAMPLE_RATE,
     apply_speed,
+    encode_audio,
     encode_pcm,
     select_audio_delta,
 )
@@ -69,6 +71,13 @@ from sglang_omni.http.admin_auth import (
 )
 from sglang_omni.http.favicon import register_favicon
 from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
+from sglang_omni.preprocessing.transcription import (
+    DEFAULT_TARGET_SAMPLE_RATE,
+    Chunk,
+    detect_silence_boundaries,
+    plan_chunks,
+    stitch_transcripts,
+)
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
     AdminRequestBase,
@@ -114,6 +123,7 @@ from sglang_omni.serve.speech_service import SpeechRequestValidator
 from sglang_omni.serve.speech_voices import MAX_VOICE_UPLOAD_BYTES, SpeakerSampleStore
 from sglang_omni.serve.speech_ws import SpeechWebSocketSession
 from sglang_omni.serve.transcription_adapters import resolve_adapter
+from sglang_omni.utils.audio import load_audio
 
 logger = logging.getLogger(__name__)
 STREAM_DONE_SENTINEL = "[DONE]"
@@ -222,6 +232,9 @@ def create_app(
     admin_api_key: str | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
     architectures: list[str] | None = None,
+    asr_auto_chunk: bool | None = None,
+    asr_chunk_max_seconds: float | None = None,
+    asr_chunk_overlap_seconds: float = 0.0,
 ) -> FastAPI:
     """Create a FastAPI application with OpenAI-compatible endpoints.
 
@@ -247,6 +260,10 @@ def create_app(
         admin_api_key: Optional API key for admin-control endpoints.
         tts_batch_max_items: Maximum items accepted by
             ``/v1/audio/speech/batch``.
+        architectures: Model architectures used by transcription adapters.
+        asr_auto_chunk: Optional model-owned long-audio chunking toggle.
+        asr_chunk_max_seconds: Hard maximum duration for each ASR chunk.
+        asr_chunk_overlap_seconds: Overlap between adjacent ASR chunks.
 
     Returns:
         Configured FastAPI application.
@@ -269,6 +286,9 @@ def create_app(
     app.state.client = client
     app.state.model_name = model_name or "sglang-omni"
     app.state.architectures = [a for a in (architectures or []) if a]
+    app.state.asr_auto_chunk = asr_auto_chunk
+    app.state.asr_chunk_max_seconds = asr_chunk_max_seconds
+    app.state.asr_chunk_overlap_seconds = asr_chunk_overlap_seconds
     app.state.realtime_enabled = enable_realtime
     app.state.supports_realtime_audio_output = supports_realtime_audio_output
     app.state.speaker_sample_store = SpeakerSampleStore()
@@ -1646,15 +1666,80 @@ def _register_transcriptions(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
 
         normalized_response_format = response_format.strip().lower()
-        if stream:
-            if normalized_response_format not in {"json", "text"}:
+        if stream and normalized_response_format not in {"json", "text"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "stream=true supports only response_format 'json' or "
+                    f"'text', got {response_format!r}"
+                ),
+            )
+        duration_s = _probe_audio_duration(audio_bytes)
+        chunk_plan = None
+        chunk_waveform = None
+        chunk_max_s = app.state.asr_chunk_max_seconds
+        if chunk_max_s is not None and duration_s > chunk_max_s:
+            if not app.state.asr_auto_chunk:
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        "stream=true supports only response_format 'json' or "
-                        f"'text', got {response_format!r}"
+                        f"Audio duration {duration_s:.3f} seconds exceeds the "
+                        f"model window of {chunk_max_s:.3f} seconds while auto "
+                        "chunking is disabled"
                     ),
                 )
+            chunk_waveform = load_audio(
+                audio_bytes,
+                source_name="transcription",
+                target_sample_rate=DEFAULT_TARGET_SAMPLE_RATE,
+            )
+            chunk_plan = _plan_transcription_chunks(
+                chunk_waveform,
+                chunk_max_s,
+                app.state.asr_chunk_overlap_seconds,
+            )
+        if chunk_plan is not None and stream:
+            base_request = build_transcription_generate_request(
+                audio_bytes=audio_bytes,
+                filename=file.filename,
+                content_type=file.content_type,
+                model=model or default_model,
+                language=language,
+                prompt=prompt,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+            )
+            try:
+                text = await _complete_auto_chunked_transcription(
+                    client,
+                    base_request,
+                    request_id=request_id,
+                    filename=file.filename,
+                    waveform=chunk_waveform,
+                    chunks=chunk_plan,
+                )
+            except ClientError as exc:
+                if _is_bad_request_error(exc):
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            except Exception as exc:
+                if _is_bad_request_error(exc):
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                logger.exception(
+                    "Error transcribing chunked audio for request %s", request_id
+                )
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            adapter = resolve_adapter(getattr(app.state, "architectures", None))
+            return _ClosableStreamingResponse(
+                _completed_transcription_stream(
+                    text,
+                    adapter=adapter,
+                    duration_s=duration_s,
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
+            )
+        if stream:
             gen_req = build_transcription_generate_request(
                 audio_bytes=audio_bytes,
                 filename=file.filename,
@@ -1667,7 +1752,6 @@ def _register_transcriptions(app: FastAPI) -> None:
                 stream=True,
             )
             adapter = resolve_adapter(getattr(app.state, "architectures", None))
-            duration_s = _probe_audio_duration(audio_bytes)
             chunk_stream = client.generate(gen_req, request_id=request_id)
             # note (db-ol): pull the first chunk before sending response
             # headers. Admission rejections such as audio past the context
@@ -1706,19 +1790,39 @@ def _register_transcriptions(app: FastAPI) -> None:
                 headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
             )
 
-        gen_req = build_transcription_generate_request(
-            audio_bytes=audio_bytes,
-            filename=file.filename,
-            content_type=file.content_type,
-            model=model or default_model,
-            language=language,
-            prompt=prompt,
-            temperature=temperature,
-            max_new_tokens=max_new_tokens,
-        )
-
         try:
-            result = await client.completion(gen_req, request_id=request_id)
+            if chunk_plan is None:
+                gen_req = build_transcription_generate_request(
+                    audio_bytes=audio_bytes,
+                    filename=file.filename,
+                    content_type=file.content_type,
+                    model=model or default_model,
+                    language=language,
+                    prompt=prompt,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                )
+                result = await client.completion(gen_req, request_id=request_id)
+                text = result.text
+            else:
+                base_request = build_transcription_generate_request(
+                    audio_bytes=audio_bytes,
+                    filename=file.filename,
+                    content_type=file.content_type,
+                    model=model or default_model,
+                    language=language,
+                    prompt=prompt,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                )
+                text = await _complete_auto_chunked_transcription(
+                    client,
+                    base_request,
+                    request_id=request_id,
+                    filename=file.filename,
+                    waveform=chunk_waveform,
+                    chunks=chunk_plan,
+                )
         except ClientError as exc:
             if _is_bad_request_error(exc):
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1729,7 +1833,6 @@ def _register_transcriptions(app: FastAPI) -> None:
             logger.exception("Error transcribing audio for request %s", request_id)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-        text = result.text
         if normalized_response_format == "text":
             return PlainTextResponse(text)
         if normalized_response_format not in {"json", "verbose_json"}:
@@ -1743,7 +1846,9 @@ def _register_transcriptions(app: FastAPI) -> None:
 
         adapter = resolve_adapter(getattr(app.state, "architectures", None))
         text = adapter.postprocess_text(text)
-        duration_s = _probe_audio_duration(audio_bytes)
+        # Chunk-local timestamps are intentionally not remapped in F1. The
+        # endpoint's current plain-text/minimal-JSON contract is preserved;
+        # timestamp-bearing chunk aggregation belongs to a follow-up.
         usage = (
             TranscriptionUsage(seconds=math.ceil(duration_s))
             if duration_s > 0
@@ -1762,6 +1867,76 @@ def _register_transcriptions(app: FastAPI) -> None:
                 exclude_none=True
             )
         )
+
+
+def _plan_transcription_chunks(
+    waveform: Any,
+    max_window_s: float,
+    overlap_s: float,
+) -> list[Chunk]:
+    vad_boundaries = detect_silence_boundaries(waveform, DEFAULT_TARGET_SAMPLE_RATE)
+    return plan_chunks(
+        len(waveform),
+        DEFAULT_TARGET_SAMPLE_RATE,
+        max_window_s,
+        overlap_s,
+        vad_boundaries,
+    )
+
+
+async def _complete_auto_chunked_transcription(
+    client: Client,
+    base_request: GenerateRequest,
+    *,
+    request_id: str,
+    filename: str | None,
+    waveform: Any,
+    chunks: list[Chunk],
+) -> str:
+    pieces: list[str] = []
+    for index, chunk in enumerate(chunks):
+        chunk_bytes, _ = encode_audio(
+            waveform[chunk.start_sample : chunk.end_sample],
+            response_format="wav",
+            sample_rate=DEFAULT_TARGET_SAMPLE_RATE,
+        )
+        chunk_request = replace(
+            base_request,
+            prompt={
+                "audio_bytes": chunk_bytes,
+                "filename": f"{filename or 'audio'}.chunk-{index:04d}.wav",
+                "content_type": "audio/wav",
+            },
+            stream=False,
+        )
+        result = await client.completion(
+            chunk_request,
+            request_id=f"{request_id}-chunk-{index}",
+        )
+        pieces.append(result.text)
+    overlap_seconds = [
+        (previous.end_sample - current.start_sample) / DEFAULT_TARGET_SAMPLE_RATE
+        for previous, current in zip(chunks, chunks[1:])
+    ]
+    return stitch_transcripts(pieces, overlap_seconds)
+
+
+async def _completed_transcription_stream(
+    text: str,
+    *,
+    adapter: Any,
+    duration_s: float,
+) -> AsyncIterator[str]:
+    text = adapter.postprocess_text(text)
+    if text:
+        event = TranscriptionTextDeltaEvent(delta=text)
+        yield f"data: {event.model_dump_json(exclude_none=True)}\n\n"
+    usage = (
+        TranscriptionUsage(seconds=math.ceil(duration_s)) if duration_s > 0 else None
+    )
+    done_event = TranscriptionTextDoneEvent(text=text, usage=usage)
+    yield f"data: {done_event.model_dump_json(exclude_none=True)}\n\n"
+    yield f"data: {STREAM_DONE_SENTINEL}\n\n"
 
 
 async def _transcription_stream(

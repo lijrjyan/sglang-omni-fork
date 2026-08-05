@@ -11,9 +11,13 @@ import pytest
 
 import sglang_omni.preprocessing.transcription as transcription
 from sglang_omni.preprocessing.transcription import (
+    Chunk,
     PreparedAudio,
+    detect_silence_boundaries,
+    plan_chunks,
     prepare_audio,
     resolve_audio_source,
+    stitch_transcripts,
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.utils.audio import audio_fingerprint, audio_fingerprint_int
@@ -175,3 +179,127 @@ def test_prepare_audio_resamples_and_downmixes_like_before() -> None:
     )
     assert prepared.waveform.ndim == 1
     assert prepared.duration_s == pytest.approx(0.1)
+
+
+def test_plan_chunks_keeps_short_audio_in_one_exact_window() -> None:
+    assert plan_chunks(319, 160, 2.0, 0.25, []) == [
+        Chunk(start_sample=0, end_sample=319)
+    ]
+
+
+def test_detect_silence_boundaries_returns_internal_silence_midpoint() -> None:
+    waveform = np.concatenate(
+        [
+            np.ones(20, dtype=np.float32),
+            np.zeros(20, dtype=np.float32),
+            np.ones(20, dtype=np.float32),
+        ]
+    )
+
+    assert detect_silence_boundaries(
+        waveform,
+        100,
+        min_silence_s=0.2,
+        frame_duration_s=0.1,
+        relative_threshold=0.1,
+    ) == [30]
+
+
+def test_detect_silence_boundaries_ignores_audio_without_internal_silence() -> None:
+    assert (
+        detect_silence_boundaries(
+            np.ones(60, dtype=np.float32),
+            100,
+            min_silence_s=0.2,
+            frame_duration_s=0.1,
+            relative_threshold=0.1,
+        )
+        == []
+    )
+
+
+def test_plan_chunks_falls_back_to_fixed_windows_with_overlap() -> None:
+    assert plan_chunks(100, 10, 4.0, 1.0, []) == [
+        Chunk(0, 40),
+        Chunk(30, 70),
+        Chunk(60, 100),
+    ]
+
+
+def test_plan_chunks_preserves_a_short_final_window() -> None:
+    assert plan_chunks(95, 10, 4.0, 1.0, []) == [
+        Chunk(0, 40),
+        Chunk(30, 70),
+        Chunk(60, 95),
+    ]
+
+
+def test_plan_chunks_prefers_latest_vad_boundary_before_hard_limit() -> None:
+    assert plan_chunks(100, 10, 4.0, 1.0, [15, 35, 65]) == [
+        Chunk(0, 35),
+        Chunk(25, 65),
+        Chunk(55, 95),
+        Chunk(85, 100),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("max_window_s", "overlap_s"),
+    [(0.0, 0.0), (1.0, -0.1), (1.0, 1.0), (1.0, 1.1)],
+)
+def test_plan_chunks_rejects_invalid_windows(
+    max_window_s: float, overlap_s: float
+) -> None:
+    with pytest.raises(ValueError):
+        plan_chunks(100, 10, max_window_s, overlap_s, [])
+
+
+def test_stitch_transcripts_removes_repeated_overlap_words() -> None:
+    assert (
+        stitch_transcripts(
+            ["the quick brown fox", "brown fox jumps over", "over the dog"],
+            [2, 1],
+        )
+        == "the quick brown fox jumps over the dog"
+    )
+
+
+def test_stitch_transcripts_keeps_non_repeated_boundary_words() -> None:
+    assert stitch_transcripts(["hello boundary", "different world"], [1]) == (
+        "hello boundary different world"
+    )
+
+
+def test_stitch_transcripts_matches_overlap_across_case_and_punctuation() -> None:
+    assert stitch_transcripts(["Hello, boundary!", "BOUNDARY world"], [1]) == (
+        "Hello, boundary! world"
+    )
+
+
+def test_stitch_transcripts_removes_repeated_chinese_phrase() -> None:
+    assert stitch_transcripts(["今天天气很好", "天气很好我们去公园"], [1.0]) == (
+        "今天天气很好我们去公园"
+    )
+
+
+def test_stitch_transcripts_handles_mixed_chinese_and_english() -> None:
+    assert (
+        stitch_transcripts(["今天学习 Qwen three", "Qwen three模型很好用"], [1.0])
+        == "今天学习 Qwen three模型很好用"
+    )
+
+
+def test_stitch_transcripts_joins_unmatched_cjk_without_space() -> None:
+    assert stitch_transcripts(["你好世界", "今天天气很好"], [1.0]) == (
+        "你好世界今天天气很好"
+    )
+
+
+def test_stitch_transcripts_limits_matching_to_overlap_derived_budget() -> None:
+    assert stitch_transcripts(["甲乙丙", "甲乙丙丁"], [0.1]) == "甲乙丙甲乙丙丁"
+
+
+def test_stitch_transcripts_ignores_empty_pieces() -> None:
+    assert stitch_transcripts(["", "hello world", "", "world again"], [1, 1, 1]) == (
+        "hello world again"
+    )

@@ -7,6 +7,12 @@ from typing import ClassVar
 
 from sglang_omni.config import PipelineConfig, StageConfig
 
+from .chunking import (
+    QWEN3_ASR_AUTO_CHUNK_DEFAULT,
+    QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
+    QWEN3_ASR_CHUNK_WINDOW_SECONDS,
+)
+
 _PKG = "sglang_omni.models.qwen3_asr"
 
 
@@ -36,6 +42,9 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
                 "max_new_tokens": 128,
                 "request_build_max_workers": 2,
                 "request_build_max_pending": 16,
+                "asr_auto_chunk": QWEN3_ASR_AUTO_CHUNK_DEFAULT,
+                "asr_chunk_max_seconds": QWEN3_ASR_CHUNK_WINDOW_SECONDS,
+                "asr_chunk_overlap_seconds": QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
             },
             gpu=0,
             terminal=True,

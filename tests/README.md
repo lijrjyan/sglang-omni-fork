@@ -134,6 +134,7 @@ tests/
     │   ├── test_stop_run_id.py
     │   └── test_views.py
     ├── serve/
+    │   ├── test_asr_auto_chunk.py
     │   ├── test_generation_batch_policy.py
     │   ├── test_generation_server_args.py
     │   └── test_openai_api.py
@@ -369,6 +370,11 @@ that happened to contain an older version of the test.
 - `unit_test/utils/`: Shared utility tests:
   - audio loading helpers for data URIs, file URIs, HTTP URLs, timeout fallback,
     and mono/channel preservation.
+- `unit_test/preprocessing/`: Shared request-preparation tests:
+  - ASR audio source compatibility, duration/fingerprint derivation, and
+    resampling/downmix behavior
+  - exact-sample long-audio chunk planning, silence-boundary preference,
+    hard-window fallback, overlap, and transcript de-duplication.
 - `unit_test/models/`: Model registry and cross-model contract tests:
   - static TTS `ModelCapabilities` declarations, registry lookup, aliases, and
     launcher startup logging.
@@ -387,6 +393,15 @@ that happened to contain an older version of the test.
     request builder paths
   - token-level result adapter marker handling, avoiding decode/encode
     text round-trips for byte-level BPE output.
+  - model-owned auto-chunk defaults, CLI/factory override propagation,
+    short-audio path preservation, and explicit over-window rejection when
+    chunking is disabled.
+- `unit_test/serve/test_asr_auto_chunk.py`: OpenAI-compatible transcription tests:
+  - long-audio chunk orchestration and overlap-aware multilingual text stitching
+  - unchanged single-request handling at or below the configured model window
+  - explicit HTTP 400 behavior when long-audio auto chunking is disabled
+  - whole-request HTTP 500 failure with remaining chunks abandoned after a child
+    completion fails.
 - `unit_test/fun_asr/`: Fun-ASR-Nano unit tests:
   - pipeline config and stage factory: single `asr` stage, `max_running_requests=32`,
     auto static KV budget, pre-LM encoder/cache defaults, scheduler-owned

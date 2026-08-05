@@ -14,8 +14,10 @@ sources beyond the default payload keys (e.g. MOSS-Transcribe-Diarize).
 
 from __future__ import annotations
 
+import math
+import unicodedata
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 import numpy as np
 
@@ -61,6 +63,241 @@ class PreparedAudio:
         return audio_fingerprint_int(self.fingerprint)
 
 
+@dataclass(frozen=True)
+class Chunk:
+    """Half-open sample range for one transcription window."""
+
+    start_sample: int
+    end_sample: int
+
+    @property
+    def num_samples(self) -> int:
+        return self.end_sample - self.start_sample
+
+
+# Conservative upper bound for either CJK characters or whitespace-delimited
+# words produced by ASR during one second of overlapped audio.
+_MAX_STITCH_UNITS_PER_OVERLAP_SECOND = 20
+
+
+@dataclass(frozen=True)
+class _TranscriptUnit:
+    normalized: str
+    start: int
+    end: int
+
+
+def detect_silence_boundaries(
+    waveform: np.ndarray,
+    sample_rate: int,
+    *,
+    min_silence_s: float = 0.3,
+    frame_duration_s: float = 0.02,
+    relative_threshold: float = 0.1,
+) -> list[int]:
+    """Return sample midpoints of internal low-energy runs.
+
+    This offline detector intentionally avoids the realtime Silero VAD's model
+    lifecycle. It provides deterministic silence candidates; ``plan_chunks``
+    still enforces the hard maximum when no candidate is usable.
+    """
+
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    frame_samples = round(frame_duration_s * sample_rate)
+    min_silence_samples = round(min_silence_s * sample_rate)
+    if frame_samples <= 0 or min_silence_samples <= 0:
+        raise ValueError("silence durations must produce at least one sample")
+    if not 0.0 <= relative_threshold < 1.0:
+        raise ValueError("relative_threshold must be in [0, 1)")
+    if len(waveform) < frame_samples * 3:
+        return []
+
+    rms: list[float] = []
+    for start in range(0, len(waveform), frame_samples):
+        frame = waveform[start : start + frame_samples]
+        rms.append(float(np.sqrt(np.mean(np.square(frame, dtype=np.float64)))))
+    peak = max(rms, default=0.0)
+    if peak == 0.0:
+        return []
+    silent = [value <= peak * relative_threshold for value in rms]
+
+    boundaries: list[int] = []
+    run_start: int | None = None
+    for index, is_silent in enumerate([*silent, False]):
+        if is_silent and run_start is None:
+            run_start = index
+            continue
+        if is_silent or run_start is None:
+            continue
+        run_end = index
+        start_sample = run_start * frame_samples
+        end_sample = min(run_end * frame_samples, len(waveform))
+        is_internal = run_start > 0 and run_end < len(silent)
+        if is_internal and end_sample - start_sample >= min_silence_samples:
+            boundaries.append((start_sample + end_sample) // 2)
+        run_start = None
+    return boundaries
+
+
+def plan_chunks(
+    num_samples: int,
+    sample_rate: int,
+    max_window_s: float,
+    overlap_s: float,
+    vad_boundaries: Sequence[int],
+) -> list[Chunk]:
+    """Plan exact half-open windows, preferring silence before each hard limit."""
+
+    if num_samples < 0:
+        raise ValueError("num_samples must be non-negative")
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    max_samples = round(max_window_s * sample_rate)
+    overlap_samples = round(overlap_s * sample_rate)
+    if max_samples <= 0:
+        raise ValueError("max_window_s must produce at least one sample")
+    if overlap_samples < 0:
+        raise ValueError("overlap_s must be non-negative")
+    if overlap_samples >= max_samples:
+        raise ValueError("overlap_s must be smaller than max_window_s")
+    if num_samples == 0:
+        return []
+    if num_samples <= max_samples:
+        return [Chunk(0, num_samples)]
+
+    boundaries = sorted(
+        {int(boundary) for boundary in vad_boundaries if 0 < boundary < num_samples}
+    )
+    chunks: list[Chunk] = []
+    start = 0
+    previous_end = 0
+    while start < num_samples:
+        hard_end = min(start + max_samples, num_samples)
+        if hard_end == num_samples:
+            end = hard_end
+        else:
+            candidates = [
+                boundary
+                for boundary in boundaries
+                if previous_end < boundary <= hard_end
+            ]
+            end = candidates[-1] if candidates else hard_end
+        chunks.append(Chunk(start, end))
+        if end == num_samples:
+            break
+        previous_end = end
+        start = end - overlap_samples
+    return chunks
+
+
+def stitch_transcripts(
+    pieces: Sequence[str], overlap_info: Sequence[int | float | bool]
+) -> str:
+    """Join chunk text with bounded exact suffix-prefix overlap removal.
+
+    CJK text is split into individual characters while whitespace-delimited
+    text is split into words. The overlap duration bounds how many units may be
+    compared, so repeated text outside the audio overlap is never guessed away.
+    """
+
+    if len(overlap_info) != max(len(pieces) - 1, 0):
+        raise ValueError("overlap_info must have one entry per adjacent piece")
+
+    stitched = ""
+    for index, piece in enumerate(pieces):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if stitched and index > 0 and overlap_info[index - 1] > 0:
+            stitched_units = _transcript_units(stitched)
+            piece_units = _transcript_units(piece)
+            unit_budget = math.ceil(
+                float(overlap_info[index - 1]) * _MAX_STITCH_UNITS_PER_OVERLAP_SECOND
+            )
+            max_match = min(len(stitched_units), len(piece_units), unit_budget)
+            duplicate_units = 0
+            for count in range(max_match, 0, -1):
+                if [unit.normalized for unit in stitched_units[-count:]] == [
+                    unit.normalized for unit in piece_units[:count]
+                ]:
+                    duplicate_units = count
+                    break
+            if duplicate_units == len(piece_units):
+                piece = ""
+            elif duplicate_units:
+                piece = piece[piece_units[duplicate_units].start :].lstrip()
+        if piece:
+            stitched += _transcript_separator(stitched, piece) + piece
+    return stitched
+
+
+def _transcript_units(text: str) -> list[_TranscriptUnit]:
+    units: list[_TranscriptUnit] = []
+    word_start: int | None = None
+
+    def append_word(end: int) -> None:
+        nonlocal word_start
+        if word_start is None:
+            return
+        word = text[word_start:end]
+        units.append(_TranscriptUnit(_normalize_word(word), word_start, end))
+        word_start = None
+
+    for index, character in enumerate(text):
+        if character.isspace():
+            append_word(index)
+        elif _is_cjk_character(character):
+            append_word(index)
+            units.append(
+                _TranscriptUnit(character.casefold(), index, index + len(character))
+            )
+        elif word_start is None:
+            word_start = index
+    append_word(len(text))
+    return units
+
+
+def _transcript_separator(previous: str, current: str) -> str:
+    if not previous or not current or previous[-1].isspace() or current[0].isspace():
+        return ""
+    if _is_no_space_boundary(previous[-1]) or _is_no_space_boundary(current[0]):
+        return ""
+    if unicodedata.category(current[0]).startswith("P"):
+        return ""
+    return " "
+
+
+def _is_no_space_boundary(character: str) -> bool:
+    return _is_cjk_character(character) or (
+        unicodedata.category(character).startswith("P")
+        and unicodedata.east_asian_width(character) in {"F", "W"}
+    )
+
+
+def _is_cjk_character(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x2FA1F
+        or 0x3040 <= codepoint <= 0x30FF
+        or 0xAC00 <= codepoint <= 0xD7AF
+    )
+
+
+def _normalize_word(word: str) -> str:
+    start = 0
+    end = len(word)
+    while start < end and unicodedata.category(word[start]).startswith("P"):
+        start += 1
+    while end > start and unicodedata.category(word[end - 1]).startswith("P"):
+        end -= 1
+    normalized = word[start:end]
+    return (normalized or word).casefold()
+
+
 def prepare_audio(
     payload: StagePayload,
     *,
@@ -96,8 +333,12 @@ def prepare_audio(
 
 
 __all__ = [
+    "Chunk",
     "DEFAULT_TARGET_SAMPLE_RATE",
     "PreparedAudio",
+    "detect_silence_boundaries",
+    "plan_chunks",
     "prepare_audio",
     "resolve_audio_source",
+    "stitch_transcripts",
 ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from transformers import WhisperFeatureExtractor
 
@@ -87,10 +88,13 @@ def test_qwen3_asr_audio_token_length_formula_is_shared() -> None:
 def test_qwen3_asr_request_builder_records_inclusive_audio_offsets(monkeypatch) -> None:
     num_mel_frames = 101
     num_audio_tokens = qwen3_asr_num_audio_tokens(num_mel_frames)
-    feature_extractor = lambda *args, **kwargs: SimpleNamespace(
-        input_features=torch.zeros((1, 128, 3000)),
-        attention_mask=torch.ones((1, num_mel_frames), dtype=torch.long),
-    )
+
+    def feature_extractor(*args, **kwargs):
+        return SimpleNamespace(
+            input_features=torch.zeros((1, 128, 3000)),
+            attention_mask=torch.ones((1, num_mel_frames), dtype=torch.long),
+        )
+
     monkeypatch.setattr(
         transcription,
         "load_audio",
@@ -155,6 +159,63 @@ def test_qwen3_asr_request_builder_preserves_audio_beyond_30_seconds(
     assert audio_item.feature.shape == (1, 128, 3100)
     assert int(audio_item.feature_attention_mask.sum().item()) == 3100
     assert data.audio_duration_s == audio_duration_s
+
+
+def test_qwen3_asr_rejects_over_window_audio_when_auto_chunk_is_disabled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(310, dtype=np.float32),
+    )
+    request_builder, _ = make_qwen3_asr_scheduler_adapters(
+        tokenizer=_FakeTokenizer(),
+        max_new_tokens=32,
+        feature_extractor=object(),
+        asr_auto_chunk=False,
+        asr_chunk_max_seconds=30.0,
+        sample_rate=10,
+    )
+    payload = StagePayload(
+        request_id="req-over-window",
+        request=OmniRequest(inputs={"audio_bytes": b"wav"}),
+        data={},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Qwen3-ASR accepts audio up to 30\.000 seconds when auto chunking "
+            r"is disabled; got 31\.000 seconds"
+        ),
+    ):
+        request_builder(payload)
+
+
+def test_qwen3_asr_custom_window_controls_disabled_chunking_limit(monkeypatch) -> None:
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(160, dtype=np.float32),
+    )
+    request_builder, _ = make_qwen3_asr_scheduler_adapters(
+        tokenizer=_FakeTokenizer(),
+        max_new_tokens=32,
+        feature_extractor=object(),
+        asr_auto_chunk=False,
+        asr_chunk_max_seconds=15.0,
+        sample_rate=10,
+    )
+
+    with pytest.raises(ValueError, match=r"15\.000.*16\.000"):
+        request_builder(
+            StagePayload(
+                request_id="req-custom-window",
+                request=OmniRequest(inputs={"audio_bytes": b"wav"}),
+                data={},
+            )
+        )
 
 
 def test_qwen3_asr_result_adapter_decodes_without_text_round_trip() -> None:

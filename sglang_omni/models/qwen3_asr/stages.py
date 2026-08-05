@@ -26,6 +26,13 @@ from sglang_omni.scheduling.sglang_backend import (
 )
 from sglang_omni.utils.gpu_compat import get_visible_gpu_sm_version
 
+from .chunking import (
+    QWEN3_ASR_AUTO_CHUNK_DEFAULT,
+    QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
+    QWEN3_ASR_CHUNK_WINDOW_SECONDS,
+    validate_qwen3_asr_chunking,
+)
+
 
 def create_sglang_qwen3_asr_executor(
     model_path: str,
@@ -42,8 +49,13 @@ def create_sglang_qwen3_asr_executor(
     mm_attention_backend: str | None = None,
     request_build_max_workers: int = 2,
     request_build_max_pending: int | None = 16,
+    asr_auto_chunk: bool = QWEN3_ASR_AUTO_CHUNK_DEFAULT,
+    asr_chunk_max_seconds: float = QWEN3_ASR_CHUNK_WINDOW_SECONDS,
+    asr_chunk_overlap_seconds: float = QWEN3_ASR_CHUNK_OVERLAP_SECONDS,
     server_args_overrides: dict[str, Any] | None = None,
 ):
+
+    validate_qwen3_asr_chunking(asr_chunk_max_seconds, asr_chunk_overlap_seconds)
 
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
@@ -86,14 +98,17 @@ def create_sglang_qwen3_asr_executor(
         server_args=server_args,
     )
 
-    want_cuda_graph, (
-        model_worker,
-        tree_cache,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-        prefill_mgr,
-        decode_mgr,
-        model_config,
+    (
+        want_cuda_graph,
+        (
+            model_worker,
+            tree_cache,
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            prefill_mgr,
+            decode_mgr,
+            model_config,
+        ),
     ) = create_sglang_infrastructure_defer_cuda_graph(
         server_args,
         gpu_id,
@@ -114,6 +129,9 @@ def create_sglang_qwen3_asr_executor(
         tokenizer=tokenizer,
         feature_extractor=feature_extractor,
         max_new_tokens=max_new_tokens,
+        asr_auto_chunk=asr_auto_chunk,
+        asr_chunk_max_seconds=asr_chunk_max_seconds,
+        asr_chunk_overlap_seconds=asr_chunk_overlap_seconds,
     )
 
     return OmniScheduler(

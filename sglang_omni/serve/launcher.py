@@ -180,6 +180,30 @@ def _model_capabilities_log_summary(
     }
 
 
+def _transcription_chunking_kwargs(
+    pipeline_config: PipelineConfig,
+) -> dict[str, Any]:
+    """Forward an entry stage's optional model-owned chunking policy."""
+
+    entry_stage = next(
+        (
+            stage
+            for stage in pipeline_config.stages
+            if stage.name == pipeline_config.entry_stage
+        ),
+        None,
+    )
+    factory_args = dict(entry_stage.factory_args or {}) if entry_stage else {}
+    keys = (
+        "asr_auto_chunk",
+        "asr_chunk_max_seconds",
+        "asr_chunk_overlap_seconds",
+    )
+    if "asr_chunk_max_seconds" not in factory_args:
+        return {}
+    return {key: factory_args[key] for key in keys if key in factory_args}
+
+
 def _log_model_capabilities(pipeline_config: PipelineConfig) -> None:
     try:
         summary = _model_capabilities_log_summary(pipeline_config)
@@ -402,6 +426,7 @@ async def _run_server(
             allowed_media_domains=allowed_media_domains,
             tts_batch_max_items=tts_batch_max_items,
             architectures=[pipeline_config.architecture],
+            **_transcription_chunking_kwargs(pipeline_config),
         )
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
