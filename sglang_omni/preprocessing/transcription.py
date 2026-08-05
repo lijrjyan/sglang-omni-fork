@@ -14,6 +14,7 @@ sources beyond the default payload keys (e.g. MOSS-Transcribe-Diarize).
 
 from __future__ import annotations
 
+import math
 import unicodedata
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Sequence
@@ -132,8 +133,10 @@ def plan_chunks(
     sample_rate: int,
     max_window_s: float,
     vad_boundaries: Sequence[int],
+    *,
+    boundary_search_s: float = 5.0,
 ) -> list[Chunk]:
-    """Plan non-overlapping windows, preferring silence before each hard limit."""
+    """Plan non-overlapping windows, preferring nearby silence before each limit."""
 
     if num_samples < 0:
         raise ValueError("num_samples must be non-negative")
@@ -142,6 +145,14 @@ def plan_chunks(
     max_samples = round(max_window_s * sample_rate)
     if max_samples <= 0:
         raise ValueError("max_window_s must produce at least one sample")
+    if not math.isfinite(boundary_search_s) or boundary_search_s < 0:
+        raise ValueError("boundary_search_s must be a finite non-negative number")
+    # note (Junnan Li): The 5-second default keeps silence cuts near the hard
+    # limit; fall back to the hard limit instead of overlapping when none exists.
+    search_samples = min(
+        round(boundary_search_s * sample_rate),
+        max_samples // 2,
+    )
     if num_samples == 0:
         return []
     if num_samples <= max_samples:
@@ -157,8 +168,11 @@ def plan_chunks(
         if hard_end == num_samples:
             end = hard_end
         else:
+            search_start = hard_end - search_samples
             candidates = [
-                boundary for boundary in boundaries if start < boundary <= hard_end
+                boundary
+                for boundary in boundaries
+                if search_start <= boundary <= hard_end
             ]
             end = candidates[-1] if candidates else hard_end
         chunks.append(Chunk(start, end))

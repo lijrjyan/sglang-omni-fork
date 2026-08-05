@@ -1842,8 +1842,6 @@ def _register_transcriptions(app: FastAPI) -> None:
 
         adapter = resolve_adapter(getattr(app.state, "architectures", None))
         text = adapter.postprocess_text(text)
-        # Chunked responses aggregate text only because timestamp-bearing
-        # formats require remapping each chunk to the original timeline.
         usage = (
             TranscriptionUsage(seconds=math.ceil(duration_s))
             if duration_s > 0
@@ -1886,6 +1884,8 @@ async def _complete_auto_chunked_transcription(
     waveform: Any,
     chunks: list[Chunk],
 ) -> str:
+    # note (Junnan Li): Do not expose accumulated text until every child finishes;
+    # a partial transcript must never be returned as a successful response.
     pieces: list[str] = []
     for index, chunk in enumerate(chunks):
         chunk_bytes, _ = encode_audio(
@@ -1907,6 +1907,8 @@ async def _complete_auto_chunked_transcription(
             request_id=f"{request_id}-chunk-{index}",
         )
         pieces.append(result.text)
+    # note (Junnan Li): Timestamp-bearing formats need per-chunk timeline
+    # remapping, so auto-chunking currently aggregates text only.
     return stitch_transcripts(pieces)
 
 

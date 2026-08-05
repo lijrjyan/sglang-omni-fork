@@ -4,10 +4,6 @@ import logging
 from typing import Annotated, Literal, NoReturn
 
 import typer
-from sglang_omni.models.qwen3_asr.chunking import (
-    QWEN3_ASR_CHUNK_WINDOW_SECONDS,
-    validate_qwen3_asr_chunking,
-)
 import yaml
 
 from sglang_omni.config import (
@@ -16,6 +12,10 @@ from sglang_omni.config import (
     apply_stage_process_overrides,
 )
 from sglang_omni.config.manager import ConfigManager
+from sglang_omni.models.qwen3_asr.chunking import (
+    QWEN3_ASR_CHUNK_WINDOW_SECONDS,
+    validate_qwen3_asr_chunking,
+)
 from sglang_omni.preprocessing.resource_connector import (
     resolve_allowed_local_media_path,
 )
@@ -895,8 +895,8 @@ def apply_asr_chunking_cli_overrides(
     for stage in matching_stages:
         effective = dict(stage.factory_args or {})
         effective.update(updates)
-        # Single validation source: the model-owned validator. The CLI layer
-        # only translates its ValueError into a typer.BadParameter.
+        # note (Junnan Li): Keep validation model-owned; the CLI only translates
+        # ValueError into a command-line error.
         try:
             validate_qwen3_asr_chunking(
                 float(

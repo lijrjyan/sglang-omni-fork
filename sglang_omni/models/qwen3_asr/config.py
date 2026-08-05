@@ -7,10 +7,7 @@ from typing import ClassVar
 
 from sglang_omni.config import PipelineConfig, StageConfig
 
-from .chunking import (
-    QWEN3_ASR_AUTO_CHUNK_DEFAULT,
-    QWEN3_ASR_CHUNK_WINDOW_SECONDS,
-)
+from .chunking import QWEN3_ASR_AUTO_CHUNK_DEFAULT, QWEN3_ASR_CHUNK_WINDOW_SECONDS
 
 _PKG = "sglang_omni.models.qwen3_asr"
 

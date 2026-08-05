@@ -222,14 +222,6 @@ def test_plan_chunks_falls_back_to_non_overlapping_fixed_windows() -> None:
     ]
 
 
-def test_plan_chunks_preserves_a_short_final_window() -> None:
-    assert plan_chunks(95, 10, 4.0, []) == [
-        Chunk(0, 40),
-        Chunk(40, 80),
-        Chunk(80, 95),
-    ]
-
-
 def test_plan_chunks_prefers_latest_vad_boundary_before_hard_limit() -> None:
     assert plan_chunks(100, 10, 4.0, [15, 35, 65]) == [
         Chunk(0, 35),
@@ -258,19 +250,14 @@ def test_stitch_transcripts_ignores_empty_pieces() -> None:
     assert stitch_transcripts(["", "hello world", "", "again"]) == "hello world again"
 
 
-def test_plan_chunks_early_silence_boundary_keeps_non_overlapping_starts_valid() -> (
-    None
-):
-    chunks = transcription.plan_chunks(
+def test_plan_chunks_ignores_silence_far_before_hard_limit() -> None:
+    assert transcription.plan_chunks(
         num_samples=100,
         sample_rate=1,
         max_window_s=35.0,
         vad_boundaries=[5],
-    )
-
-    for index, chunk in enumerate(chunks):
-        assert 0 <= chunk.start_sample < chunk.end_sample <= 100
-        if index:
-            assert chunks[index - 1].end_sample == chunk.start_sample
-    assert chunks[0] == transcription.Chunk(0, 5)
-    assert chunks[-1].end_sample == 100
+    ) == [
+        transcription.Chunk(0, 35),
+        transcription.Chunk(35, 70),
+        transcription.Chunk(70, 100),
+    ]

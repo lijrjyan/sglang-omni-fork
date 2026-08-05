@@ -184,8 +184,6 @@ def _model_capabilities_log_summary(
 def _transcription_chunking_kwargs(
     pipeline_config: PipelineConfig,
 ) -> dict[str, Any]:
-    """Forward an entry stage's optional model-owned chunking policy."""
-
     entry_stage = next(
         (
             stage
@@ -196,9 +194,8 @@ def _transcription_chunking_kwargs(
     )
     if entry_stage is None:
         return {}
-    # Use the standard resolver so runtime_overrides win here exactly as they
-    # do for the worker-side factory; reading factory_args directly can hand
-    # the endpoint a different policy than the stage actually runs with.
+    # note (Junnan Li): Use the standard resolver so the endpoint and worker
+    # apply the same runtime-overridden policy.
     factory_args = resolve_stage_static_factory_args(entry_stage, pipeline_config)
     keys = (
         "asr_auto_chunk",
