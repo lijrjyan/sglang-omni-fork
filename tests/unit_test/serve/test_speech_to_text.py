@@ -7,15 +7,14 @@ import json
 import pytest
 from fastapi import HTTPException
 
-from sglang_omni.serve.speech_to_text import (
-    assemble_speech_to_text_response,
-    build_transcription_generate_request,
-    validate_speech_to_text_response_format,
+from sglang_omni.serve import speech_to_text
+from sglang_omni.serve.transcriptions import (
+    build_transcription_generate_request as legacy_transcription_request_builder,
 )
 
 
 def _build_request(*, task: str = "transcribe"):
-    return build_transcription_generate_request(
+    return speech_to_text.build_speech_to_text_generate_request(
         audio_bytes=b"RIFF",
         filename="sample.wav",
         content_type="audio/wav",
@@ -24,6 +23,14 @@ def _build_request(*, task: str = "transcribe"):
         prompt=None,
         temperature=None,
         task=task,
+    )
+
+
+def test_transcription_builder_import_keeps_shared_callable() -> None:
+    """Keep the pre-extraction import stable while stacked consumers migrate."""
+    assert (
+        legacy_transcription_request_builder
+        is speech_to_text.build_speech_to_text_generate_request
     )
 
 
@@ -37,7 +44,7 @@ def test_build_request_accepts_sibling_endpoint_task() -> None:
 
 def test_response_format_validation_preserves_endpoint_error_contract() -> None:
     with pytest.raises(HTTPException) as exc_info:
-        validate_speech_to_text_response_format(
+        speech_to_text.validate_speech_to_text_response_format(
             " SRT ",
             stream=False,
             endpoint_path="/v1/audio/transcriptions",
@@ -50,7 +57,7 @@ def test_response_format_validation_preserves_endpoint_error_contract() -> None:
 
 
 def test_verbose_response_uses_requested_task() -> None:
-    response = assemble_speech_to_text_response(
+    response = speech_to_text.assemble_speech_to_text_response(
         text="hello world",
         response_format="verbose_json",
         endpoint_path="/v1/audio/transcriptions",
