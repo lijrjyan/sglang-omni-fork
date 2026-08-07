@@ -49,7 +49,7 @@ DEFAULT_STREAMING_RESPONSE_FORMATS = frozenset({"json", "text"})
 
 @dataclass(frozen=True, slots=True)
 class SpeechToTextForm:
-    """Parsed multipart fields shared by speech-to-text endpoints."""
+    """Separate shared form parsing from endpoint-specific policy."""
 
     file: UploadFile
     model: str | None
@@ -71,7 +71,6 @@ async def parse_speech_to_text_form(
     max_new_tokens: int | None = Form(default=None, ge=1),
     stream: bool = Form(default=False),
 ) -> SpeechToTextForm:
-    """Let FastAPI parse the common multipart speech-to-text form."""
     return SpeechToTextForm(
         file=file,
         model=model,
@@ -85,7 +84,7 @@ async def parse_speech_to_text_form(
 
 
 async def read_and_validate_speech_to_text_audio(file: UploadFile) -> bytes:
-    """Read an upload and preserve the endpoint's empty-file error."""
+    """Reject empty uploads before dispatch can consume backend resources."""
     audio_bytes = await file.read()
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
@@ -100,7 +99,7 @@ def validate_speech_to_text_response_format(
     response_formats: Collection[str] = DEFAULT_RESPONSE_FORMATS,
     streaming_response_formats: Collection[str] = DEFAULT_STREAMING_RESPONSE_FORMATS,
 ) -> str:
-    """Normalize and validate a response format for a speech-to-text route."""
+    """Keep format errors endpoint-specific without duplicating validation."""
     normalized_response_format = response_format.strip().lower()
     if stream and normalized_response_format not in streaming_response_formats:
         raise HTTPException(
@@ -120,7 +119,7 @@ def validate_speech_to_text_response_format(
     return normalized_response_format
 
 
-def build_transcription_generate_request(
+def build_speech_to_text_generate_request(
     *,
     audio_bytes: bytes,
     filename: str | None,
@@ -133,7 +132,7 @@ def build_transcription_generate_request(
     stream: bool = False,
     task: str = "transcribe",
 ) -> GenerateRequest:
-    """Build the model-neutral generation request for a speech-to-text job."""
+    """Keep endpoint policy out of model-neutral request construction."""
     params: dict[str, Any] = {"task": task}
     metadata: dict[str, Any] = {"task": "asr"}
     explicit_fields: list[str] = []
@@ -166,6 +165,11 @@ def build_transcription_generate_request(
     )
 
 
+# note (Junnan Li): Keep the old name while stacked callers migrate to the
+# endpoint-neutral shared API.
+build_transcription_generate_request = build_speech_to_text_generate_request
+
+
 async def complete_speech_to_text_request(
     client: Client,
     gen_req: GenerateRequest,
@@ -173,7 +177,7 @@ async def complete_speech_to_text_request(
     request_id: str,
     error_log_message: str,
 ) -> CompletionResult:
-    """Dispatch one speech-to-text request and preserve HTTP error mapping."""
+    """Keep sibling endpoints on the same backend-to-HTTP error mapping."""
     try:
         return await client.completion(gen_req, request_id=request_id)
     except ClientError as exc:
@@ -190,12 +194,11 @@ async def complete_speech_to_text_request(
 def resolve_speech_to_text_adapter(
     architectures: list[str] | None,
 ) -> TranscriptionAdapter:
-    """Resolve model output semantics at the shared serving boundary."""
     return resolve_adapter(architectures)
 
 
 def probe_audio_duration(audio_bytes: bytes) -> float:
-    """Best-effort duration in seconds using metadata without a full decode."""
+    """Avoid a full decode; unknown duration is valid for response formatting."""
     try:
         import soundfile as sf
 
@@ -217,7 +220,7 @@ def assemble_speech_to_text_response(
     audio_bytes: bytes,
     architectures: list[str] | None,
 ) -> Response:
-    """Serialize text/json/verbose_json without owning endpoint semantics."""
+    """Keep response schemas consistent across sibling endpoints."""
     normalized_response_format = validate_speech_to_text_response_format(
         response_format,
         stream=False,
@@ -288,7 +291,8 @@ async def _first_speech_to_text_chunk(
     chunk_stream: AsyncIterator[GenerateChunk],
     request_id: str,
 ) -> GenerateChunk | None:
-    """Wait for the first stream chunk while watching for disconnect."""
+    # note (Junnan Li): Admit before headers so model validation remains an
+    # HTTP error instead of becoming an SSE error event.
     disconnect_task = asyncio.create_task(_wait_for_request_disconnect(request))
     first_chunk_task = asyncio.create_task(anext(chunk_stream))
     try:
@@ -320,7 +324,7 @@ async def speech_to_text_stream(
     duration_s: float,
     operation_name: str = "transcription",
 ) -> AsyncIterator[str]:
-    """Emit speech-to-text deltas, one done event, then the SSE sentinel."""
+    """Keep terminal event ordering stable for OpenAI-compatible clients."""
     final_text: str | None = None
 
     def _event_for(chunk: GenerateChunk) -> str | None:
@@ -371,7 +375,7 @@ async def create_speech_to_text_streaming_response(
     architectures: list[str] | None,
     operation_name: str = "transcription",
 ) -> Response:
-    """Own first-chunk admission and the complete SSE response lifecycle."""
+    """Delay headers until backend admission can still return an HTTP error."""
     adapter = resolve_speech_to_text_adapter(architectures)
     duration_s = probe_audio_duration(audio_bytes)
     chunk_stream = client.generate(gen_req, request_id=request_id)

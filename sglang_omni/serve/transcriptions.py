@@ -16,7 +16,7 @@ TRANSCRIPTIONS_ENDPOINT = "/v1/audio/transcriptions"
 _first_transcription_chunk = speech_to_text._first_speech_to_text_chunk
 _transcription_stream = speech_to_text.speech_to_text_stream
 build_transcription_generate_request = (
-    speech_to_text.build_transcription_generate_request
+    speech_to_text.build_speech_to_text_generate_request
 )
 
 __all__ = [
@@ -51,7 +51,7 @@ def register_transcriptions(app: FastAPI) -> None:
                 stream=True,
                 endpoint_path=TRANSCRIPTIONS_ENDPOINT,
             )
-            gen_req = build_transcription_generate_request(
+            gen_req = speech_to_text.build_speech_to_text_generate_request(
                 audio_bytes=audio_bytes,
                 filename=form.file.filename,
                 content_type=form.file.content_type,
@@ -71,7 +71,7 @@ def register_transcriptions(app: FastAPI) -> None:
                 architectures=getattr(app.state, "architectures", None),
             )
 
-        gen_req = build_transcription_generate_request(
+        gen_req = speech_to_text.build_speech_to_text_generate_request(
             audio_bytes=audio_bytes,
             filename=form.file.filename,
             content_type=form.file.content_type,
