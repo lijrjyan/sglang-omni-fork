@@ -46,7 +46,7 @@ class TranscriptionAdapter(ABC):
         language: str | None,
         audio_duration_s: float,
     ) -> TranscriptionVerboseResponse:
-        """Build a verbose_json response with segments / timestamps."""
+        """Build a verbose_json response from model-decoded text."""
 
     def build_verbose_response_from_chunks(
         self,

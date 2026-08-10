@@ -2581,6 +2581,38 @@ class DiarizationTranscriptionClient:
         )
 
 
+class WhisperTimestampTranscriptionClient(SuccessfulTranscriptionClient):
+    async def completion(self, request, *, request_id, audio_format="wav"):
+        from sglang_omni.client.types import CompletionResult
+
+        del request_id, audio_format
+        self.requests.append(request)
+        return CompletionResult(
+            request_id="transcription-1",
+            text="<|0.00|>hello there.<|1.20|>",
+        )
+
+
+def test_transcription_srt_returns_whisper_timestamp_segments() -> None:
+    fake_client = WhisperTimestampTranscriptionClient()
+    client = TestClient(
+        create_app(
+            fake_client,
+            model_name="openai/whisper-large-v3",
+            architectures=["WhisperForConditionalGeneration"],
+        )
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "openai/whisper-large-v3", "response_format": "srt"},
+        files={"file": ("sample.wav", b"RIFF", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert response.text == ("1\n00:00:00,000 --> 00:00:01,200\nhello there.\n\n")
+
+
 def test_transcription_verbose_json_returns_diarized_segments() -> None:
     client = TestClient(
         create_app(
@@ -2655,14 +2687,14 @@ def test_transcription_srt_requires_segment_timestamp_capability() -> None:
     client = TestClient(
         create_app(
             SuccessfulTranscriptionClient(),
-            model_name="openai/whisper-large-v3",
-            architectures=["WhisperForConditionalGeneration"],
+            model_name="unsupported-asr",
+            architectures=["UnsupportedForConditionalGeneration"],
         )
     )
 
     response = client.post(
         "/v1/audio/transcriptions",
-        data={"model": "openai/whisper-large-v3", "response_format": "srt"},
+        data={"model": "unsupported-asr", "response_format": "srt"},
         files={"file": ("sample.wav", b"RIFF", "audio/wav")},
     )
 

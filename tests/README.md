@@ -157,8 +157,12 @@ tests/
     │   ├── test_streaming_vocoder.py
     │   ├── test_tts.py
     │   └── test_vocoder.py
-    └── voxtral_tts/
-        └── test_pipeline.py
+    ├── voxtral_tts/
+    │   └── test_pipeline.py
+    └── whisper_asr/
+        ├── test_pipeline.py
+        ├── test_request_builders.py
+        └── test_transcription_adapter.py
 ```
 
 ## How To Add A Test
