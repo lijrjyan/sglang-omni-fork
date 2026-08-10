@@ -47,29 +47,49 @@ resp.raise_for_status()
 print(resp.json()["text"])
 ```
 
+## Translate Audio
+
+Whisper multilingual checkpoints can translate source speech to English via
+`/v1/audio/translations`. Use a multilingual, non-turbo checkpoint: `*.en`
+checkpoints have no translate task, and `whisper-large-v3-turbo` was distilled
+without it.
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/translations \
+  -F model=openai/whisper-large-v3 \
+  -F file=@tests/data/query_to_cars.wav \
+  -F language=fr \
+  -F response_format=json
+```
+
+For this endpoint, `language` is an optional source-language hint and a
+**SGLang-Omni extension**. OpenAI's official audio translations request schema
+does not include `language`; the translation target is English in both APIs.
+See the [audio translation support matrix](../basic_usage/audio_translations.md)
+for response formats and other ASR models.
+
 ## Request Parameters
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `file` | file | required | Audio file uploaded as multipart form data |
 | `model` | string | server default | Model identifier |
-| `language` | string | unset | Optional language hint |
-| `response_format` | string | `json` | Use `json` for the current Whisper path |
+| `language` | string | unset | Optional source-language hint; on translations this is a SGLang-Omni extension |
+| `response_format` | string | `json` | `json`, `verbose_json`, or raw `text`; translation `srt`/`vtt` require segment timestamps and return HTTP 400 |
 | `temperature` | float | `0.0` | Sampling temperature; defaults to greedy decoding |
 
-The request builder also supports `task` (`transcribe` by default) and
-`max_new_tokens`, but the public transcription endpoint currently exposes only
-the fields above. The route uses the ASR stage default unless the pipeline is
-configured another way. For smoke tests, keep the request minimal and use
-`response_format=json`.
+The serving route selects the internal `task` from the endpoint (`transcribe`
+or `translate`); it is not a public form field. The route uses the ASR stage
+default unless the pipeline is configured another way. For smoke tests, keep
+the request minimal and use `response_format=json`.
 
 ## Known Limitations
 
 - This path is experimental and not yet correctness-validated. Prefer Qwen3-ASR
   for validated ASR serving.
 - Keep Whisper ASR at encoder batch size 1.
-- Use `response_format=json`; other response formats are not validated for this
-  experimental path.
+- `verbose_json` contains one duration-based placeholder segment; `srt` and
+  `vtt` are rejected until real segment timestamps exist.
 - First startup can take several minutes.
 - The endpoint accepts one uploaded file per request.
 - Audio is resampled to 16 kHz before transcription.
