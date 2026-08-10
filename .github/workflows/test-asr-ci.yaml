@@ -41,6 +41,7 @@ jobs:
       options: >-
         --rm
         -e NVIDIA_VISIBLE_DEVICES
+        -e OMNI_CI_CPUSET
         -v /dev/shm:/dev/shm
         -v /data/omni-ci:/data/omni-ci
         -v /data/cache/huggingface:/github/home/.cache/huggingface
@@ -75,12 +76,14 @@ jobs:
             */moss_transcribe_diarize_results.json
             */moss_transcribe_diarize_stream_results.json
             */moss_transcribe_diarize_aishell4_long_results.json
+            */moss_transcribe_diarize_aishell4_long90_results.json
             */moss_transcribe_diarize_googletime_results.json
           artifact-upload-name: asr-stage-multi-speaker-results
           artifact-upload-path: |
             /tmp/**/moss_transcribe_diarize_results.json
             /tmp/**/moss_transcribe_diarize_stream_results.json
             /tmp/**/moss_transcribe_diarize_aishell4_long_results.json
+            /tmp/**/moss_transcribe_diarize_aishell4_long90_results.json
             /tmp/**/moss_transcribe_diarize_googletime_results.json
           summary-only: "true"
 
@@ -95,6 +98,7 @@ jobs:
       options: >-
         --rm
         -e NVIDIA_VISIBLE_DEVICES
+        -e OMNI_CI_CPUSET
         -v /dev/shm:/dev/shm
         -v /data/omni-ci:/data/omni-ci
         -v /data/cache/huggingface:/github/home/.cache/huggingface
