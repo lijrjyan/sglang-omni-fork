@@ -30,6 +30,15 @@ class _FakeTokenizer:
     pad_token_id = 3
     vocab_size = 51865
 
+    def __len__(self) -> int:
+        return 51866
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return {"<|startoftranscript|>": 50258}[token]
+
+    def get_added_vocab(self) -> dict[str, int]:
+        return {"<|en|>": 50259, "<|zh|>": 50260}
+
     def set_prefix_tokens(
         self, *, language: str, task: str, predict_timestamps: bool
     ) -> None:
