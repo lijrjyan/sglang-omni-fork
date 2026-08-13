@@ -2605,6 +2605,71 @@ def test_transcription_verbose_json_returns_diarized_segments() -> None:
     ]
 
 
+def test_transcription_srt_returns_diarized_segments() -> None:
+    client = TestClient(
+        create_app(
+            DiarizationTranscriptionClient(),
+            model_name="moss-transcribe-diarize",
+            architectures=["MossTranscribeDiarizeForConditionalGeneration"],
+        )
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "moss-transcribe-diarize", "response_format": "srt"},
+        files={"file": ("sample.wav", b"RIFF", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert response.text == (
+        "1\n"
+        "00:00:00,000 --> 00:00:01,200\n"
+        "[S01]hello there.\n\n"
+        "2\n"
+        "00:00:01,300 --> 00:00:03,000\n"
+        "[S02]bye.\n\n"
+    )
+
+
+def test_transcription_vtt_returns_diarized_segments() -> None:
+    client = TestClient(
+        create_app(
+            DiarizationTranscriptionClient(),
+            model_name="moss-transcribe-diarize",
+            architectures=["MossTranscribeDiarizeForConditionalGeneration"],
+        )
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "moss-transcribe-diarize", "response_format": "vtt"},
+        files={"file": ("sample.wav", b"RIFF", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert response.text.startswith("WEBVTT\n\n")
+
+
+def test_transcription_srt_requires_segment_timestamp_capability() -> None:
+    client = TestClient(
+        create_app(
+            SuccessfulTranscriptionClient(),
+            model_name="openai/whisper-large-v3",
+            architectures=["WhisperForConditionalGeneration"],
+        )
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "openai/whisper-large-v3", "response_format": "srt"},
+        files={"file": ("sample.wav", b"RIFF", "audio/wav")},
+    )
+
+    assert response.status_code == 400
+    assert "segment-timestamp capability" in response.json()["detail"]
+
+
 def test_transcription_verbose_json_falls_back_for_plain_text() -> None:
     client = TestClient(
         create_app(
