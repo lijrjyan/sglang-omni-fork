@@ -154,8 +154,8 @@ All 1,200 measured requests completed successfully. Corpus WER remained 0.0415 i
 
 - This path is experimental and not yet correctness-validated. Prefer Qwen3-ASR
   for validated ASR serving.
-- `verbose_json` contains one duration-based placeholder segment; `srt` and
-  `vtt` are rejected until real segment timestamps exist.
+- `verbose_json` returns a single segment spanning the audio duration; `srt`
+  and `vtt` are not supported and return HTTP 400.
 - Encoder CUDA Graph is enabled by default and requires SGLang generation CUDA
   Graph to remain enabled. Validate the selected buckets before production use.
 - Chunked prefill is disabled because the Whisper encoder prefix must be

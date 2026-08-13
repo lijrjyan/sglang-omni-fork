@@ -60,10 +60,10 @@ See each model's cookbook for its transcription workflow.
 | `json` | JSON object containing `text` |
 | `verbose_json` | JSON with `task="translate"`, text, duration, and segments |
 | `text` | Raw translated text with `text/plain` content type |
-| `srt`, `vtt` | HTTP 400 — requires a segment-timestamp capability |
+| `srt`, `vtt` | Not supported; HTTP 400 |
 
-`verbose_json` follows transcription parity: without a real segment-timestamp
-channel it reports one placeholder segment spanning the audio duration.
+`verbose_json` returns a single segment spanning the audio duration, matching
+`/v1/audio/transcriptions`.
 
 Streaming is available with `stream=true` for `json` and `text`, using the same
 SSE lifecycle as transcriptions: `transcript.text.delta` events, one
