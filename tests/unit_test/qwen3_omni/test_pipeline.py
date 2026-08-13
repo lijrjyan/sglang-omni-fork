@@ -781,10 +781,11 @@ def test_qwen_cli_mem_fraction_static_survives_runtime_overrides_overlay() -> No
         "expected_infrastructure_graph_disabled",
         "expected_capture_hidden_layers",
         "expected_init_graph_calls",
+        "expected_infrastructure_return_hidden",
     ),
     [
-        (False, False, None, 0),
-        (True, True, [0, 24], 1),
+        (False, False, None, 0, False),
+        (True, True, [0, 24], 1, True),
     ],
 )
 def test_qwen_thinker_cuda_graph_capture_lifecycle(
@@ -793,6 +794,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     expected_infrastructure_graph_disabled: bool,
     expected_capture_hidden_layers: list[int] | None,
     expected_init_graph_calls: int,
+    expected_infrastructure_return_hidden: bool,
 ) -> None:
     from sglang.srt.utils import hf_transformers_utils
 
@@ -805,6 +807,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
         disable_cuda_graph=False, enable_return_hidden_states=False
     )
     infrastructure_saw_graph_disabled: list[bool] = []
+    infrastructure_saw_return_hidden: list[bool] = []
     capture_hidden_layers_seen: list[list[int] | None] = []
     init_graph_calls = 0
 
@@ -815,6 +818,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
             nonlocal init_graph_calls
             init_graph_calls += 1
             assert server_args.disable_cuda_graph is False
+            assert server_args.enable_return_hidden_states is False
 
     model_config = SimpleNamespace(
         model_path="model",
@@ -828,6 +832,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
 
     def fake_create_infrastructure(*args, **kwargs):
         infrastructure_saw_graph_disabled.append(bool(args[0].disable_cuda_graph))
+        infrastructure_saw_return_hidden.append(
+            bool(args[0].enable_return_hidden_states)
+        )
         capture_hidden_layers_seen.append(kwargs.get("capture_hidden_layers"))
         return (
             model_worker,
@@ -877,7 +884,8 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     assert infrastructure_saw_graph_disabled == [expected_infrastructure_graph_disabled]
     assert capture_hidden_layers_seen == [expected_capture_hidden_layers]
     assert init_graph_calls == expected_init_graph_calls
-    assert server_args.enable_return_hidden_states is speech_enabled
+    assert infrastructure_saw_return_hidden == [expected_infrastructure_return_hidden]
+    assert server_args.enable_return_hidden_states is False
     assert server_args.disable_cuda_graph is False
     assert scheduler.server_args is server_args
 
@@ -1401,6 +1409,64 @@ def test_qwen_sglang_request_hashes_media_tokens_without_changing_mrope_ids(
     assert pad_values["audio"] >= 256
     assert int(req_data.input_ids[1]) == pad_values["audio"]
     assert captured["input_ids"].tolist() == input_ids.tolist()
+
+
+def test_qwen_sglang_request_records_mm_token_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Build records per-modality placeholder positions so the thinker prefill
+    merge never has to derive placement from GPU tensors."""
+    monkeypatch.setattr(
+        "sglang.srt.sampling.sampling_params.SamplingParams.normalize",
+        lambda self, tokenizer: None,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.sampling.sampling_params.SamplingParams.verify",
+        lambda self, vocab_size: None,
+    )
+    monkeypatch.setattr(
+        "sglang_omni.models.qwen3_omni.request_builders._compute_mrope_positions",
+        lambda input_ids, model_inputs, thinker_config: (
+            torch.zeros((3, input_ids.numel()), dtype=torch.long),
+            torch.tensor(0),
+        ),
+    )
+
+    image_token_id, audio_token_id = 55, 77
+    input_ids = torch.tensor(
+        [10, image_token_id, image_token_id, 11, audio_token_id, 12],
+        dtype=torch.long,
+    )
+    state = make_qwen_state(
+        prompt={"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)},
+        thinker_inputs={
+            "model_inputs": {
+                "image_embeds": torch.ones((2, 4)),
+                "audio_embeds": torch.ones((1, 4)),
+            },
+            "media_cache_keys": {"audio": "audio:cache"},
+        },
+    )
+    req_data = build_sglang_thinker_request(
+        state,
+        params={"max_new_tokens": 3},
+        tokenizer=FakeQwenTokenizer(),
+        vocab_size=256,
+        request_id="rid-mm-pos",
+        thinker_config=SimpleNamespace(
+            image_token_id=image_token_id,
+            video_token_id=66,
+            audio_token_id=audio_token_id,
+        ),
+    )
+
+    positions = req_data.req._omni_mm_positions
+    assert {k: v.tolist() for k, v in positions.items()} == {
+        "image": [1, 2],
+        "video": [],
+        "audio": [4],
+    }
+    assert all(v.dtype == torch.int64 and not v.is_cuda for v in positions.values())
 
 
 def _encode_processed_tensor(tensor: torch.Tensor) -> dict[str, object]:

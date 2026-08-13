@@ -21,8 +21,9 @@ from benchmarks.tasks.tts import (
     _handle_raw_pcm_streaming_response,
     estimate_moss_tts_duration_tokens,
 )
+from sglang_omni.config.manager import ConfigManager
+from sglang_omni.config.runtime import resolve_stage_factory_args
 from sglang_omni.models.moss_tts.config import MossTTSPipelineConfig
-from sglang_omni.models.moss_tts.delay_pattern import split_moss_audio_segments
 from sglang_omni.models.moss_tts.payload_types import MossTTSState
 from sglang_omni.models.moss_tts.request_builders import (
     _INF_DELAY,
@@ -112,6 +113,10 @@ def test_moss_tts_config_and_registry_contracts() -> None:
     }
     assert {stage.process for stage in config.stages} == {"pipeline"}
     assert config.supports_uploaded_voice_references() is True
+    tts_engine = next(stage for stage in config.stages if stage.name == "tts_engine")
+    vocoder = next(stage for stage in config.stages if stage.name == "vocoder")
+    assert tts_engine.stream_to == ["vocoder"]
+    assert vocoder.can_accept_stream_before_payload is True
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("MossTTSDelayModel")
         is MossTTSPipelineConfig
@@ -125,7 +130,187 @@ def test_moss_tts_config_and_registry_contracts() -> None:
     preprocessing = next(
         stage for stage in config.stages if stage.name == "preprocessing"
     )
-    assert preprocessing.factory_args == {"dtype": "float32"}
+    vocoder = next(stage for stage in config.stages if stage.name == "vocoder")
+    assert preprocessing.factory_args == {
+        "dtype": "float32",
+        "ref_audio_cache": True,
+        "ref_audio_cache_max_items": 8192,
+        "ref_audio_cache_max_bytes": 64 * 1024 * 1024,
+    }
+    assert vocoder.factory_args == {
+        "dtype": "float32",
+        "compute_dtype": "bfloat16",
+    }
+
+
+def test_moss_tts_production_config_resolves_codec_memory_policy() -> None:
+    config = ConfigManager.from_file("examples/configs/moss_tts.yaml").config
+
+    assert isinstance(config, MossTTSPipelineConfig)
+    stages = {stage.name: stage for stage in config.stages}
+    preprocessing_args = resolve_stage_factory_args(
+        stages["preprocessing"], config, gpu_id=0
+    )
+    vocoder_args = resolve_stage_factory_args(stages["vocoder"], config, gpu_id=0)
+
+    assert preprocessing_args == {
+        "dtype": "float32",
+        "ref_audio_cache": True,
+        "ref_audio_cache_max_items": 8192,
+        "ref_audio_cache_max_bytes": 64 * 1024 * 1024,
+        "model_path": "OpenMOSS-Team/MOSS-TTS-v1.5",
+        "gpu_id": 0,
+    }
+    assert vocoder_args == {
+        "dtype": "float32",
+        "compute_dtype": "bfloat16",
+        "model_path": "OpenMOSS-Team/MOSS-TTS-v1.5",
+        "gpu_id": 0,
+    }
+
+
+def test_moss_tts_32gb_config_bounds_runtime_memory() -> None:
+    config = ConfigManager.from_file("examples/configs/moss_tts_32gb.yaml").config
+
+    assert isinstance(config, MossTTSPipelineConfig)
+    stages = {stage.name: stage for stage in config.stages}
+    preprocessing_args = resolve_stage_factory_args(
+        stages["preprocessing"], config, gpu_id=0
+    )
+    tts_engine_args = resolve_stage_factory_args(stages["tts_engine"], config, gpu_id=0)
+    vocoder_args = resolve_stage_factory_args(stages["vocoder"], config, gpu_id=0)
+
+    assert preprocessing_args["device"] == "cpu"
+    assert preprocessing_args["dtype"] == "float32"
+    assert preprocessing_args["max_concurrency"] == 1
+    assert tts_engine_args["dtype"] == "bfloat16"
+    assert tts_engine_args["server_args_overrides"] == {
+        "max_running_requests": 1,
+        "mem_fraction_static": 0.70,
+        "cuda_graph_max_bs": 1,
+    }
+    assert vocoder_args["dtype"] == "bfloat16"
+    assert vocoder_args["compute_dtype"] == "bfloat16"
+    assert vocoder_args["max_batch_size"] == 1
+    assert vocoder_args["max_batch_wait_ms"] == 2
+
+
+def test_moss_tts_24gb_config_bounds_runtime_memory() -> None:
+    config = ConfigManager.from_file("examples/configs/moss_tts_24gb.yaml").config
+
+    assert isinstance(config, MossTTSPipelineConfig)
+    stages = {stage.name: stage for stage in config.stages}
+    preprocessing_args = resolve_stage_factory_args(
+        stages["preprocessing"], config, gpu_id=0
+    )
+    tts_engine_args = resolve_stage_factory_args(stages["tts_engine"], config, gpu_id=0)
+    vocoder_args = resolve_stage_factory_args(stages["vocoder"], config, gpu_id=0)
+
+    assert preprocessing_args["device"] == "cpu"
+    assert preprocessing_args["dtype"] == "float32"
+    assert preprocessing_args["max_concurrency"] == 1
+    assert tts_engine_args["dtype"] == "bfloat16"
+    assert tts_engine_args["server_args_overrides"] == {
+        "max_running_requests": 1,
+        "max_total_tokens": 8192,
+        "mem_fraction_static": 0.78,
+        "cuda_graph_max_bs": 1,
+    }
+    assert vocoder_args["dtype"] == "bfloat16"
+    assert vocoder_args["compute_dtype"] == "bfloat16"
+    assert vocoder_args["max_batch_size"] == 1
+    assert vocoder_args["max_batch_wait_ms"] == 2
+
+
+def test_moss_tts_codec_runtime_overrides_take_precedence() -> None:
+    config = MossTTSPipelineConfig(
+        model_path="model",
+        runtime_overrides={
+            "preprocessing": {"device": "cuda:7", "dtype": "bfloat16"},
+            "vocoder": {"device": "cpu", "dtype": "float32"},
+        },
+    )
+    stages = {stage.name: stage for stage in config.stages}
+
+    preprocessing_args = resolve_stage_factory_args(
+        stages["preprocessing"], config, gpu_id=2
+    )
+    vocoder_args = resolve_stage_factory_args(stages["vocoder"], config, gpu_id=2)
+
+    assert preprocessing_args["device"] == "cuda:7"
+    assert preprocessing_args["dtype"] == "bfloat16"
+    assert preprocessing_args["gpu_id"] == 2
+    assert vocoder_args["device"] == "cpu"
+    assert vocoder_args["dtype"] == "float32"
+    assert vocoder_args["compute_dtype"] == "bfloat16"
+    assert vocoder_args["gpu_id"] == 2
+
+
+def test_moss_tts_config_merge_updates_reference_cache_factory_args() -> None:
+    from sglang_omni.config.manager import ConfigManager
+
+    config = MossTTSPipelineConfig(model_path="model")
+    merged = ConfigManager(config).merge_config(
+        {
+            "stages.preprocessing.factory_args.ref_audio_cache": False,
+            "stages.preprocessing.factory_args.ref_audio_cache_max_items": 17,
+            "stages.preprocessing.factory_args.ref_audio_cache_max_bytes": 4096,
+        }
+    )
+    preprocessing = next(
+        stage for stage in merged.stages if stage.name == "preprocessing"
+    )
+
+    assert preprocessing.factory_args["ref_audio_cache"] is False
+    assert preprocessing.factory_args["ref_audio_cache_max_items"] == 17
+    assert preprocessing.factory_args["ref_audio_cache_max_bytes"] == 4096
+
+
+def test_moss_tts_config_merge_updates_vocoder_factory_args() -> None:
+    from sglang_omni.config.manager import ConfigManager
+
+    config = MossTTSPipelineConfig(model_path="model")
+    merged = ConfigManager(config).merge_config(
+        {
+            "stages.vocoder.factory_args.compute_dtype": "float32",
+        }
+    )
+    vocoder = next(stage for stage in merged.stages if stage.name == "vocoder")
+
+    assert vocoder.factory_args["compute_dtype"] == "float32"
+
+    disabled = ConfigManager(config).merge_config(
+        {"stages.vocoder.factory_args.compute_dtype": None}
+    )
+    vocoder = next(stage for stage in disabled.stages if stage.name == "vocoder")
+
+    assert vocoder.factory_args["compute_dtype"] is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("float32", torch.float32),
+        ("bfloat16", torch.bfloat16),
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+    ],
+)
+def test_moss_tts_resolves_compute_dtype(value, expected) -> None:
+    from sglang_omni.models.moss_tts import stages
+
+    assert stages._resolve_compute_dtype(value) is expected
+
+
+@pytest.mark.parametrize(
+    "value", ["fp16", "float16", "fp32", "bf16", "invalid", torch.float16]
+)
+def test_moss_tts_rejects_invalid_compute_dtype(value) -> None:
+    from sglang_omni.models.moss_tts import stages
+
+    with pytest.raises(ValueError, match="compute_dtype"):
+        stages._resolve_compute_dtype(value)
 
 
 def test_moss_tts_preprocessing_factory_receives_placement_gpu_id() -> None:
@@ -147,6 +332,29 @@ def test_moss_tts_preprocessing_factory_receives_placement_gpu_id() -> None:
     assert preprocessing.gpu == 2
     assert factory_args["gpu_id"] == 2
     assert "device" not in factory_args
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"ref_audio_cache_max_items": 0}, "ref_audio_cache_max_items"),
+        ({"ref_audio_cache_max_bytes": 0}, "ref_audio_cache_max_bytes"),
+    ],
+)
+def test_moss_tts_preprocessing_rejects_invalid_reference_cache_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    kwargs,
+    match,
+) -> None:
+    from sglang_omni.models.moss_tts import stages
+
+    monkeypatch.setattr(
+        stages,
+        "_load_moss_processor",
+        lambda *_args, **_kwargs: pytest.fail("validation must precede model loading"),
+    )
+    with pytest.raises(ValueError, match=match):
+        stages.create_preprocessing_executor("model", **kwargs)
 
 
 def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
@@ -174,7 +382,8 @@ def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
                 decode=SimpleNamespace(
                     max_bs=kwargs["cuda_graph_max_bs"],
                     bs=kwargs["cuda_graph_bs"],
-                )
+                ),
+                prefill=SimpleNamespace(backend="disabled", bs=None, max_bs=None),
             ),
             enable_torch_compile=kwargs["enable_torch_compile"],
             torch_compile_max_bs=kwargs.get("torch_compile_max_bs"),
@@ -190,12 +399,30 @@ def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
         captured["gpu_id"] = gpu_id
         captured["model_arch_override"] = model_arch_override
         captured["defer_cuda_graph_capture"] = defer_cuda_graph_capture
-        model = object()
+
+        def init_sampling_graphs(batch_sizes, *, disable_padding):
+            captured.setdefault("sampling_graph_inits", []).append(
+                (batch_sizes, disable_padding)
+            )
+            captured.setdefault("graph_init_order", []).append("sampling")
+
+        def init_cuda_graphs():
+            captured["graph_inits"] = int(captured.get("graph_inits", 0)) + 1
+            captured.setdefault("graph_init_order", []).append("backbone")
+
+        model = SimpleNamespace(init_sampling_graphs=init_sampling_graphs)
         model_runner = SimpleNamespace(
             model=model,
-            init_cuda_graphs=lambda: captured.setdefault("graph_inits", 0) or None,
+            decode_cuda_graph_runner=SimpleNamespace(
+                capture_bs=tuple(server_args.cuda_graph_bs),
+                disable_padding=False,
+            ),
+            init_cuda_graphs=init_cuda_graphs,
         )
-        model_worker = SimpleNamespace(model_runner=model_runner)
+        model_worker = SimpleNamespace(
+            model_runner=model_runner,
+            enable_prefill_input_embeds=False,
+        )
         return (
             model_worker,
             object(),
@@ -269,6 +496,18 @@ def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
     assert explicit_kwargs["mem_fraction_static"] == 0.61
     assert captured["context_length"] == 8192
     assert captured["model_arch_override"] == "MossTTSDelaySGLangModel"
+    assert captured["defer_cuda_graph_capture"] is True
+    assert captured["graph_inits"] == 2
+    assert captured["sampling_graph_inits"] == [
+        ([1, 2, 4, 8, 12, 16], False),
+        ([1, 2, 4, 8, 12, 16], False),
+    ]
+    assert captured["graph_init_order"] == [
+        "backbone",
+        "sampling",
+        "backbone",
+        "sampling",
+    ]
 
 
 def test_moss_tts_talker_torch_compile_cli_override_targets_tts_engine() -> None:
@@ -396,13 +635,18 @@ def test_moss_tts_preprocessing_loads_separate_codec(
     monkeypatch.setattr(stages, "load_moss_tts_audio_tokenizer", load_codec)
 
     try:
-        stages.create_preprocessing_executor("model", device="cpu")
+        stages.create_preprocessing_executor(
+            "model",
+            device="cpu",
+            ref_audio_cache=False,
+        )
         context = rb._QUEUE.snapshot().context
         assert context is not None
         assert context.processor is processor
         assert context.processor.audio_tokenizer is None
-        assert context.reference_encoder.audio_tokenizer is codec
-        assert context.reference_encoder.n_vq == 32
+        assert context.reference_encoder._audio_tokenizer is codec
+        assert context.reference_encoder._n_vq == 32
+        assert isinstance(context.reference_encoder, stages._BatchedReferenceEncoder)
     finally:
         rb.clear_moss_tts_preprocessing_context()
 
@@ -433,22 +677,18 @@ def test_moss_tts_preprocessing_uses_placement_gpu_id(
     monkeypatch.setattr(stages, "load_moss_tts_audio_tokenizer", load_codec)
 
     try:
-        stages.create_preprocessing_executor("model", gpu_id=2)
+        stages.create_preprocessing_executor(
+            "model",
+            gpu_id=2,
+            ref_audio_cache=False,
+        )
         context = rb._QUEUE.snapshot().context
         assert context is not None
-        assert context.reference_encoder.audio_tokenizer is codec
-
-        stages.create_preprocessing_executor("model", device="cpu", gpu_id=2)
-        context = rb._QUEUE.snapshot().context
-        assert context is not None
-        assert context.reference_encoder.audio_tokenizer is codec
+        assert isinstance(context.reference_encoder, stages._BatchedReferenceEncoder)
     finally:
         rb.clear_moss_tts_preprocessing_context()
 
-    assert loaded == [
-        ("codec", "cuda:2", "float32"),
-        ("codec", "cpu", "float32"),
-    ]
+    assert loaded == [("codec", "cuda:2", "float32")]
 
 
 def test_moss_tts_pathlike_reference_uses_separate_codec() -> None:
@@ -473,54 +713,48 @@ def test_moss_tts_pathlike_reference_uses_separate_codec() -> None:
     assert encoded_paths == ["voice.wav"]
 
 
-@pytest.mark.parametrize(
-    "source",
-    [
-        "voice.wav",
-        "data:audio/wav;base64,UklGRg==",
-    ],
-)
-def test_moss_tts_reference_encoder_uses_shared_audio_loader(
+def test_moss_tts_preprocessing_reference_cache_toggles(
     monkeypatch: pytest.MonkeyPatch,
-    source: str,
 ) -> None:
+    from sglang_omni.models.moss_tts import request_builders as rb
     from sglang_omni.models.moss_tts import stages
 
-    encoded = torch.tensor([[7, 8]], dtype=torch.long)
-    load_calls: list[tuple[str, str, int, bool]] = []
-    encode_calls: list[tuple[list[tuple[torch.Tensor, int]], int]] = []
+    processor = SimpleNamespace(
+        audio_tokenizer=None,
+        model_config=SimpleNamespace(
+            n_vq=32,
+            audio_tokenizer_name_or_path="codec",
+        ),
+    )
+    codec = SimpleNamespace(sample_rate=24000, device="cpu", model=None)
+    monkeypatch.setattr(stages, "_load_moss_processor", lambda model_path: processor)
+    monkeypatch.setattr(stages, "load_moss_tts_audio_tokenizer", lambda *a, **k: codec)
 
-    class FakeAudioTokenizer:
-        sample_rate = 24000
+    try:
+        stages.create_preprocessing_executor(
+            "model",
+            device="cpu",
+            ref_audio_cache=False,
+        )
+        assert isinstance(
+            rb._QUEUE.snapshot().context.reference_encoder,
+            stages._BatchedReferenceEncoder,
+        )
 
-        def encode_waveforms(self, waveforms, *, num_quantizers):
-            encode_calls.append((waveforms, num_quantizers))
-            return [encoded]
+        monkeypatch.setenv("MOSS_REF_AUDIO_CACHE", "0")
+        stages.create_preprocessing_executor("model", device="cpu")
+        assert isinstance(
+            rb._QUEUE.snapshot().context.reference_encoder,
+            stages._BatchedReferenceEncoder,
+        )
 
-    def fake_load_audio(
-        audio_source,
-        *,
-        source_name,
-        target_sample_rate,
-        mono,
-    ):
-        load_calls.append((audio_source, source_name, target_sample_rate, mono))
-        return np.asarray([0.1, 0.2], dtype=np.float32)
-
-    monkeypatch.setattr(stages, "load_audio", fake_load_audio)
-    encoder = stages._MossTTSReferenceEncoder(FakeAudioTokenizer(), n_vq=2)
-
-    result = encoder.encode(source)
-
-    assert result is encoded
-    assert load_calls == [(source, "MOSS-TTS reference", 24000, True)]
-    assert len(encode_calls) == 1
-    waveforms, num_quantizers = encode_calls[0]
-    assert num_quantizers == 2
-    assert len(waveforms) == 1
-    waveform, sample_rate = waveforms[0]
-    assert waveform.tolist() == pytest.approx([0.1, 0.2])
-    assert sample_rate == 24000
+        monkeypatch.delenv("MOSS_REF_AUDIO_CACHE")
+        stages.create_preprocessing_executor("model", device="cpu")
+        cached = rb._QUEUE.snapshot().context.reference_encoder
+        assert isinstance(cached, stages._MossTTSReferenceEncoder)
+        assert cached._service._cache.max_size == 8192
+    finally:
+        rb.clear_moss_tts_preprocessing_context()
 
 
 def test_moss_tts_processor_load_preserves_codec_metadata(
@@ -611,6 +845,7 @@ def test_moss_tts_vocoder_honors_explicit_codec_path(
     stages.create_vocoder_executor(
         "model",
         device="cpu",
+        gpu_id=2,
         codec_model_path="explicit-codec",
     )
 
@@ -695,7 +930,95 @@ def test_moss_tts_audio_tokenizer_preserves_processor_code_layout() -> None:
     assert chunk_duration == 8
 
 
-def test_moss_tts_maps_references_token_count_and_deterministic_defaults() -> None:
+@pytest.mark.parametrize(
+    ("device", "dtype", "expected"),
+    [
+        ("cuda:0", torch.bfloat16, [("cuda", torch.bfloat16)]),
+        ("cuda:0", torch.float16, [("cuda", torch.float16)]),
+        ("cuda:0", torch.float32, []),
+        ("cpu", torch.bfloat16, []),
+    ],
+)
+def test_moss_tts_audio_tokenizer_encode_autocast_matches_model_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+    dtype: torch.dtype,
+    expected: list[tuple[str, torch.dtype]],
+) -> None:
+    from sglang_omni.models.moss_tts import audio_tokenizer as audio_tokenizer_mod
+
+    class FakeCodec(torch.nn.Module):
+        config = SimpleNamespace(sampling_rate=24000)
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(1, dtype=dtype))
+
+        def batch_encode(self, waveforms, num_quantizers):
+            return SimpleNamespace(
+                audio_codes=torch.ones(1, 1, 1, dtype=torch.long),
+                audio_codes_lengths=torch.ones(1, dtype=torch.long),
+            )
+
+    calls: list[tuple[str, torch.dtype]] = []
+
+    def fake_autocast(*, device_type: str, dtype: torch.dtype):
+        calls.append((device_type, dtype))
+        return nullcontext()
+
+    monkeypatch.setattr(audio_tokenizer_mod.torch, "autocast", fake_autocast)
+    tokenizer = audio_tokenizer_mod.MossTTSAudioTokenizer(FakeCodec(), device=device)
+    monkeypatch.setattr(
+        tokenizer,
+        "_prepare_waveform",
+        lambda wav, sample_rate: wav,
+    )
+
+    tokenizer.encode_waveforms([(torch.zeros(1), 24000)])
+
+    assert calls == expected
+
+
+@pytest.mark.parametrize(
+    ("device", "dtype", "expected"),
+    [
+        ("cuda:0", torch.bfloat16, [("cuda", torch.bfloat16)]),
+        ("cuda:0", torch.float16, [("cuda", torch.float16)]),
+        ("cuda:0", torch.float32, []),
+        ("cpu", torch.bfloat16, []),
+    ],
+)
+def test_moss_tts_audio_tokenizer_autocast_matches_model_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+    dtype: torch.dtype,
+    expected: list[tuple[str, torch.dtype]],
+) -> None:
+    from sglang_omni.models.moss_tts import audio_tokenizer as audio_tokenizer_mod
+
+    class FakeCodec(torch.nn.Module):
+        config = SimpleNamespace(sampling_rate=24000)
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(1, dtype=dtype))
+
+    calls: list[tuple[str, torch.dtype]] = []
+
+    def fake_autocast(*, device_type: str, dtype: torch.dtype):
+        calls.append((device_type, dtype))
+        return nullcontext()
+
+    monkeypatch.setattr(audio_tokenizer_mod.torch, "autocast", fake_autocast)
+    tokenizer = audio_tokenizer_mod.MossTTSAudioTokenizer(FakeCodec(), device=device)
+
+    with tokenizer._autocast():
+        pass
+
+    assert calls == expected
+
+
+def test_moss_tts_maps_references_token_count_and_checkpoint_defaults() -> None:
     payload = make_payload(
         inputs={
             "text": "${token:120}hello [pause 0.5s] ni3 hao3 /hello/",
@@ -718,9 +1041,12 @@ def test_moss_tts_maps_references_token_count_and_deterministic_defaults() -> No
     assert state.generation_kwargs["max_new_tokens"] == 4096
     # Defaults follow the upstream checkpoint's generate() (sampling), not greedy.
     assert state.generation_kwargs["text_temperature"] == 1.5
+    assert state.generation_kwargs["text_top_p"] == 1.0
+    assert state.generation_kwargs["text_top_k"] == 50
     assert state.generation_kwargs["audio_temperature"] == 1.7
     assert state.generation_kwargs["audio_top_p"] == 0.8
     assert state.generation_kwargs["audio_top_k"] == 25
+    assert state.generation_kwargs["audio_repetition_penalty"] == 1.0
 
 
 def test_moss_tts_benchmark_auto_token_count_uses_openmoss_estimate() -> None:
@@ -1575,22 +1901,6 @@ def test_moss_audio_end_in_batch_uses_full_text_path_on_next_step() -> None:
     )
 
     assert seen == {"head": False, "sampler": False}
-
-
-def test_moss_delay_codec_splits_non_pad_segments() -> None:
-    delayed = torch.tensor(
-        [
-            [1, 1024],
-            [2, 3],
-            [1024, 4],
-            [1024, 1024],
-        ],
-        dtype=torch.long,
-    )
-
-    segments = split_moss_audio_segments(delayed, audio_pad_code=1024)
-
-    assert [segment.tolist() for segment in segments] == [[[1, 3], [2, 4]]]
 
 
 def test_moss_sample_tokens_uses_per_row_top_k() -> None:

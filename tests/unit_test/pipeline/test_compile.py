@@ -15,7 +15,7 @@ from sglang_omni.pipeline.mp_runner import (
     _resolve_same_process_targets,
 )
 from sglang_omni.pipeline.runtime_config import prepare_pipeline_runtime
-from sglang_omni.pipeline.stage_workers import get_stage_process_env
+from sglang_omni.platforms.cuda import CUDAOmniPlatform
 from tests.unit_test.fixtures.pipeline_fakes import FakeMpContext, fake_factory_path
 from tests.unit_test.pipeline.helpers import stage
 
@@ -475,13 +475,22 @@ def test_mp_runner_preserves_tp_rank_and_visible_device_contracts(tmp_path) -> N
         assert prep.runtime_dir is not None
         prep.runtime_dir.close()
     leader, follower = group.specs
-    env = get_stage_process_env(follower, env={"CUDA_VISIBLE_DEVICES": "4,5,6,7"})
+    env = CUDAOmniPlatform().get_stage_process_env(
+        follower, env={"CUDA_VISIBLE_DEVICES": "4,5,6,7"}
+    )
 
     assert leader.role == "leader"
     assert follower.role == "follower"
     assert leader.factory_args["tp_rank"] == 0
     assert follower.factory_args["tp_rank"] == 1
     assert leader.factory_args["nccl_port"] == follower.factory_args["nccl_port"]
+    assert leader.recv_endpoint == prep.endpoints["stage_thinker"]
+    assert follower.recv_endpoint == ""
+    for spec in (leader, follower):
+        assert (
+            spec.rank_endpoints["thinker"][spec.tp_rank]
+            == prep.endpoints[f"comm_thinker_rank{spec.tp_rank}"]
+        )
     assert leader.env_defaults == {"SGLANG_TEST_STAGE_ENV": "1"}
     assert follower.env_defaults == {"SGLANG_TEST_STAGE_ENV": "1"}
     assert env["CUDA_VISIBLE_DEVICES"] == "7"

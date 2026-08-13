@@ -23,6 +23,7 @@ from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
     Qwen3OmniMoeTalkerTextConfig,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
@@ -52,17 +53,6 @@ def _bind_default_weight_loaders(module: nn.Module) -> None:
     for param in module.parameters():
         if not hasattr(param, "weight_loader"):
             param.weight_loader = default_weight_loader
-
-
-def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Repeat KV heads to match the number of query heads."""
-    batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_kv_heads, n_rep, seq_len, head_dim
-    )
-    return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
 
 
 class _PredictorDecodeGraph:
@@ -458,7 +448,7 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         )
 
         # Decoder layers
-        alt_stream = torch.cuda.Stream()
+        alt_stream = torch.get_device_module().Stream()
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Qwen3OmniMoeTalkerDecoderLayer(
@@ -589,7 +579,7 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         )
 
         # 5 dense decoder layers
-        alt_stream = torch.cuda.Stream()
+        alt_stream = torch.get_device_module().Stream()
         self.model.layers = nn.ModuleList()
         for idx in range(cp_config.num_hidden_layers):
             # Create a decoder layer similar to Thinker but with dense MLP
@@ -770,8 +760,8 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             raise ValueError(f"Unsupported positions rank: {positions.ndim}")
         return positions.to(device=device, dtype=torch.long).reshape(-1)
 
+    @staticmethod
     def _direct_self_attention(
-        self,
         *,
         attn: Qwen3OmniMoeThinkerTextAttention,
         hidden_states: torch.Tensor,
@@ -802,16 +792,14 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             1, 2
         )
 
-        num_kv_groups = attn.num_heads // attn.num_kv_heads
-        k = _repeat_kv(k, num_kv_groups)
-        v = _repeat_kv(v, num_kv_groups)
-
         # Use SDPA to match HF's attention computation
+        # note (EdwardZhang1108): enable_gqa broadcasts KV heads in-kernel (#1145)
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
             v,
             is_causal=True,
+            enable_gqa=attn.num_heads != attn.num_kv_heads,
         )
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size * seq_len, attn.num_heads * attn.head_dim
@@ -986,7 +974,7 @@ class Qwen3OmniTalker(nn.Module):
             device=device,
         )
         self._sampling_staging_event = (
-            torch.cuda.Event() if device.type == "cuda" else None
+            torch.get_device_module().Event() if device.type != "cpu" else None
         )
         self._decode_prep_rids: list | None = None
         self._decode_prep_out_lens: list[int] = []
@@ -1394,7 +1382,7 @@ class Qwen3OmniTalker(nn.Module):
             custom_params=None,
             custom_logit_processor=None,
             sampling_seed=self._sampling_seeds[:batch_size],
-            device="cuda",
+            device=current_platform.device_type,
             logit_bias=None,
         )
 
@@ -1719,15 +1707,14 @@ class Qwen3OmniTalker(nn.Module):
 
         cached_k = layer_k_cache[:, :, : cache_len + 1, :]
         cached_v = layer_v_cache[:, :, : cache_len + 1, :]
-        num_kv_groups = attn.num_heads // attn.num_kv_heads
-        cached_k = _repeat_kv(cached_k, num_kv_groups)
-        cached_v = _repeat_kv(cached_v, num_kv_groups)
 
+        # note (EdwardZhang1108): enable_gqa broadcasts KV heads in-kernel (#1145)
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             cached_k,
             cached_v,
             is_causal=False,
+            enable_gqa=attn.num_heads != attn.num_kv_heads,
         )
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, attn.num_heads * attn.head_dim
