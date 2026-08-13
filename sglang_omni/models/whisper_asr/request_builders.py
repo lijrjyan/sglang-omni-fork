@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from threading import Lock
@@ -40,7 +41,11 @@ class WhisperASRRequestData(SGLangARRequestData):
     output_ids: list[int] | None = None
     audio_duration_s: float = 0.0
     language: str = "en"
+    detect_language: bool = False
     engine_start_s: float = 0.0
+
+
+_LANGUAGE_TOKEN_RE = re.compile(r"^<\|([a-z]{2,3})\|>$")
 
 
 def _resolve_language(value: Any) -> str:
@@ -120,7 +125,17 @@ def make_whisper_scheduler_adapters(
     tokenizer_lock = Lock()
     eos_token_id = int(tokenizer.eos_token_id)
     pad_token_id = int(tokenizer.pad_token_id or eos_token_id)
-    vocab_size = int(tokenizer.vocab_size)
+    # note (Junnan Li): language identification samples language tokens, which
+    # sit above the base vocabulary, so the sampling vocab must cover them.
+    vocab_size = len(tokenizer)
+    sot_token_id = int(tokenizer.convert_tokens_to_ids("<|startoftranscript|>"))
+    # note (Junnan Li): a uniform positive bias keeps the relative order of the
+    # language tokens while guaranteeing one of them wins the detection step.
+    language_token_bias = {
+        str(int(token_id)): 100.0
+        for token, token_id in tokenizer.get_added_vocab().items()
+        if _LANGUAGE_TOKEN_RE.match(token)
+    }
     # note (jiannan-17): Prefer the decoder limit passed by the caller. Fall back
     # to generation_config.max_length, then to Whisper's default 448 positions.
     decoder_context_len = int(
@@ -140,23 +155,28 @@ def make_whisper_scheduler_adapters(
 
         language = _resolve_language(params.get("language"))
         task = str(params.get("task") or "transcribe")
-        with tokenizer_lock:
-            prefix_token_ids = _build_prefix_tokens(
-                tokenizer,
-                language=language,
-                task=task,
-            )
-            request_max_new_tokens, max_prev_tokens = _decoder_token_budgets(
-                decoder_context_len=decoder_context_len,
-                prefix_len=len(prefix_token_ids),
-                requested_max_new_tokens=int(
-                    params.get("max_new_tokens") or max_new_tokens
-                ),
-            )
-            prev_context_ids = _build_prev_context_tokens(
-                tokenizer, params.get("prompt"), max_prev_tokens=max_prev_tokens
-            )
-        prompt_token_ids = prev_context_ids + prefix_token_ids
+        detect_language = bool(params.get("detect_language"))
+        if detect_language:
+            prompt_token_ids = [sot_token_id]
+            request_max_new_tokens = 1
+        else:
+            with tokenizer_lock:
+                prefix_token_ids = _build_prefix_tokens(
+                    tokenizer,
+                    language=language,
+                    task=task,
+                )
+                request_max_new_tokens, max_prev_tokens = _decoder_token_budgets(
+                    decoder_context_len=decoder_context_len,
+                    prefix_len=len(prefix_token_ids),
+                    requested_max_new_tokens=int(
+                        params.get("max_new_tokens") or max_new_tokens
+                    ),
+                )
+                prev_context_ids = _build_prev_context_tokens(
+                    tokenizer, params.get("prompt"), max_prev_tokens=max_prev_tokens
+                )
+            prompt_token_ids = prev_context_ids + prefix_token_ids
         # note (jiannan-17): Keep the invariant at the assembly boundary so future
         # changes fail before an out-of-range decoder position reaches the GPU.
         if len(prompt_token_ids) + request_max_new_tokens > decoder_context_len:
@@ -189,7 +209,7 @@ def make_whisper_scheduler_adapters(
             temperature=temperature,
             top_p=1.0,
             stop_token_ids=[eos_token_id],
-            logit_bias=logit_bias,
+            logit_bias=language_token_bias if detect_language else logit_bias,
         )
         sampling_params.normalize(tokenizer=None)
 
@@ -212,6 +232,7 @@ def make_whisper_scheduler_adapters(
             temperature=temperature,
             audio_duration_s=audio_duration_s,
             language=language,
+            detect_language=detect_language,
             engine_start_s=time.perf_counter(),
             stage_payload=payload,
         )
@@ -219,7 +240,12 @@ def make_whisper_scheduler_adapters(
     def result_adapter(data: WhisperASRRequestData) -> StagePayload:
         payload = data.stage_payload
         output_ids = list(data.output_ids or [])
-        text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+        if data.detect_language:
+            token = tokenizer.convert_ids_to_tokens(output_ids[0]) if output_ids else ""
+            match = _LANGUAGE_TOKEN_RE.match(token or "")
+            text = match.group(1) if match else ""
+        else:
+            text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
         engine_time_s = (
             time.perf_counter() - data.engine_start_s if data.engine_start_s else 0.0
         )

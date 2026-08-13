@@ -103,12 +103,23 @@ def register_translations(app: FastAPI) -> None:
             speech_to_text.probe_audio_duration, audio_bytes
         )
 
+        language = form.language
+        if language is None:
+            language = await speech_to_text.detect_speech_language(
+                client,
+                audio_bytes=audio_bytes,
+                filename=form.file.filename,
+                content_type=form.file.content_type,
+                model=model,
+                request_id=request_id,
+            )
+
         gen_req = speech_to_text.build_speech_to_text_generate_request(
             audio_bytes=audio_bytes,
             filename=form.file.filename,
             content_type=form.file.content_type,
             model=model,
-            language=form.language,
+            language=language,
             prompt=form.prompt,
             temperature=form.temperature,
             max_new_tokens=form.max_new_tokens,
@@ -148,7 +159,7 @@ def register_translations(app: FastAPI) -> None:
             response_format=form.response_format,
             endpoint_path=TRANSLATIONS_ENDPOINT,
             task="translate",
-            language=form.language,
+            language=language,
             audio_bytes=audio_bytes,
             architectures=getattr(app.state, "architectures", None),
             duration_s=duration_s,

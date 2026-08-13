@@ -19,8 +19,9 @@ UNSUPPORTED_MODEL = "Qwen/Qwen3-ASR-1.7B"
 
 
 class RecordingTranslationClient:
-    def __init__(self) -> None:
+    def __init__(self, detected_language: str = "zh") -> None:
         self.requests: list[GenerateRequest] = []
+        self.detected_language = detected_language
 
     async def completion(
         self,
@@ -31,6 +32,8 @@ class RecordingTranslationClient:
     ) -> CompletionResult:
         del audio_format
         self.requests.append(request)
+        if request.extra_params.get("detect_language"):
+            return CompletionResult(request_id=request_id, text=self.detected_language)
         return CompletionResult(request_id=request_id, text="hello world")
 
     async def generate(
@@ -166,6 +169,16 @@ def test_translation_response_format_matrix(
         assert error["type"] == "invalid_request_error"
         assert error["param"] == "response_format"
         assert "segment-timestamp capability" in error["message"]
+
+
+def test_omitted_language_detects_the_source() -> None:
+    client, backend = _translation_client()
+
+    response = _post_translation(client, language=None)
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "hello world"
+    assert backend.requests[-1].extra_params["language"] == "zh"
 
 
 def test_invalid_response_format_returns_openai_400() -> None:
