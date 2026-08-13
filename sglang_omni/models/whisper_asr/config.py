@@ -24,9 +24,7 @@ class WhisperASRPipelineConfig(PipelineConfig):
         return {"generation": "asr"}
 
     def supports_audio_translation(self) -> bool:
-        """Multilingual non-turbo Whisper checkpoints translate speech to
-        English; `*.en` and turbo checkpoints do not, which is documented
-        rather than gated, matching how sibling engines handle it."""
+        """Multilingual non-turbo Whisper checkpoints translate speech to English."""
         return True
 
     model_path: str
