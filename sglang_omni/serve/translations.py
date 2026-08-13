@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -96,6 +97,12 @@ def register_translations(app: FastAPI) -> None:
         except HTTPException as exc:
             return _http_exception_response(exc, param="file")
 
+        # note (Junnan Li): probe once off the event loop and pass the
+        # duration through, matching transcriptions.
+        duration_s = await asyncio.to_thread(
+            speech_to_text.probe_audio_duration, audio_bytes
+        )
+
         gen_req = speech_to_text.build_speech_to_text_generate_request(
             audio_bytes=audio_bytes,
             filename=form.file.filename,
@@ -117,6 +124,7 @@ def register_translations(app: FastAPI) -> None:
                     request_id=request_id,
                     audio_bytes=audio_bytes,
                     architectures=getattr(app.state, "architectures", None),
+                    duration_s=duration_s,
                     operation_name="translation",
                 )
             except HTTPException as exc:
@@ -143,6 +151,7 @@ def register_translations(app: FastAPI) -> None:
             language=form.language,
             audio_bytes=audio_bytes,
             architectures=getattr(app.state, "architectures", None),
+            duration_s=duration_s,
         )
 
 
