@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass
 from threading import Lock
@@ -51,9 +50,6 @@ class WhisperASRRequestData(SGLangARRequestData):
     language: str = "en"
     detect_language: bool = False
     engine_start_s: float = 0.0
-
-
-_LANGUAGE_TOKEN_RE = re.compile(r"^<\|([a-z]{2,3})\|>$")
 
 
 def _resolve_language(value: Any) -> str:
@@ -139,10 +135,12 @@ def make_whisper_scheduler_adapters(
     sot_token_id = int(tokenizer.convert_tokens_to_ids("<|startoftranscript|>"))
     # note (Junnan Li): a uniform positive bias keeps the relative order of the
     # language tokens while guaranteeing one of them wins the detection step.
+    lang_to_id = getattr(generation_config, "lang_to_id", None) or {}
     language_token_bias = {
-        str(int(token_id)): 100.0
-        for token, token_id in tokenizer.get_added_vocab().items()
-        if _LANGUAGE_TOKEN_RE.match(token)
+        str(int(token_id)): 100.0 for token_id in lang_to_id.values()
+    }
+    id_to_language = {
+        int(token_id): token.strip("<|>") for token, token_id in lang_to_id.items()
     }
     # note (jiannan-17): Prefer the decoder limit passed by the caller. Fall back
     # to generation_config.max_length, then to Whisper's default 448 positions.
@@ -253,9 +251,7 @@ def make_whisper_scheduler_adapters(
         payload = data.stage_payload
         output_ids = list(data.output_ids or [])
         if data.detect_language:
-            token = tokenizer.convert_ids_to_tokens(output_ids[0]) if output_ids else ""
-            match = _LANGUAGE_TOKEN_RE.match(token or "")
-            text = match.group(1) if match else ""
+            text = id_to_language.get(output_ids[0], "") if output_ids else ""
         else:
             text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
         engine_time_s = (
