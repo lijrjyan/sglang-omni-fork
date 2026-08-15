@@ -216,7 +216,6 @@ def register_transcriptions(app: FastAPI) -> None:
             plan=plan,
             chunk_texts=chunk_texts,
             architectures=getattr(app.state, "architectures", None),
-            response_formats=TRANSCRIPTION_RESPONSE_FORMATS,
         )
 
 
