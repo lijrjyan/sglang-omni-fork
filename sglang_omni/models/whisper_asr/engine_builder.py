@@ -107,6 +107,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         speculative_num_draft_tokens: int = 4,
         speculative_cuda_graph: bool = False,
         speculative_draft_cuda_graph: bool = False,
+        speculative_share_encoder: bool = True,
     ) -> None:
         self.max_running_requests = max_running_requests
         self.max_new_tokens = max_new_tokens
@@ -135,6 +136,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.speculative_cuda_graph = bool(speculative_cuda_graph)
         self.speculative_draft_cuda_graph = bool(speculative_draft_cuda_graph)
+        self.speculative_share_encoder = bool(speculative_share_encoder)
         self.processor: Any = None
         self.tokenizer: Any = None
         self.generation_config: Any = None
@@ -164,6 +166,21 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         self.decoder_context_len = int(
             self._target_hf_config.max_target_positions or 448
         )
+
+    def setup_speculative_models(self, model: Any, draft_model: Any) -> None:
+        if not self.speculative_share_encoder:
+            return
+        from sglang_omni.models.whisper_asr.encoder_share import EncoderStateShare
+
+        # note (Junnan Li): distil-whisper drafts ship the target's encoder
+        # weights verbatim, so the draft reads the target's states instead of
+        # re-running a 1500-position encoder per request.
+        share = EncoderStateShare()
+        model.encoder_share = share
+        model.encoder_share_role = "target"
+        draft_model.encoder_share = share
+        draft_model.encoder_share_role = "draft"
+        logger.info("Whisper speculative draft shares the target encoder output")
 
     def setup_model_resources(
         self,

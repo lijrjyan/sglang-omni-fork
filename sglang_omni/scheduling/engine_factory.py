@@ -277,6 +277,10 @@ class SGLangGenerationEngineBuilder(ABC):
             gpu_id=gpu_id,
             server_args=server_args,
         )
+        if draft_worker is not None:
+            self.setup_speculative_models(
+                model, scheduling_bootstrap.speculative_draft_model(draft_worker)
+            )
 
         self.validate_after_model_setup(model, server_args)
 
@@ -377,6 +381,10 @@ class SGLangGenerationEngineBuilder(ABC):
     def get_model_buffer_bs(self, model: Any) -> int | None:
         del model
         return None
+
+    def setup_speculative_models(self, model: Any, draft_model: Any) -> None:
+        """Link the target and speculative draft models after both are loaded."""
+        del model, draft_model
 
     def compile_model(self, model: Any, server_args: Any) -> None:
         del model, server_args

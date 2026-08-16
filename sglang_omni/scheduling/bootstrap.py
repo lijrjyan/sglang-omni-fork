@@ -67,6 +67,11 @@ def init_sglang_cuda_graphs(model_worker: Any) -> None:
         )
 
 
+def speculative_draft_model(draft_worker: Any) -> Any:
+    """Return the draft model owned by a native STANDALONE speculative worker."""
+    return draft_worker.draft_worker.draft_runner.model
+
+
 def init_speculative_draft_cuda_graphs(
     draft_worker: Any, *, capture_draft_decode_graph: bool
 ) -> None:
