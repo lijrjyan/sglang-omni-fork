@@ -105,6 +105,8 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         speculative_draft_model_path: str | None = None,
         speculative_num_steps: int = 3,
         speculative_num_draft_tokens: int = 4,
+        speculative_cuda_graph: bool = False,
+        speculative_draft_cuda_graph: bool = False,
     ) -> None:
         self.max_running_requests = max_running_requests
         self.max_new_tokens = max_new_tokens
@@ -131,6 +133,8 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         self.speculative_draft_model_path = speculative_draft_model_path
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        self.speculative_cuda_graph = bool(speculative_cuda_graph)
+        self.speculative_draft_cuda_graph = bool(speculative_draft_cuda_graph)
         self.processor: Any = None
         self.tokenizer: Any = None
         self.generation_config: Any = None

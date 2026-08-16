@@ -102,6 +102,40 @@ def test_first_class_speculative_args_populate_eager_server_overrides() -> None:
     }
 
 
+def test_speculative_target_cuda_graph_opt_in_enables_generation_graphs() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    overrides = configure_speculative_overrides(
+        {"max_running_requests": 8, "disable_cuda_graph": True},
+        enable_speculative=True,
+        speculative_draft_model_path="/models/distil-whisper-large-v3",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        speculative_cuda_graph=True,
+    )
+
+    assert overrides["disable_cuda_graph"] is False
+    assert overrides["disable_overlap_schedule"] is True
+
+
+def test_speculative_draft_cuda_graph_requires_target_graphs() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    with pytest.raises(ValueError, match="requires speculative_cuda_graph=True"):
+        configure_speculative_overrides(
+            {
+                "speculative_algorithm": "STANDALONE",
+                "speculative_draft_model_path": "/draft",
+            },
+            enable_speculative=False,
+            speculative_draft_model_path=None,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_cuda_graph=False,
+            speculative_draft_cuda_graph=True,
+        )
+
+
 def test_speculative_overrides_require_topk_one_chain_invariant() -> None:
     from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
 

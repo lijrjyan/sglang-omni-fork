@@ -46,18 +46,42 @@ def init_sglang_cuda_graphs(model_worker: Any) -> None:
         # Required even when graphs are disabled: SGLang installs its eager
         # phase runner from init_cuda_graphs().
         model_worker.model_runner.init_cuda_graphs()
-        return
+    else:
+        model_config = model_worker.model_config
+        original_is_multimodal = model_config.is_multimodal
+        # Attention backends have already captured the model's real modality.
+        # Only the prefill graph runner needs this temporary view so it allocates
+        # the upstream input_embeds replay buffer.
+        model_config.is_multimodal = True
+        try:
+            model_worker.model_runner.init_cuda_graphs()
+        finally:
+            model_config.is_multimodal = original_is_multimodal
 
-    model_config = model_worker.model_config
-    original_is_multimodal = model_config.is_multimodal
-    # Attention backends have already captured the model's real modality.
-    # Only the prefill graph runner needs this temporary view so it allocates
-    # the upstream input_embeds replay buffer.
-    model_config.is_multimodal = True
-    try:
-        model_worker.model_runner.init_cuda_graphs()
-    finally:
-        model_config.is_multimodal = original_is_multimodal
+    spec_algorithm = getattr(model_worker.model_runner, "spec_algorithm", None)
+    if spec_algorithm is not None and spec_algorithm.is_standalone():
+        runner = model_worker.model_runner.decode_cuda_graph_runner
+        logger.info(
+            "STANDALONE speculative graph startup: target_verify=%s",
+            "captured" if runner is not None else "eager",
+        )
+
+
+def init_speculative_draft_cuda_graphs(
+    draft_worker: Any, *, capture_draft_decode_graph: bool
+) -> None:
+    """Install the draft runner, capturing decode only when explicitly enabled."""
+    draft_worker.init_cuda_graphs(
+        capture_draft_decode_graph=capture_draft_decode_graph,
+        capture_draft_extend_graph=False,
+    )
+    inner_draft_worker = getattr(draft_worker, "draft_worker", None)
+    draft_decode_runner = getattr(inner_draft_worker, "cuda_graph_runner", None)
+    logger.info(
+        "STANDALONE speculative graph startup: draft_decode=%s, "
+        "draft_extend=eager (P5b)",
+        "captured" if draft_decode_runner is not None else "eager",
+    )
 
 
 def _hidden_capture_max_tokens(server_args: Any) -> int:
@@ -103,7 +127,7 @@ def _parse_speculative_algorithm(server_args: Any) -> Any:
     if not algorithm.is_none() and not algorithm.is_standalone():
         raise ValueError(
             "sglang-omni only supports STANDALONE speculative decoding in the "
-            "eager synchronous lane"
+            "synchronous lane"
         )
     return algorithm
 
@@ -154,10 +178,6 @@ def create_sglang_infrastructure(
     target_worker_adapter = None
     draft_worker = None
     if not spec_algorithm.is_none():
-        if not server_args.disable_cuda_graph:
-            raise ValueError(
-                "P1 STANDALONE speculative decoding requires disable_cuda_graph=True"
-            )
         if not server_args.disable_overlap_schedule:
             raise ValueError(
                 "P1 STANDALONE speculative decoding requires "
@@ -182,7 +202,7 @@ def create_sglang_infrastructure(
             target_worker=target_worker_adapter,
         )
         logger.info(
-            "Initialized eager STANDALONE speculative workers: target_arch=%s "
+            "Initialized STANDALONE speculative workers: target_arch=%s "
             "draft_model=%s",
             model_arch_override,
             server_args.speculative_draft_model_path,
@@ -221,8 +241,10 @@ def create_sglang_infrastructure(
     if not defer_cuda_graph_capture:
         init_sglang_cuda_graphs(model_worker)
         if draft_worker is not None:
-            # note (Junnan Li): disabled graphs make this the draft eager-runner hook.
-            draft_worker.init_cuda_graphs()
+            # Disabled graphs make this the draft eager-runner hook.
+            init_speculative_draft_cuda_graphs(
+                draft_worker, capture_draft_decode_graph=False
+            )
 
     req_to_token_pool, token_to_kv_pool_allocator = model_worker.get_memory_pool()
 

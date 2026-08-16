@@ -42,9 +42,15 @@ def configure_speculative_overrides(
     speculative_draft_model_path: str | None,
     speculative_num_steps: int,
     speculative_num_draft_tokens: int,
+    speculative_cuda_graph: bool = False,
+    speculative_draft_cuda_graph: bool = False,
 ) -> dict[str, Any]:
-    """Validate Omni's eager STANDALONE speculative decoding configuration."""
+    """Validate Omni's STANDALONE speculative decoding configuration."""
     configured = dict(overrides)
+    if speculative_draft_cuda_graph and not speculative_cuda_graph:
+        raise ValueError(
+            "speculative_draft_cuda_graph=True requires speculative_cuda_graph=True"
+        )
     if enable_speculative:
         requested = {
             "speculative_algorithm": "STANDALONE",
@@ -77,13 +83,17 @@ def configure_speculative_overrides(
                 "speculative_algorithm='STANDALONE' is required when setting "
                 + ", ".join(configured_fields)
             )
+        if speculative_cuda_graph:
+            raise ValueError(
+                "speculative_cuda_graph=True requires STANDALONE speculative decoding"
+            )
         return configured
 
     normalized_algorithm = str(algorithm).upper()
     if normalized_algorithm != "STANDALONE":
         raise ValueError(
             "sglang-omni only supports STANDALONE speculative decoding in the "
-            f"eager synchronous lane; got speculative_algorithm={algorithm!r}"
+            f"synchronous lane; got speculative_algorithm={algorithm!r}"
         )
     configured["speculative_algorithm"] = normalized_algorithm
 
@@ -97,8 +107,7 @@ def configure_speculative_overrides(
     topk = configured.setdefault("speculative_eagle_topk", 1)
     if topk != 1:
         raise ValueError(
-            "speculative_eagle_topk must be 1 for the eager STANDALONE lane; "
-            f"got {topk!r}"
+            "speculative_eagle_topk must be 1 for the STANDALONE lane; " f"got {topk!r}"
         )
     num_steps = int(configured.setdefault("speculative_num_steps", 3))
     num_draft_tokens = int(configured.setdefault("speculative_num_draft_tokens", 4))
@@ -114,7 +123,7 @@ def configure_speculative_overrides(
 
     # note (Junnan Li): target and draft graph capture follow multi-token parity.
     configured["disable_overlap_schedule"] = True
-    configured["disable_cuda_graph"] = True
+    configured["disable_cuda_graph"] = not speculative_cuda_graph
     if "cuda_graph_backend_prefill" in configured:
         configured["cuda_graph_backend_prefill"] = "disabled"
         configured.pop("cuda_graph_bs_prefill", None)
@@ -141,6 +150,8 @@ class SGLangGenerationEngineBuilder(ABC):
     speculative_draft_model_path: str | None = None
     speculative_num_steps: int = 3
     speculative_num_draft_tokens: int = 4
+    speculative_cuda_graph: bool = False
+    speculative_draft_cuda_graph: bool = False
 
     def build(
         self,
@@ -184,6 +195,8 @@ class SGLangGenerationEngineBuilder(ABC):
             speculative_draft_model_path=self.speculative_draft_model_path,
             speculative_num_steps=self.speculative_num_steps,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            speculative_cuda_graph=self.speculative_cuda_graph,
+            speculative_draft_cuda_graph=self.speculative_draft_cuda_graph,
         )
         self.adjust_overrides(overrides)
         # Left unset, SGLang re-detects off a CUDA-first ladder that can contradict
@@ -271,6 +284,11 @@ class SGLangGenerationEngineBuilder(ABC):
 
         if want_cuda_graph:
             scheduling_bootstrap.init_sglang_cuda_graphs(model_worker)
+            if draft_worker is not None:
+                scheduling_bootstrap.init_speculative_draft_cuda_graphs(
+                    draft_worker,
+                    capture_draft_decode_graph=self.speculative_draft_cuda_graph,
+                )
             self.post_cuda_graph_setup(model, server_args)
             if prefill_graph_backend != CudaGraphBackend.DISABLED:
                 from sglang_omni.utils import cuda_graph_batch_validator

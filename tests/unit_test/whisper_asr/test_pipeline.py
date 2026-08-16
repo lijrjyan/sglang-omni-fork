@@ -43,6 +43,8 @@ def test_whisper_encoder_cuda_graph_is_opt_in() -> None:
     assert signature.parameters["speculative_draft_model_path"].default is None
     assert signature.parameters["speculative_num_steps"].default == 3
     assert signature.parameters["speculative_num_draft_tokens"].default == 4
+    assert signature.parameters["speculative_cuda_graph"].default is False
+    assert signature.parameters["speculative_draft_cuda_graph"].default is False
 
 
 def test_whisper_stage_forwards_first_class_speculative_args(monkeypatch) -> None:
@@ -66,6 +68,8 @@ def test_whisper_stage_forwards_first_class_speculative_args(monkeypatch) -> Non
         speculative_draft_model_path="/models/distil-whisper-large-v3",
         speculative_num_steps=3,
         speculative_num_draft_tokens=4,
+        speculative_cuda_graph=True,
+        speculative_draft_cuda_graph=True,
         server_args_overrides={"max_running_requests": 2},
     )
 
@@ -78,6 +82,8 @@ def test_whisper_stage_forwards_first_class_speculative_args(monkeypatch) -> Non
     )
     assert builder_args["speculative_num_steps"] == 3
     assert builder_args["speculative_num_draft_tokens"] == 4
+    assert builder_args["speculative_cuda_graph"] is True
+    assert builder_args["speculative_draft_cuda_graph"] is True
     assert seen["build"]["server_args_overrides"] == {"max_running_requests": 2}
 
 

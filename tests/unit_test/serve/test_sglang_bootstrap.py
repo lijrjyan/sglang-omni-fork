@@ -211,7 +211,11 @@ def test_speculative_bootstrap_constructs_workers_pools_and_backends_in_order(
         def init_attention_backends(self) -> None:
             events.append("draft_backend")
 
-        def init_cuda_graphs(self) -> None:
+        def init_cuda_graphs(self, **kwargs) -> None:
+            assert kwargs == {
+                "capture_draft_decode_graph": False,
+                "capture_draft_extend_graph": False,
+            }
             events.append("draft_eager_runner")
 
     fake_algorithm = SimpleNamespace(
@@ -306,6 +310,46 @@ def test_cuda_graph_init_scopes_prefill_embedding_capture_flag() -> None:
 
     assert capture_values == [True]
     assert model_config.is_multimodal is False
+
+
+def test_speculative_draft_init_can_capture_decode_without_extend() -> None:
+    calls: list[tuple[bool, bool]] = []
+    draft_worker = SimpleNamespace(
+        init_cuda_graphs=lambda **kwargs: calls.append(
+            (
+                kwargs["capture_draft_decode_graph"],
+                kwargs["capture_draft_extend_graph"],
+            )
+        )
+    )
+
+    bootstrap.init_speculative_draft_cuda_graphs(
+        draft_worker,
+        capture_draft_decode_graph=True,
+    )
+
+    assert calls == [(True, False)]
+
+
+def test_speculative_draft_init_installs_eager_runner_when_decode_graph_is_off() -> (
+    None
+):
+    calls: list[tuple[bool, bool]] = []
+    draft_worker = SimpleNamespace(
+        init_cuda_graphs=lambda **kwargs: calls.append(
+            (
+                kwargs["capture_draft_decode_graph"],
+                kwargs["capture_draft_extend_graph"],
+            )
+        )
+    )
+
+    bootstrap.init_speculative_draft_cuda_graphs(
+        draft_worker,
+        capture_draft_decode_graph=False,
+    )
+
+    assert calls == [(False, False)]
 
 
 @pytest.mark.parametrize(

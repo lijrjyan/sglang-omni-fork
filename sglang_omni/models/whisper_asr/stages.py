@@ -30,6 +30,8 @@ def create_sglang_whisper_asr_executor(
     speculative_draft_model_path: str | None = None,
     speculative_num_steps: int = 3,
     speculative_num_draft_tokens: int = 4,
+    speculative_cuda_graph: bool = False,
+    speculative_draft_cuda_graph: bool = False,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
@@ -58,6 +60,8 @@ def create_sglang_whisper_asr_executor(
         speculative_draft_model_path=speculative_draft_model_path,
         speculative_num_steps=speculative_num_steps,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
+        speculative_cuda_graph=speculative_cuda_graph,
+        speculative_draft_cuda_graph=speculative_draft_cuda_graph,
     ).build(
         model_path,
         device=device,
