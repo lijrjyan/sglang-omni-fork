@@ -17,6 +17,7 @@ from sglang_omni.scheduling.engine_factory import AsrEngineBuilder
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ENCODER_GRAPH_BATCH_BUCKETS = (1, 2, 4, 8, 12, 16)
+_WHISPER_GENERATION_ARCHITECTURES = {"WhisperForConditionalGeneration"}
 
 
 def _normalize_encoder_graph_buckets(buckets: list[int] | None) -> tuple[int, ...]:
@@ -38,6 +39,44 @@ def _resolve_encoder_graph_buckets(
         raise ValueError(f"encoder_token_count must be >= 1, got {encoder_token_count}")
     max_encoder_batch_size = max_prefill_tokens // encoder_token_count
     return tuple(bucket for bucket in buckets if bucket <= max_encoder_batch_size)
+
+
+def _validate_whisper_speculative_configs(
+    target_config: Any,
+    draft_config: Any,
+    *,
+    num_draft_tokens: int,
+    decoder_context_len: int,
+) -> None:
+    draft_architectures = set(draft_config.architectures or [])
+    if not draft_architectures.intersection(_WHISPER_GENERATION_ARCHITECTURES):
+        raise ValueError(
+            "Whisper speculative decoding requires a Whisper architecture for the "
+            f"draft checkpoint; got {sorted(draft_architectures)!r}"
+        )
+
+    compatibility_values = (
+        ("d_model", target_config.d_model, draft_config.d_model),
+        ("vocab_size", target_config.vocab_size, draft_config.vocab_size),
+        ("num_mel_bins", target_config.num_mel_bins, draft_config.num_mel_bins),
+        (
+            "max_source_positions",
+            target_config.max_source_positions,
+            draft_config.max_source_positions,
+        ),
+    )
+    for field, target_value, draft_value in compatibility_values:
+        if draft_value != target_value:
+            raise ValueError(
+                "Whisper target and draft configs must match for speculative "
+                f"decoding: {field} target={target_value!r}, draft={draft_value!r}"
+            )
+
+    if num_draft_tokens > decoder_context_len:
+        raise ValueError(
+            "Whisper speculative_num_draft_tokens exceeds the decoder budget: "
+            f"{num_draft_tokens} > {decoder_context_len}"
+        )
 
 
 class WhisperASREngineBuilder(AsrEngineBuilder):
@@ -98,6 +137,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         self.encoder_token_count = 0
         self.context_length = 0
         self.decoder_context_len = 0
+        self._target_hf_config: Any = None
 
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         from transformers import AutoConfig, AutoProcessor, GenerationConfig
@@ -106,6 +146,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             MAX_PREV_CONTEXT_TOKENS,
         )
 
+        self._target_hf_config = AutoConfig.from_pretrained(checkpoint_dir)
         self.processor = AutoProcessor.from_pretrained(checkpoint_dir)
         self.tokenizer = self.processor.tokenizer
         self.generation_config = GenerationConfig.from_pretrained(checkpoint_dir)
@@ -117,10 +158,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         )
         # note (jiannan-17): prev_len + prefix_len + max_new_tokens <= decoder_context_len
         self.decoder_context_len = int(
-            getattr(
-                AutoConfig.from_pretrained(checkpoint_dir), "max_target_positions", 0
-            )
-            or 448
+            self._target_hf_config.max_target_positions or 448
         )
 
     def setup_model_resources(
@@ -162,6 +200,22 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             raise RuntimeError(
                 "speculative decoding for encoder-decoder models requires "
                 "upstream encoder-decoder correctness fixes (P3)"
+            )
+        if overrides.get("speculative_algorithm") is not None:
+            from transformers import AutoConfig
+
+            if self._target_hf_config is None:
+                raise RuntimeError(
+                    "Whisper target config must be loaded before speculative validation"
+                )
+            draft_config = AutoConfig.from_pretrained(
+                overrides["speculative_draft_model_path"]
+            )
+            _validate_whisper_speculative_configs(
+                self._target_hf_config,
+                draft_config,
+                num_draft_tokens=int(overrides["speculative_num_draft_tokens"]),
+                decoder_context_len=self.decoder_context_len,
             )
         if int(overrides.get("chunked_prefill_size") or 0) > 0:
             raise ValueError(

@@ -82,6 +82,8 @@ def test_whisper_stage_forwards_first_class_speculative_args(monkeypatch) -> Non
 
 
 def test_whisper_speculative_requires_p3_unless_probe_env_is_set(monkeypatch) -> None:
+    from transformers import AutoConfig
+
     from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
 
     builder = WhisperASREngineBuilder(
@@ -98,6 +100,16 @@ def test_whisper_speculative_requires_p3_unless_probe_env_is_set(monkeypatch) ->
         "speculative_eagle_topk": 1,
         "speculative_num_draft_tokens": 4,
     }
+    config = SimpleNamespace(
+        architectures=["WhisperForConditionalGeneration"],
+        d_model=1280,
+        vocab_size=51866,
+        num_mel_bins=128,
+        max_source_positions=1500,
+    )
+    builder._target_hf_config = config
+    builder.decoder_context_len = 448
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda _path: config)
 
     monkeypatch.delenv("SGLANG_OMNI_SPEC_ALLOW_ENCDEC", raising=False)
     with pytest.raises(RuntimeError, match=r"requires .* \(P3\)"):
@@ -107,6 +119,95 @@ def test_whisper_speculative_requires_p3_unless_probe_env_is_set(monkeypatch) ->
     allowed = dict(overrides)
     builder.adjust_overrides(allowed)
     assert allowed["speculative_algorithm"] == "STANDALONE"
+
+
+def test_whisper_speculative_config_requires_compatible_draft() -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import (
+        _validate_whisper_speculative_configs,
+    )
+
+    target = SimpleNamespace(
+        architectures=["WhisperForConditionalGeneration"],
+        d_model=1280,
+        vocab_size=51866,
+        num_mel_bins=128,
+        max_source_positions=1500,
+    )
+    draft = SimpleNamespace(**vars(target))
+
+    _validate_whisper_speculative_configs(
+        target,
+        draft,
+        num_draft_tokens=4,
+        decoder_context_len=448,
+    )
+
+    draft.architectures = ["LlamaForCausalLM"]
+    with pytest.raises(ValueError, match="Whisper architecture"):
+        _validate_whisper_speculative_configs(
+            target,
+            draft,
+            num_draft_tokens=4,
+            decoder_context_len=448,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "draft_value"),
+    [
+        ("d_model", 1024),
+        ("vocab_size", 51865),
+        ("num_mel_bins", 80),
+        ("max_source_positions", 1024),
+    ],
+)
+def test_whisper_speculative_config_rejects_target_draft_mismatch(
+    field: str,
+    draft_value: int,
+) -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import (
+        _validate_whisper_speculative_configs,
+    )
+
+    target = SimpleNamespace(
+        architectures=["WhisperForConditionalGeneration"],
+        d_model=1280,
+        vocab_size=51866,
+        num_mel_bins=128,
+        max_source_positions=1500,
+    )
+    draft = SimpleNamespace(**vars(target))
+    setattr(draft, field, draft_value)
+
+    with pytest.raises(ValueError, match=field):
+        _validate_whisper_speculative_configs(
+            target,
+            draft,
+            num_draft_tokens=4,
+            decoder_context_len=448,
+        )
+
+
+def test_whisper_speculative_config_rejects_draft_window_over_budget() -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import (
+        _validate_whisper_speculative_configs,
+    )
+
+    config = SimpleNamespace(
+        architectures=["WhisperForConditionalGeneration"],
+        d_model=1280,
+        vocab_size=51866,
+        num_mel_bins=128,
+        max_source_positions=1500,
+    )
+
+    with pytest.raises(ValueError, match="decoder budget"):
+        _validate_whisper_speculative_configs(
+            config,
+            config,
+            num_draft_tokens=449,
+            decoder_context_len=448,
+        )
 
 
 def test_whisper_encoder_cuda_graph_setup_is_ordered_after_generation_graphs() -> None:
