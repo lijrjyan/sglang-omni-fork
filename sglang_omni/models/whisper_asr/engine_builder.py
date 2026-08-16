@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 from sglang_omni.models.whisper_asr.quantization_scope import (
@@ -61,6 +62,10 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         prefill_coalesce_when_idle: bool = True,
         prefill_coalesce_requires_pending_builds: bool = True,
         prefill_coalesce_after_builds_during_decode: bool = False,
+        enable_speculative: bool = False,
+        speculative_draft_model_path: str | None = None,
+        speculative_num_steps: int = 3,
+        speculative_num_draft_tokens: int = 4,
     ) -> None:
         self.max_running_requests = max_running_requests
         self.max_new_tokens = max_new_tokens
@@ -83,6 +88,10 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         self.prefill_coalesce_after_builds_during_decode = (
             prefill_coalesce_after_builds_during_decode
         )
+        self.enable_speculative = enable_speculative
+        self.speculative_draft_model_path = speculative_draft_model_path
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.processor: Any = None
         self.tokenizer: Any = None
         self.generation_config: Any = None
@@ -146,6 +155,14 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             model.init_encoder_graphs(resolved_buckets, input_feature_len)
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
+        if (
+            overrides.get("speculative_algorithm") is not None
+            and os.environ.get("SGLANG_OMNI_SPEC_ALLOW_ENCDEC") != "1"
+        ):
+            raise RuntimeError(
+                "speculative decoding for encoder-decoder models requires "
+                "upstream encoder-decoder correctness fixes (P3)"
+            )
         if int(overrides.get("chunked_prefill_size") or 0) > 0:
             raise ValueError(
                 "Whisper ASR requires chunked_prefill_size=0 because its encoder "

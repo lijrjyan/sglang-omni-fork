@@ -95,6 +95,7 @@ def create_thinker_scheduler(
         prefill_mgr,
         decode_mgr,
         model_config,
+        *_spec_workers,
     ) = infrastructure
 
     if defer_cuda_graph_capture:
@@ -194,6 +195,7 @@ def create_talker_scheduler(
         prefill_mgr,
         decode_mgr,
         model_config,
+        *_spec_workers,
     ) = create_sglang_infrastructure(
         server_args,
         gpu_id,

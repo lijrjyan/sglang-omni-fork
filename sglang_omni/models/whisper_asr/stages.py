@@ -26,6 +26,10 @@ def create_sglang_whisper_asr_executor(
     prefill_coalesce_when_idle: bool = True,
     prefill_coalesce_requires_pending_builds: bool = True,
     prefill_coalesce_after_builds_during_decode: bool = False,
+    enable_speculative: bool = False,
+    speculative_draft_model_path: str | None = None,
+    speculative_num_steps: int = 3,
+    speculative_num_draft_tokens: int = 4,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
@@ -50,6 +54,10 @@ def create_sglang_whisper_asr_executor(
         prefill_coalesce_after_builds_during_decode=(
             prefill_coalesce_after_builds_during_decode
         ),
+        enable_speculative=enable_speculative,
+        speculative_draft_model_path=speculative_draft_model_path,
+        speculative_num_steps=speculative_num_steps,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
     ).build(
         model_path,
         device=device,

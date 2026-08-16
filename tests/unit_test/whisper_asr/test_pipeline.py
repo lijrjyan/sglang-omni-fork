@@ -39,6 +39,74 @@ def test_whisper_encoder_cuda_graph_is_opt_in() -> None:
         signature.parameters["prefill_coalesce_after_builds_during_decode"].default
         is False
     )
+    assert signature.parameters["enable_speculative"].default is False
+    assert signature.parameters["speculative_draft_model_path"].default is None
+    assert signature.parameters["speculative_num_steps"].default == 3
+    assert signature.parameters["speculative_num_draft_tokens"].default == 4
+
+
+def test_whisper_stage_forwards_first_class_speculative_args(monkeypatch) -> None:
+    from sglang_omni.models.whisper_asr import engine_builder as whisper_builder
+
+    seen: dict[str, object] = {}
+
+    class FakeBuilder:
+        def __init__(self, **kwargs) -> None:
+            seen["builder"] = kwargs
+
+        def build(self, model_path, **kwargs):
+            seen["build"] = {"model_path": model_path, **kwargs}
+            return "executor"
+
+    monkeypatch.setattr(whisper_builder, "WhisperASREngineBuilder", FakeBuilder)
+
+    result = whisper_asr_stages.create_sglang_whisper_asr_executor(
+        "/models/whisper-large-v3",
+        enable_speculative=True,
+        speculative_draft_model_path="/models/distil-whisper-large-v3",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        server_args_overrides={"max_running_requests": 2},
+    )
+
+    assert result == "executor"
+    builder_args = seen["builder"]
+    assert builder_args["enable_speculative"] is True
+    assert (
+        builder_args["speculative_draft_model_path"]
+        == "/models/distil-whisper-large-v3"
+    )
+    assert builder_args["speculative_num_steps"] == 3
+    assert builder_args["speculative_num_draft_tokens"] == 4
+    assert seen["build"]["server_args_overrides"] == {"max_running_requests": 2}
+
+
+def test_whisper_speculative_requires_p3_unless_probe_env_is_set(monkeypatch) -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
+
+    builder = WhisperASREngineBuilder(
+        max_running_requests=4,
+        max_new_tokens=32,
+        mem_fraction_static=0.2,
+        enable_speculative=True,
+        speculative_draft_model_path="/models/distil-whisper-large-v3",
+    )
+    overrides = {
+        "speculative_algorithm": "STANDALONE",
+        "speculative_draft_model_path": "/models/distil-whisper-large-v3",
+        "speculative_num_steps": 3,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 4,
+    }
+
+    monkeypatch.delenv("SGLANG_OMNI_SPEC_ALLOW_ENCDEC", raising=False)
+    with pytest.raises(RuntimeError, match=r"requires .* \(P3\)"):
+        builder.adjust_overrides(dict(overrides))
+
+    monkeypatch.setenv("SGLANG_OMNI_SPEC_ALLOW_ENCDEC", "1")
+    allowed = dict(overrides)
+    builder.adjust_overrides(allowed)
+    assert allowed["speculative_algorithm"] == "STANDALONE"
 
 
 def test_whisper_encoder_cuda_graph_setup_is_ordered_after_generation_graphs() -> None:

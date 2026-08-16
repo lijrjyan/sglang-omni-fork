@@ -95,6 +95,37 @@ def _make_engine_builder(
     return builder
 
 
+def test_qwen3_asr_stage_forwards_first_class_speculative_args(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeBuilder:
+        def __init__(self, **kwargs) -> None:
+            seen["builder"] = kwargs
+
+        def build(self, model_path, **kwargs):
+            seen["build"] = {"model_path": model_path, **kwargs}
+            return "executor"
+
+    monkeypatch.setattr(qwen3_asr_builder, "Qwen3ASREngineBuilder", FakeBuilder)
+
+    result = qwen3_asr_stages.create_sglang_qwen3_asr_executor(
+        "/models/Qwen3-ASR-1.7B",
+        enable_speculative=True,
+        speculative_draft_model_path="/models/Qwen3-ASR-1.7B",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        server_args_overrides={"max_running_requests": 2},
+    )
+
+    assert result == "executor"
+    builder_args = seen["builder"]
+    assert builder_args["enable_speculative"] is True
+    assert builder_args["speculative_draft_model_path"] == "/models/Qwen3-ASR-1.7B"
+    assert builder_args["speculative_num_steps"] == 3
+    assert builder_args["speculative_num_draft_tokens"] == 4
+    assert seen["build"]["server_args_overrides"] == {"max_running_requests": 2}
+
+
 @pytest.mark.parametrize(
     ("sm_version", "expected_backend"),
     [(89, None), (100, "triton_attn"), (120, "triton_attn")],

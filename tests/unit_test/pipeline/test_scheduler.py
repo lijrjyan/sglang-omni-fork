@@ -8,6 +8,7 @@ import threading
 import weakref
 from array import array
 from collections import deque
+from contextlib import nullcontext
 from queue import Queue
 from types import SimpleNamespace
 
@@ -354,6 +355,126 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
         ("end", "req-1", "error"),
         ("end", "req-2", "error"),
     ]
+
+
+def test_omni_scheduler_spec_run_batch_preserves_native_result_identity(
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+    next_draft_input = object()
+
+    class NativeResult:
+        def __init__(self) -> None:
+            self.new_seq_lens = None
+            self.next_draft_input = next_draft_input
+            self.copy_done = None
+
+        def copy_to_cpu(self, **kwargs) -> None:
+            calls.append(("copy_to_cpu", kwargs))
+
+    native_result = NativeResult()
+
+    class DraftWorker:
+        def forward_batch_generation(self, batch):
+            calls.append(("draft_forward", batch))
+            return native_result
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+    scheduler.draft_worker = DraftWorker()
+    scheduler.future_map = object()
+    scheduler.device_module = SimpleNamespace(Event=lambda: "copy-event")
+    scheduler.forward_ct = 0
+    scheduler._sched_idled = False
+    scheduler._emit_prefill_start_for_batch = lambda batch: calls.append(
+        ("prefill_start", batch)
+    )
+    scheduler._emit_prefill_end_for_batch = lambda batch: calls.append(
+        ("prefill_end", batch)
+    )
+    scheduler.update_cache_from_scheduler = lambda batch, result: calls.append(
+        ("update_cache", batch, result)
+    )
+    scheduler._forward_isolation = lambda _batch, *, overlap: nullcontext()
+    monkeypatch.setattr(
+        omni_scheduler_module,
+        "resolve_forward_inputs",
+        lambda batch, future_map: calls.append(("resolve", batch, future_map)),
+    )
+    batch = SimpleNamespace(
+        reqs=[],
+        spec_info=None,
+        seq_lens=None,
+        seq_lens_cpu=None,
+        seq_lens_sum=None,
+        input_ids=object(),
+        return_logprob=False,
+        return_hidden_states=False,
+    )
+
+    result = scheduler.run_batch(batch)
+
+    assert result is native_result
+    assert calls[2] == ("draft_forward", batch)
+    assert batch.spec_info is next_draft_input
+    assert batch.input_ids is None
+    assert native_result.copy_done == "copy-event"
+    assert ("update_cache", batch, native_result) in calls
+
+
+def test_omni_scheduler_non_spec_run_batch_keeps_custom_runner_path() -> None:
+    native_result = object()
+    mr_output = object()
+    batch = SimpleNamespace(reqs=[])
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+    scheduler._emit_prefill_start_for_batch = lambda _batch: None
+    scheduler._emit_prefill_end_for_batch = lambda _batch: None
+    scheduler._stamp_batch_launch = lambda _batch: None
+    scheduler._build_sched_output = lambda seen_batch: seen_batch
+    scheduler._emit_stream_output = lambda *_args: None
+    scheduler._make_batch_result = lambda output: native_result
+    scheduler._model_runner = SimpleNamespace(execute=lambda output: mr_output)
+
+    assert scheduler.run_batch(batch) is native_result
+
+
+def test_omni_scheduler_refuses_async_lookahead_for_spec_batches() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+    scheduler._model_runner = SimpleNamespace(
+        lookahead_eligible=lambda _batch: pytest.fail("runner must not be consulted")
+    )
+
+    assert scheduler._lookahead_eligible(SimpleNamespace()) is False
+
+
+def test_omni_scheduler_spec_binding_skips_one_token_execution_bridge() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+    scheduler._model_runner = None
+    scheduler._execution_bridge = object()
+    runner = SimpleNamespace(_async_enabled=True)
+
+    scheduler.bind_model_runner(runner)
+
+    assert scheduler._model_runner is runner
+    assert scheduler._execution_bridge is None
+    assert runner._async_enabled is False
+
+
+def test_omni_scheduler_spec_result_processor_uses_native_draft_worker() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    target_worker = object()
+    draft_worker = object()
+    scheduler.model_worker = target_worker
+    scheduler.draft_worker = draft_worker
+    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+
+    assert scheduler._batch_result_model_worker() is draft_worker
+
+    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+    assert scheduler._batch_result_model_worker() is target_worker
 
 
 def test_upstream_queue_limit_abort_is_translated_to_omni_output() -> None:
@@ -1722,6 +1843,7 @@ def _construct_omni_scheduler(
         device=torch.device("cpu"),
     )
     server_args = SimpleNamespace(
+        speculative_algorithm=None,
         tp_size=1,
         pp_size=1,
         dp_size=1,
@@ -1900,6 +2022,7 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
         device=torch.device("cpu"),
     )
     server_args = SimpleNamespace(
+        speculative_algorithm=None,
         tp_size=1,
         pp_size=1,
         dp_size=1,
@@ -1964,6 +2087,7 @@ def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
         device=torch.device("cpu"),
     )
     server_args = SimpleNamespace(
+        speculative_algorithm=None,
         tp_size=1,
         pp_size=1,
         dp_size=1,

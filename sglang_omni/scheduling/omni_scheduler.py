@@ -28,6 +28,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -37,6 +38,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler import Scheduler as _Upstream
 from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.profiler.event_recorder import emit as _emit_event
@@ -173,6 +175,10 @@ class OmniScheduler:
         are defined directly on this class and take precedence.
     """
 
+    spec_algorithm = SpeculativeAlgorithm.NONE
+    draft_worker = None
+    target_worker_adapter = None
+
     def __init__(
         self,
         tp_worker: Any,
@@ -203,6 +209,8 @@ class OmniScheduler:
         request_build_max_workers: int = 1,
         request_build_max_pending: int | None = None,
         shutdown_callback: Callable[[], None] | None = None,
+        target_worker_adapter: Any = None,
+        draft_worker: Any = None,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
         self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
@@ -293,10 +301,35 @@ class OmniScheduler:
                 "requests"
             )
 
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+        if not self.spec_algorithm.is_none():
+            if not self.spec_algorithm.is_standalone():
+                raise ValueError(
+                    "sglang-omni only supports STANDALONE speculative decoding in "
+                    "the eager synchronous lane"
+                )
+            if self.enable_overlap:
+                raise ValueError(
+                    "STANDALONE speculative decoding requires enable_overlap=False"
+                )
+            if self.enable_async_decode:
+                raise ValueError(
+                    "STANDALONE speculative decoding requires enable_async_decode=False"
+                )
+            if target_worker_adapter is None or draft_worker is None:
+                raise ValueError(
+                    "STANDALONE speculative decoding requires prebuilt target and "
+                    "draft workers"
+                )
+
         # Note: (maydomine) Validate here as well as in the CLI because per-stage
         # YAML reaches the scheduler through factory_args.
         requests = validate_prefill_coalesce_requests(prefill_coalesce_requests)
         wait_ms = validate_prefill_coalesce_wait_ms(prefill_coalesce_wait_ms)
+        if not self.spec_algorithm.is_none():
+            requests = 0
         if requests > 1 and int(server_args.tp_size) > 1:
             logger.warning(
                 "Prefill admission coalescing is disabled for "
@@ -353,6 +386,8 @@ class OmniScheduler:
         # Workers
         self.tp_worker = tp_worker
         self.model_worker = tp_worker
+        self.target_worker_adapter = target_worker_adapter
+        self.draft_worker = draft_worker
 
         # Cache / memory management
         self.tree_cache = tree_cache
@@ -440,13 +475,14 @@ class OmniScheduler:
         )
         self.current_scheduler_metrics_enabled = False
 
-        # Speculative decoding (disabled)
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.dllm_config = None
-        self.draft_worker = None
         self._execution_bridge = None
+        if not self.spec_algorithm.is_none():
+            self.future_map = self.spec_algorithm.create_future_map(
+                torch.device(self.device),
+                self.req_to_token_pool,
+                needs_cpu_seq_lens=True,
+            )
         if model_runner is not None:
             self.bind_model_runner(model_runner)
 
@@ -523,10 +559,16 @@ class OmniScheduler:
         """
         if model_runner is None:
             raise ValueError("model_runner must not be None")
-        if self._model_runner is model_runner and self._execution_bridge is not None:
+        if self._model_runner is model_runner:
             return
         if self._model_runner is not None:
             raise RuntimeError("OmniScheduler model runner is already bound")
+
+        if not self.spec_algorithm.is_none():
+            model_runner._async_enabled = False
+            self._model_runner = model_runner
+            self._execution_bridge = None
+            return
 
         from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
 
@@ -707,7 +749,7 @@ class OmniScheduler:
             metrics_collector=self.metrics_collector,
             metrics_reporter=self.metrics_reporter,
             draft_worker=self.draft_worker,
-            model_worker=self.model_worker,
+            model_worker=self._batch_result_model_worker(),
             logprob_result_processor=SchedulerLogprobResultProcessor(
                 **supported_kwargs(
                     SchedulerLogprobResultProcessor,
@@ -718,6 +760,12 @@ class OmniScheduler:
             output_streamer=self.output_streamer,
             abort_request=lambda request: self.abort(request.rid),
         )
+
+    def _batch_result_model_worker(self) -> Any:
+        """Select the worker that owns native result post-processing hooks."""
+        if self.spec_algorithm.is_none():
+            return self.model_worker
+        return self.draft_worker
 
     def self_check_during_idle(self) -> None:
         self.new_token_ratio_tracker.reset()
@@ -1343,6 +1391,8 @@ class OmniScheduler:
         ``ModelRunnerOutput``.  The upstream ``process_batch_result`` expects
         a ``GenerationBatchResult``.  We bridge the two formats here.
         """
+        if not self.spec_algorithm.is_none():
+            return self._run_speculative_batch(batch)
         del pp_proxy_tensors
         self._emit_prefill_start_for_batch(batch)
         self._stamp_batch_launch(batch)
@@ -1351,6 +1401,47 @@ class OmniScheduler:
         self._emit_prefill_end_for_batch(batch)
         self._emit_stream_output(sched_output, mr_output)
         return self._make_batch_result(mr_output)
+
+    def _run_speculative_batch(self, batch):
+        """Run one native synchronous speculative batch without reconstruction."""
+        self._emit_prefill_start_for_batch(batch)
+        self._stamp_batch_launch(batch)
+        resolve_forward_inputs(batch, self.future_map)
+        with self._forward_isolation(batch, overlap=False):
+            batch_result = self.draft_worker.forward_batch_generation(batch)
+        batch.spec_info = batch_result.next_draft_input
+        if batch_result.new_seq_lens is not None:
+            batch.seq_lens = batch_result.new_seq_lens
+            if batch.seq_lens_cpu is not None:
+                batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        batch.input_ids = None
+        self.update_cache_from_scheduler(batch, batch_result)
+        batch_result.copy_done = self.device_module.Event()
+        batch_result.copy_to_cpu(
+            return_logprob=batch.return_logprob,
+            return_hidden_states=batch.return_hidden_states,
+        )
+        if batch.return_logprob:
+            batch_result.extend_input_len_per_req = [
+                req.extend_range.length if req.extend_range is not None else 0
+                for req in batch.reqs
+            ]
+            batch_result.extend_logprob_start_len_per_req = (
+                batch.extend_logprob_start_lens
+            )
+        else:
+            batch_result.extend_input_len_per_req = None
+            batch_result.extend_logprob_start_len_per_req = None
+        self._emit_prefill_end_for_batch(batch)
+        return batch_result
+
+    def _lookahead_eligible(self, batch: Any) -> bool:
+        """Refuse Omni's one-token lookahead for native speculative batches."""
+        if not self.spec_algorithm.is_none():
+            return False
+        runner = self._model_runner
+        return runner is None or runner.lookahead_eligible(batch)
 
     def _build_sched_output(self, batch):
         """Wrap a ScheduleBatch into the SchedulerOutput the model runner
@@ -2534,12 +2625,11 @@ class OmniScheduler:
 
             # Route through sync when the runner's collect has a sync-only
             # fallback (default True for runners not overriding lookahead_eligible).
-            runner = self._model_runner
             use_lookahead = (
                 batch is not None
                 and len(batch.reqs) >= self.async_decode_min_batch_size
                 and self._batch_is_decode(batch)
-                and (runner is None or runner.lookahead_eligible(batch))
+                and self._lookahead_eligible(batch)
             )
 
             if use_lookahead:
