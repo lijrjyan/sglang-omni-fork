@@ -13,6 +13,11 @@ from typing import Any, Iterable, Tuple
 
 import torch
 import torch.nn.functional as F
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -29,15 +34,31 @@ from sglang_omni.models.whisper_asr.encoder_cuda_graph import (
 
 
 class WhisperEncoderAttention(nn.Module):
-    def __init__(self, config: WhisperConfig) -> None:
+    def __init__(
+        self,
+        config: WhisperConfig,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.embed_dim = config.d_model
         self.num_heads = config.encoder_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.qkv_proj = QKVParallelLinear(
+            self.embed_dim,
+            self.head_dim,
+            self.num_heads,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+        self.out_proj = RowParallelLinear(
+            self.embed_dim,
+            self.embed_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.out_proj",
+        )
 
     def _shape(self, states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = states.shape
@@ -46,13 +67,12 @@ class WhisperEncoderAttention(nn.Module):
         ).transpose(1, 2)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        query = self._shape(self.q_proj(hidden_states))
-        key = self._shape(self.k_proj(hidden_states))
-        value = self._shape(self.v_proj(hidden_states))
+        qkv, _ = self.qkv_proj(hidden_states)
+        query, key, value = qkv.chunk(3, dim=-1)
         attn_output = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
+            self._shape(query),
+            self._shape(key),
+            self._shape(value),
             dropout_p=0.0,
             is_causal=False,
         )
@@ -61,16 +81,34 @@ class WhisperEncoderAttention(nn.Module):
             hidden_states.shape[1],
             self.embed_dim,
         )
-        return self.out_proj(attn_output)
+        attn_output, _ = self.out_proj(attn_output)
+        return attn_output
 
 
 class WhisperEncoderLayer(nn.Module):
-    def __init__(self, config: WhisperConfig) -> None:
+    def __init__(
+        self,
+        config: WhisperConfig,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
-        self.self_attn = WhisperEncoderAttention(config)
+        self.self_attn = WhisperEncoderAttention(
+            config, quant_config=quant_config, prefix=f"{prefix}.self_attn"
+        )
         self.self_attn_layer_norm = nn.LayerNorm(config.d_model)
-        self.fc1 = nn.Linear(config.d_model, config.encoder_ffn_dim)
-        self.fc2 = nn.Linear(config.encoder_ffn_dim, config.d_model)
+        self.fc1 = ColumnParallelLinear(
+            config.d_model,
+            config.encoder_ffn_dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc1",
+        )
+        self.fc2 = RowParallelLinear(
+            config.encoder_ffn_dim,
+            config.d_model,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc2",
+        )
         self.final_layer_norm = nn.LayerNorm(config.d_model)
         self.activation_fn = ACT2FN[config.activation_function]
 
@@ -82,12 +120,18 @@ class WhisperEncoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
+        hidden_states, _ = self.fc1(hidden_states)
+        hidden_states, _ = self.fc2(self.activation_fn(hidden_states))
         return residual + hidden_states
 
 
 class WhisperEncoder(nn.Module):
-    def __init__(self, config: WhisperConfig) -> None:
+    def __init__(
+        self,
+        config: WhisperConfig,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.config = config
         self.conv1 = nn.Conv1d(
@@ -105,7 +149,12 @@ class WhisperEncoder(nn.Module):
         )
         self.embed_positions = nn.Embedding(config.max_source_positions, config.d_model)
         self.layers = nn.ModuleList(
-            [WhisperEncoderLayer(config) for _ in range(config.encoder_layers)]
+            [
+                WhisperEncoderLayer(
+                    config, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
+                )
+                for i in range(config.encoder_layers)
+            ]
         )
         self.layer_norm = nn.LayerNorm(config.d_model)
 
@@ -135,16 +184,26 @@ class WhisperSGLangSelfAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        del quant_config, prefix
         super().__init__()
         self.embed_dim = config.d_model
         self.num_heads = config.decoder_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         self.scaling = self.head_dim**-0.5
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.qkv_proj = QKVParallelLinear(
+            self.embed_dim,
+            self.head_dim,
+            self.num_heads,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+        self.out_proj = RowParallelLinear(
+            self.embed_dim,
+            self.embed_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.out_proj",
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -158,11 +217,16 @@ class WhisperSGLangSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        query = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
-        key = self.k_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
-        value = self.v_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
-        attn_output = self.attn(query, key, value, forward_batch)
-        return self.out_proj(attn_output)
+        qkv, _ = self.qkv_proj(hidden_states)
+        query, key, value = qkv.chunk(3, dim=-1)
+        attn_output = self.attn(
+            query.reshape(-1, self.num_heads, self.head_dim),
+            key.reshape(-1, self.num_heads, self.head_dim),
+            value.reshape(-1, self.num_heads, self.head_dim),
+            forward_batch,
+        )
+        attn_output, _ = self.out_proj(attn_output)
+        return attn_output
 
 
 class WhisperSGLangCrossAttention(nn.Module):
@@ -173,16 +237,34 @@ class WhisperSGLangCrossAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        del quant_config, prefix
         super().__init__()
         self.embed_dim = config.d_model
         self.num_heads = config.decoder_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         self.scaling = self.head_dim**-0.5
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.q_proj = ColumnParallelLinear(
+            self.embed_dim,
+            self.embed_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q_proj",
+        )
+        self.kv_proj = QKVParallelLinear(
+            self.embed_dim,
+            self.head_dim,
+            total_num_heads=0,
+            total_num_kv_heads=self.num_heads,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.kv_proj",
+        )
+        self.out_proj = RowParallelLinear(
+            self.embed_dim,
+            self.embed_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.out_proj",
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -198,18 +280,18 @@ class WhisperSGLangCrossAttention(nn.Module):
         cross_attention_states: torch.Tensor | None,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        query = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
+        query, _ = self.q_proj(hidden_states)
+        query = query.view(-1, self.num_heads, self.head_dim)
         if cross_attention_states is None:
             key = value = None
         else:
-            key = self.k_proj(cross_attention_states).view(
-                -1, self.num_heads, self.head_dim
-            )
-            value = self.v_proj(cross_attention_states).view(
-                -1, self.num_heads, self.head_dim
-            )
+            kv, _ = self.kv_proj(cross_attention_states)
+            key, value = kv.chunk(2, dim=-1)
+            key = key.reshape(-1, self.num_heads, self.head_dim)
+            value = value.reshape(-1, self.num_heads, self.head_dim)
         attn_output = self.attn(query, key, value, forward_batch)
-        return self.out_proj(attn_output)
+        attn_output, _ = self.out_proj(attn_output)
+        return attn_output
 
 
 class WhisperDecoderLayer(nn.Module):
@@ -218,6 +300,7 @@ class WhisperDecoderLayer(nn.Module):
         config: WhisperConfig,
         layer_idx: int,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         num_decoder_layers = int(config.decoder_layers)
@@ -225,16 +308,28 @@ class WhisperDecoderLayer(nn.Module):
             config,
             layer_id=layer_idx,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
         self.self_attn_layer_norm = nn.LayerNorm(config.d_model)
         self.encoder_attn = WhisperSGLangCrossAttention(
             config,
             layer_id=num_decoder_layers + layer_idx,
             quant_config=quant_config,
+            prefix=f"{prefix}.encoder_attn",
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(config.d_model)
-        self.fc1 = nn.Linear(config.d_model, config.decoder_ffn_dim)
-        self.fc2 = nn.Linear(config.decoder_ffn_dim, config.d_model)
+        self.fc1 = ColumnParallelLinear(
+            config.d_model,
+            config.decoder_ffn_dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc1",
+        )
+        self.fc2 = RowParallelLinear(
+            config.decoder_ffn_dim,
+            config.d_model,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc2",
+        )
         self.final_layer_norm = nn.LayerNorm(config.d_model)
         self.activation_fn = ACT2FN[config.activation_function]
 
@@ -262,7 +357,8 @@ class WhisperDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
+        hidden_states, _ = self.fc1(hidden_states)
+        hidden_states, _ = self.fc2(self.activation_fn(hidden_states))
         return residual + hidden_states
 
 
@@ -271,6 +367,7 @@ class WhisperDecoder(nn.Module):
         self,
         config: WhisperConfig,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
@@ -280,7 +377,12 @@ class WhisperDecoder(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                WhisperDecoderLayer(config, layer_idx=i, quant_config=quant_config)
+                WhisperDecoderLayer(
+                    config,
+                    layer_idx=i,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{i}",
+                )
                 for i in range(config.decoder_layers)
             ]
         )
@@ -313,10 +415,15 @@ class WhisperModel(nn.Module):
         self,
         config: WhisperConfig,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
-        self.encoder = WhisperEncoder(config)
-        self.decoder = WhisperDecoder(config, quant_config=quant_config)
+        self.encoder = WhisperEncoder(
+            config, quant_config=quant_config, prefix=f"{prefix}.encoder"
+        )
+        self.decoder = WhisperDecoder(
+            config, quant_config=quant_config, prefix=f"{prefix}.decoder"
+        )
 
 
 class WhisperForConditionalGeneration(nn.Module):
@@ -326,10 +433,9 @@ class WhisperForConditionalGeneration(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        del prefix
         super().__init__()
         self.config = config
-        self.model = WhisperModel(config, quant_config=quant_config)
+        self.model = WhisperModel(config, quant_config=quant_config, prefix="model")
         self.proj_out = self.model.decoder.embed_tokens
         self.lm_head = self.proj_out
         self.logits_processor = LogitsProcessor(config)
@@ -453,16 +559,41 @@ class WhisperForConditionalGeneration(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    _STACKED_PARAMS_MAPPING = (
+        (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
+        (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
+        (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
+        (".encoder_attn.kv_proj", ".encoder_attn.k_proj", "k"),
+        (".encoder_attn.kv_proj", ".encoder_attn.v_proj", "v"),
+    )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in weights:
-            if name == "proj_out.weight":
-                name = "model.decoder.embed_tokens.weight"
-            if name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+        weights_dict = dict(weights)
+        if "proj_out.weight" in weights_dict:
+            weights_dict.setdefault(
+                "model.decoder.embed_tokens.weight", weights_dict.pop("proj_out.weight")
+            )
+        # note (Junnan Li): Whisper checkpoints have no k_proj bias, but the fused
+        # qkv/kv projections carry one bias; feed the k shard explicit zeros.
+        for name, weight in list(weights_dict.items()):
+            if name.endswith("k_proj.weight"):
+                weights_dict.setdefault(
+                    name[: -len("weight")] + "bias", torch.zeros_like(weight[:, 0])
+                )
+        for name, loaded_weight in weights_dict.items():
+            for param_name, weight_name, shard_id in self._STACKED_PARAMS_MAPPING:
+                if weight_name not in name:
+                    continue
+                param = params_dict[name.replace(weight_name, param_name)]
+                param.weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
 
 
 EntryClass = WhisperForConditionalGeneration
