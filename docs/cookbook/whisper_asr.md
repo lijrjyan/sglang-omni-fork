@@ -68,6 +68,27 @@ runtime_overrides:
 unset for the default mode (`max-autotune-no-cudagraphs` was slower on both
 GPUs because Triton matmuls lost to cuBLAS).
 
+## Quantization
+
+`--quantization` (or `server_args_overrides: {quantization: ...}` on the `asr`
+stage) reaches every Whisper projection. Whisper serving is decoder
+weight-bandwidth bound at small batch and encoder compute bound, so quantizing
+the decoder with an online W8A8 scheme adds per-token activation-quant work that
+outweighs its GEMM savings, while the encoder benefits. `quantization_scope`
+restricts the server-wide quantization to the encoder:
+
+```yaml
+runtime_overrides:
+  asr:
+    quantization_scope: encoder
+    server_args_overrides:
+      quantization: fp8
+```
+
+`quantization_scope: all` (default) applies it to the whole model. FP8 needs a
+GPU with native FP8 (sm_89+); on older GPUs SGLang falls back to a weight-only
+path that is not validated for Whisper.
+
 ## Prefill Coalescing
 
 Whisper builds up to two requests concurrently and coalesces prefill at the serving-reachable batch size of two. A partial batch waits for at most 6 ms only while another request build is pending; a single request and a partial batch with no remaining build work are released immediately. This allows concurrent traffic to replay the encoder batch-2 graph without adding a fixed wait to the idle c=1 path.

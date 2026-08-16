@@ -3,9 +3,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
+from sglang_omni.models.whisper_asr.quantization_scope import (
+    QUANTIZATION_SCOPE_ATTR,
+    validate_quantization_scope,
+)
 from sglang_omni.scheduling.engine_factory import AsrEngineBuilder
 
 logger = logging.getLogger(__name__)
@@ -48,6 +53,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         encoder_graph_batch_buckets: list[int] | None = None,
         enable_encoder_torch_compile: bool = False,
         encoder_torch_compile_mode: str | None = None,
+        quantization_scope: str = "all",
         request_build_max_workers: int = 2,
         request_build_max_pending: int | None = 16,
         prefill_coalesce_requests: int = 2,
@@ -65,6 +71,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         )
         self.enable_encoder_torch_compile = bool(enable_encoder_torch_compile)
         self.encoder_torch_compile_mode = encoder_torch_compile_mode
+        self.quantization_scope = validate_quantization_scope(quantization_scope)
         self.request_build_max_workers = request_build_max_workers
         self.request_build_max_pending = request_build_max_pending
         self.prefill_coalesce_requests = prefill_coalesce_requests
@@ -145,6 +152,14 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
                 "prefix must be admitted atomically"
             )
         overrides["chunked_prefill_size"] = 0
+        if self.quantization_scope != "all":
+            # note (Junnan Li): the model only sees hf_config at construction, so
+            # the scope rides on SGLang's json_model_override_args channel.
+            model_overrides = json.loads(
+                overrides.get("json_model_override_args") or "{}"
+            )
+            model_overrides[QUANTIZATION_SCOPE_ATTR] = self.quantization_scope
+            overrides["json_model_override_args"] = json.dumps(model_overrides)
 
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
         return {

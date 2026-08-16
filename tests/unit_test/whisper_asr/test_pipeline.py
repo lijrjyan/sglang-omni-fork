@@ -26,6 +26,7 @@ def test_whisper_encoder_cuda_graph_is_opt_in() -> None:
     assert signature.parameters["encoder_graph_batch_buckets"].default is None
     assert signature.parameters["enable_encoder_torch_compile"].default is False
     assert signature.parameters["encoder_torch_compile_mode"].default is None
+    assert signature.parameters["quantization_scope"].default == "all"
     assert signature.parameters["request_build_max_workers"].default == 2
     assert signature.parameters["request_build_max_pending"].default == 16
     assert signature.parameters["prefill_coalesce_requests"].default == 2

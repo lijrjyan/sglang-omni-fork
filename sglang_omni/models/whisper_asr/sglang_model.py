@@ -31,6 +31,7 @@ from sglang_omni.models.whisper_asr.encoder_compile import compile_encoder_layer
 from sglang_omni.models.whisper_asr.encoder_cuda_graph import (
     WhisperEncoderCudaGraphRunner,
 )
+from sglang_omni.models.whisper_asr.quantization_scope import decoder_quant_config
 
 
 class WhisperEncoderAttention(nn.Module):
@@ -422,7 +423,9 @@ class WhisperModel(nn.Module):
             config, quant_config=quant_config, prefix=f"{prefix}.encoder"
         )
         self.decoder = WhisperDecoder(
-            config, quant_config=quant_config, prefix=f"{prefix}.decoder"
+            config,
+            quant_config=decoder_quant_config(config, quant_config),
+            prefix=f"{prefix}.decoder",
         )
 
 
