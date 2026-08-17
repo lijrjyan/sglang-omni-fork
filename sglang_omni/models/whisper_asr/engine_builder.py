@@ -245,8 +245,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             )
         overrides["chunked_prefill_size"] = 0
         if self.quantization_scope != "all":
-            # note (Junnan Li): the model only sees hf_config at construction, so
-            # the scope rides on SGLang's json_model_override_args channel.
+            # note (Junnan Li): the model only sees hf_config at construction.
             model_overrides = json.loads(
                 overrides.get("json_model_override_args") or "{}"
             )
