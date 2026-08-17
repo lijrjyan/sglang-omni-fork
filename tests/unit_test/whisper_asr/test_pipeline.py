@@ -603,3 +603,22 @@ def test_whisper_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
     assert build_kwargs["max_prefill_tokens"] == 6144
     assert scheduler_kwargs["enable_async_decode"] is False
     assert scheduler_kwargs["async_decode_min_batch_size"] == 4
+
+
+def test_whisper_speculative_turns_off_async_decode_default() -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
+
+    builder = WhisperASREngineBuilder(
+        max_running_requests=4,
+        max_new_tokens=32,
+        mem_fraction_static=0.2,
+        enable_speculative=True,
+        speculative_draft_model_path="/models/distil-whisper-large-v3",
+    )
+    assert builder.enable_async_decode is False
+    assert builder.extra_scheduler_kwargs()["enable_async_decode"] is False
+
+    plain = WhisperASREngineBuilder(
+        max_running_requests=4, max_new_tokens=32, mem_fraction_static=0.2
+    )
+    assert plain.enable_async_decode is True

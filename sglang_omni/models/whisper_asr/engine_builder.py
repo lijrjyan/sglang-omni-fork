@@ -160,6 +160,13 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         self.enable_encoder_torch_compile = bool(enable_encoder_torch_compile)
         self.encoder_torch_compile_mode = encoder_torch_compile_mode
         self.quantization_scope = validate_quantization_scope(quantization_scope)
+        if enable_speculative and enable_async_decode:
+            # note (Junnan Li): the STANDALONE lane is synchronous by design, so
+            # the async-decode default is turned off instead of failing startup.
+            logger.info(
+                "Whisper speculative decoding disables enable_async_decode"
+            )
+            enable_async_decode = False
         self.enable_async_decode = enable_async_decode
         self.async_decode_min_batch_size = async_decode_min_batch_size
         self.request_build_max_workers = request_build_max_workers
