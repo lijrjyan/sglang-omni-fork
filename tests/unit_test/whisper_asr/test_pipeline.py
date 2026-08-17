@@ -66,6 +66,8 @@ def test_whisper_stage_defaults() -> None:
     assert signature.parameters["speculative_num_draft_tokens"].default == 4
     assert signature.parameters["speculative_cuda_graph"].default is False
     assert signature.parameters["speculative_draft_cuda_graph"].default is False
+    assert signature.parameters["enable_pre_lm_encoder"].default is True
+    assert signature.parameters["pre_lm_max_batch_size"].default == 8
 
 
 def test_whisper_stage_forwards_first_class_speculative_args(monkeypatch) -> None:
@@ -235,8 +237,6 @@ def test_whisper_speculative_config_rejects_draft_window_over_budget() -> None:
             num_draft_tokens=449,
             decoder_context_len=448,
         )
-    assert signature.parameters["enable_pre_lm_encoder"].default is True
-    assert signature.parameters["pre_lm_max_batch_size"].default == 8
 
 
 def test_whisper_encoder_cuda_graph_setup_is_ordered_after_generation_graphs() -> None:
