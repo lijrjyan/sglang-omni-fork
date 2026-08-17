@@ -19,7 +19,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from benchmarks.tasks.asr import FUN_ASR_MODEL_PATH, QWEN3_ASR_MODEL_PATH
+from benchmarks.tasks.asr import (
+    FUN_ASR_MODEL_PATH,
+    OMNI_WHISPER_MODEL_PATH,
+    QWEN3_ASR_MODEL_PATH,
+)
 from tests.utils import apply_wer_slack
 
 
@@ -123,6 +127,48 @@ QWEN3_ASR_RTF_MEAN_THRESHOLD = round(QWEN3_ASR_RTF_MEAN_MAX * THRESHOLD_SLACK_LO
 QWEN3_ASR_RTF_P95_THRESHOLD = round(QWEN3_ASR_RTF_P95_MAX * THRESHOLD_SLACK_LOWER, 4)
 
 
+# note (Junnan Li): Whisper is registered ahead of its first calibration; these
+# raw references are placeholders and the preset runs with gate_thresholds=False
+# until tune-ci-thresholds writes measured worst-of-N values.
+WHISPER_ASR_EN_CORPUS_WER_MAX = 0.0138
+WHISPER_ASR_EN_SAMPLE_WER_MAX = 1.0
+WHISPER_ASR_ZH_CORPUS_WER_MAX = 0.1
+WHISPER_ASR_ZH_SAMPLE_WER_MAX = 1.0
+WHISPER_ASR_THROUGHPUT_MIN = 1.0
+WHISPER_ASR_LATENCY_MEAN_MAX_S = 10.0
+WHISPER_ASR_LATENCY_P95_MAX_S = 10.0
+WHISPER_ASR_RTF_MEAN_MAX = 1.0
+WHISPER_ASR_RTF_P95_MAX = 1.0
+
+WHISPER_ASR_EN_CORPUS_WER_THRESHOLD = apply_wer_slack(
+    WHISPER_ASR_EN_CORPUS_WER_MAX, THRESHOLD_SLACK_LOWER
+)
+WHISPER_ASR_EN_SAMPLE_WER_THRESHOLD = apply_wer_slack(
+    WHISPER_ASR_EN_SAMPLE_WER_MAX, THRESHOLD_SLACK_LOWER
+)
+WHISPER_ASR_ZH_CORPUS_WER_THRESHOLD = apply_wer_slack(
+    WHISPER_ASR_ZH_CORPUS_WER_MAX, THRESHOLD_SLACK_LOWER
+)
+WHISPER_ASR_ZH_SAMPLE_WER_THRESHOLD = apply_wer_slack(
+    WHISPER_ASR_ZH_SAMPLE_WER_MAX, THRESHOLD_SLACK_LOWER
+)
+WHISPER_ASR_THROUGHPUT_THRESHOLD = round(
+    WHISPER_ASR_THROUGHPUT_MIN * THRESHOLD_SLACK_HIGHER, 3
+)
+WHISPER_ASR_LATENCY_MEAN_THRESHOLD_S = round(
+    WHISPER_ASR_LATENCY_MEAN_MAX_S * THRESHOLD_SLACK_LOWER, 3
+)
+WHISPER_ASR_LATENCY_P95_THRESHOLD_S = round(
+    WHISPER_ASR_LATENCY_P95_MAX_S * THRESHOLD_SLACK_LOWER, 3
+)
+WHISPER_ASR_RTF_MEAN_THRESHOLD = round(
+    WHISPER_ASR_RTF_MEAN_MAX * THRESHOLD_SLACK_LOWER, 4
+)
+WHISPER_ASR_RTF_P95_THRESHOLD = round(
+    WHISPER_ASR_RTF_P95_MAX * THRESHOLD_SLACK_LOWER, 4
+)
+
+
 ASR_CI_PRESETS: dict[str, AsrCiPreset] = {
     "fun": AsrCiPreset(
         model_path=FUN_ASR_MODEL_PATH,
@@ -153,6 +199,22 @@ ASR_CI_PRESETS: dict[str, AsrCiPreset] = {
             rtf_mean_max=QWEN3_ASR_RTF_MEAN_THRESHOLD,
             rtf_p95_max=QWEN3_ASR_RTF_P95_THRESHOLD,
         ),
+    ),
+    "whisper": AsrCiPreset(
+        model_path=OMNI_WHISPER_MODEL_PATH,
+        display_name="Whisper-large-v3",
+        thresholds=AsrCiThresholdPreset(
+            en_corpus_wer_max=WHISPER_ASR_EN_CORPUS_WER_THRESHOLD,
+            en_sample_wer_max=WHISPER_ASR_EN_SAMPLE_WER_THRESHOLD,
+            zh_corpus_wer_max=WHISPER_ASR_ZH_CORPUS_WER_THRESHOLD,
+            zh_sample_wer_max=WHISPER_ASR_ZH_SAMPLE_WER_THRESHOLD,
+            throughput_min=WHISPER_ASR_THROUGHPUT_THRESHOLD,
+            latency_mean_max_s=WHISPER_ASR_LATENCY_MEAN_THRESHOLD_S,
+            latency_p95_max_s=WHISPER_ASR_LATENCY_P95_THRESHOLD_S,
+            rtf_mean_max=WHISPER_ASR_RTF_MEAN_THRESHOLD,
+            rtf_p95_max=WHISPER_ASR_RTF_P95_THRESHOLD,
+        ),
+        gate_thresholds=False,
     ),
 }
 
