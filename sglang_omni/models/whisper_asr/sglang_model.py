@@ -447,8 +447,6 @@ class WhisperForConditionalGeneration(nn.Module):
         self.end_layer = int(config.decoder_layers) * 2
         self._encoder_graph_runner: WhisperEncoderCudaGraphRunner | None = None
         self.encoder_compiled = False
-        # note (Junnan Li): speculative draft/target pairs that ship the same
-        # encoder weights share one encoder run per request via this object.
         self.encoder_share: EncoderStateShare | None = None
         self.encoder_share_role: str | None = None
 

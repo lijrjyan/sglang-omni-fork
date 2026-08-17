@@ -11,9 +11,7 @@ import torch
 class EncoderStateShare:
     """Per-request encoder states published by the target model, consumed once by the draft.
 
-    Keyed by ``req_pool_idx``: the target and draft workers share the request table, and the
-    draft prefill for a request always follows the target prefill inside the same speculative
-    step, so pop-on-read is safe. The dict is bounded so an aborted request cannot leak.
+    Keyed by ``req_pool_idx`` because target and draft workers share the request table.
     """
 
     def __init__(self, max_entries: int = 256) -> None:
@@ -21,6 +19,7 @@ class EncoderStateShare:
         self._max_entries = max_entries
         self.published = 0
         self.consumed = 0
+        self.misses = 0
 
     def publish(
         self, req_pool_indices: list[int], flat: torch.Tensor, encoder_lens: list[int]
@@ -36,6 +35,7 @@ class EncoderStateShare:
     def take(self, req_pool_indices: list[int]) -> torch.Tensor | None:
         """Return the concatenated states for the batch, or None if any request is missing."""
         if any(idx not in self._states for idx in req_pool_indices):
+            self.misses += 1
             return None
         pieces = [self._states.pop(idx) for idx in req_pool_indices]
         self.consumed += len(pieces)

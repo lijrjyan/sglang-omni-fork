@@ -28,7 +28,8 @@ def test_take_is_all_or_nothing_and_entries_are_bounded() -> None:
 
     share.publish([1, 2, 3], flat, [1, 1, 1])
 
-    assert share.take([1, 2]) is None  # 1 was evicted by the bound
+    assert share.take([1, 2]) is None
+    assert share.misses == 1
     assert share.take([2, 3]) is not None
 
 

@@ -235,7 +235,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             _validate_whisper_speculative_configs(
                 self._target_hf_config,
                 draft_config,
-                num_draft_tokens=int(overrides["speculative_num_draft_tokens"]),
+                num_draft_tokens=overrides["speculative_num_draft_tokens"],
                 decoder_context_len=self.decoder_context_len,
             )
         if int(overrides.get("chunked_prefill_size") or 0) > 0:

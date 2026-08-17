@@ -49,9 +49,9 @@ def init_sglang_cuda_graphs(model_worker: Any) -> None:
     else:
         model_config = model_worker.model_config
         original_is_multimodal = model_config.is_multimodal
-        # Attention backends have already captured the model's real modality.
-        # Only the prefill graph runner needs this temporary view so it allocates
-        # the upstream input_embeds replay buffer.
+        # note (Junnan Li): attention backends have already captured the real
+        # modality; only the prefill graph runner needs this temporary view so
+        # it allocates the upstream input_embeds replay buffer.
         model_config.is_multimodal = True
         try:
             model_worker.model_runner.init_cuda_graphs()
@@ -246,7 +246,8 @@ def create_sglang_infrastructure(
     if not defer_cuda_graph_capture:
         init_sglang_cuda_graphs(model_worker)
         if draft_worker is not None:
-            # Disabled graphs make this the draft eager-runner hook.
+            # note (Junnan Li): with graphs disabled this is the draft
+            # eager-runner hook.
             init_speculative_draft_cuda_graphs(
                 draft_worker, capture_draft_decode_graph=False
             )
