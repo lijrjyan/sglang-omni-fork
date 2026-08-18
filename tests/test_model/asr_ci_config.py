@@ -127,18 +127,17 @@ QWEN3_ASR_RTF_MEAN_THRESHOLD = round(QWEN3_ASR_RTF_MEAN_MAX * THRESHOLD_SLACK_LO
 QWEN3_ASR_RTF_P95_THRESHOLD = round(QWEN3_ASR_RTF_P95_MAX * THRESHOLD_SLACK_LOWER, 4)
 
 
-# note (Junnan Li): Whisper is registered ahead of its first calibration; these
-# raw references are placeholders and the preset runs with gate_thresholds=False
-# until tune-ci-thresholds writes measured worst-of-N values.
+# note (Junnan Li): worst-of-5 raw references from tune-ci-thresholds on the H100
+# CI lane 0,1 (calibration commit d5d75c10 = main 66ccb81f + this preset).
 WHISPER_ASR_EN_CORPUS_WER_MAX = 0.0138
-WHISPER_ASR_EN_SAMPLE_WER_MAX = 1.0
-WHISPER_ASR_ZH_CORPUS_WER_MAX = 0.1
-WHISPER_ASR_ZH_SAMPLE_WER_MAX = 1.0
-WHISPER_ASR_THROUGHPUT_MIN = 1.0
-WHISPER_ASR_LATENCY_MEAN_MAX_S = 10.0
-WHISPER_ASR_LATENCY_P95_MAX_S = 10.0
-WHISPER_ASR_RTF_MEAN_MAX = 1.0
-WHISPER_ASR_RTF_P95_MAX = 1.0
+WHISPER_ASR_EN_SAMPLE_WER_MAX = 0.2858
+WHISPER_ASR_ZH_CORPUS_WER_MAX = 0.0668
+WHISPER_ASR_ZH_SAMPLE_WER_MAX = 0.75
+WHISPER_ASR_THROUGHPUT_MIN = 107.61255681801663
+WHISPER_ASR_LATENCY_MEAN_MAX_S = 0.2953515846582056
+WHISPER_ASR_LATENCY_P95_MAX_S = 0.41507688845158514
+WHISPER_ASR_RTF_MEAN_MAX = 0.0642
+WHISPER_ASR_RTF_P95_MAX = 0.0925
 
 WHISPER_ASR_EN_CORPUS_WER_THRESHOLD = apply_wer_slack(
     WHISPER_ASR_EN_CORPUS_WER_MAX, THRESHOLD_SLACK_LOWER
@@ -214,7 +213,6 @@ ASR_CI_PRESETS: dict[str, AsrCiPreset] = {
             rtf_mean_max=WHISPER_ASR_RTF_MEAN_THRESHOLD,
             rtf_p95_max=WHISPER_ASR_RTF_P95_THRESHOLD,
         ),
-        gate_thresholds=False,
     ),
 }
 
