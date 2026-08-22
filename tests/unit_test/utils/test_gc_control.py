@@ -46,3 +46,23 @@ def test_gc_stats_hook_counts_collections(monkeypatch) -> None:
         gc.collect(2)  # exercises start/stop without raising
     finally:
         del gc.callbacks[before:]
+
+
+def test_freeze_gc_after_requests_env(monkeypatch) -> None:
+    import pytest
+
+    from sglang_omni.utils.gc_control import (
+        DEFAULT_FREEZE_GC_AFTER_REQUESTS,
+        FREEZE_GC_AFTER_REQUESTS_ENV,
+        freeze_gc_after_requests,
+    )
+
+    monkeypatch.delenv(FREEZE_GC_AFTER_REQUESTS_ENV, raising=False)
+    assert freeze_gc_after_requests() == DEFAULT_FREEZE_GC_AFTER_REQUESTS
+    monkeypatch.setenv(FREEZE_GC_AFTER_REQUESTS_ENV, "0")
+    assert freeze_gc_after_requests() == 0
+    monkeypatch.setenv(FREEZE_GC_AFTER_REQUESTS_ENV, "128")
+    assert freeze_gc_after_requests() == 128
+    monkeypatch.setenv(FREEZE_GC_AFTER_REQUESTS_ENV, "-1")
+    with pytest.raises(ValueError):
+        freeze_gc_after_requests()

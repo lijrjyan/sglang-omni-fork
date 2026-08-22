@@ -33,6 +33,27 @@ def freeze_gc_after_startup_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+FREEZE_GC_AFTER_REQUESTS_ENV = "SGLANG_OMNI_FREEZE_GC_AFTER_REQUESTS"
+DEFAULT_FREEZE_GC_AFTER_REQUESTS = 64
+
+
+def freeze_gc_after_requests() -> int:
+    """How many completed requests to wait for before the second freeze.
+
+    The first requests lazily build kernels, caches and per-model state that
+    the startup freeze cannot see; freezing once more after they complete
+    moves that set into the permanent generation as well.  ``0`` disables the
+    second freeze.
+    """
+    raw = os.environ.get(FREEZE_GC_AFTER_REQUESTS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_FREEZE_GC_AFTER_REQUESTS
+    value = int(raw)
+    if value < 0:
+        raise ValueError(f"{FREEZE_GC_AFTER_REQUESTS_ENV} must be >= 0, got {value}")
+    return value
+
+
 def gc_object_counts() -> tuple[int, int, int]:
     return tuple(len(gc.get_objects(generation=i)) for i in range(3))  # type: ignore[return-value]
 

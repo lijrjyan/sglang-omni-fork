@@ -50,6 +50,7 @@ from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 from sglang_omni.utils.gc_control import (
     FREEZE_GC_AFTER_STARTUP_ENV,
     freeze_gc,
+    freeze_gc_after_requests,
     freeze_gc_after_startup_enabled,
     install_gc_stats_if_enabled,
 )
@@ -416,6 +417,7 @@ async def _run_server(
         len(gpu_ids),
     )
 
+    warmup_freeze_task: asyncio.Task[None] | None = None
     try:
         cl_kwargs = client_kwargs or {}
         client = Client(coordinator, **cl_kwargs)
@@ -453,7 +455,7 @@ async def _run_server(
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
         _mount_profiler_routes(app, profiler_ctl, profiler_dir)
 
-        await _freeze_gc_after_startup(client)
+        warmup_freeze_task = await _freeze_gc_after_startup(client, coordinator)
 
         config = uvicorn.Config(
             app,
@@ -465,34 +467,58 @@ async def _run_server(
         server = _PipelineUvicornServer(config)
         await _serve_with_failure_watch(server, [mp_runner.wait_failed()])
     finally:
+        if warmup_freeze_task is not None:
+            warmup_freeze_task.cancel()
         logger.info("Shutting down pipeline …")
         await mp_runner.stop()
         logger.info("Pipeline stopped.")
 
 
-async def _freeze_gc_after_startup(client: Client) -> None:
-    """Freeze the cyclic GC in every pipeline process once startup is complete.
+_WARMUP_FREEZE_POLL_S = 5.0
 
-    Stage processes have finished model load and CUDA graph capture by the time
-    ``mp_runner.start()`` returns, so the static object set is in place.  The
-    freeze is process-local and idempotent; ``POST /freeze_gc`` can repeat it
-    after operator warmup traffic.  Disable with
-    ``SGLANG_OMNI_FREEZE_GC_AFTER_STARTUP=0``.
+
+async def _freeze_all(client: Client, context: str) -> None:
+    try:
+        result = await client.freeze_gc(timeout_s=30.0)
+    except Exception:
+        logger.warning("%s GC freeze failed on the stages", context, exc_info=True)
+    else:
+        if not result.get("success", False):
+            logger.warning("%s GC freeze reported failure: %s", context, result)
+    freeze_gc(f"api server ({context})")
+
+
+async def _freeze_gc_after_startup(
+    client: Client, coordinator: Any
+) -> asyncio.Task[None] | None:
+    """Freeze the cyclic GC in every pipeline process, twice.
+
+    Once right away: stage processes have finished model load and CUDA graph
+    capture by the time ``mp_runner.start()`` returns.  Once more after the
+    first ``SGLANG_OMNI_FREEZE_GC_AFTER_REQUESTS`` (default 64) requests
+    complete, so the state that the first requests build lazily joins the
+    frozen set too.  Both freezes are process-local and idempotent;
+    ``POST /freeze_gc`` repeats them on demand.  Disable everything with
+    ``SGLANG_OMNI_FREEZE_GC_AFTER_STARTUP=0``; ``..._AFTER_REQUESTS=0`` keeps
+    only the startup freeze.
     """
     if not freeze_gc_after_startup_enabled():
         logger.info(
             "Skipping post-startup GC freeze (%s disabled it)",
             FREEZE_GC_AFTER_STARTUP_ENV,
         )
-        return
-    try:
-        result = await client.freeze_gc(timeout_s=30.0)
-    except Exception:
-        logger.warning("Post-startup GC freeze failed on the stages", exc_info=True)
-    else:
-        if not result.get("success", False):
-            logger.warning("Post-startup GC freeze reported failure: %s", result)
-    freeze_gc("api server")
+        return None
+    await _freeze_all(client, "post-startup")
+    threshold = freeze_gc_after_requests()
+    if threshold == 0:
+        return None
+
+    async def _after_requests() -> None:
+        while coordinator.completed_requests < threshold:
+            await asyncio.sleep(_WARMUP_FREEZE_POLL_S)
+        await _freeze_all(client, f"post-warmup ({threshold} requests)")
+
+    return asyncio.create_task(_after_requests())
 
 
 async def _serve_with_failure_watch(

@@ -59,10 +59,12 @@ updated the model weights; recover by reloading or otherwise repairing the
 worker before calling `continue_generation`.
 
 `/freeze_gc` calls `gc.freeze()` in the API process and in every targeted stage
-process (all TP ranks). The launcher already does this once automatically when
-the pipeline becomes ready (disable with `SGLANG_OMNI_FREEZE_GC_AFTER_STARTUP=0`);
-call the endpoint again after your own warmup traffic so lazily created objects
-join the frozen set. Freezing is idempotent and only affects GC scan cost, never
+process (all TP ranks). The launcher already does this automatically: once when
+the pipeline becomes ready and once more after the first
+`SGLANG_OMNI_FREEZE_GC_AFTER_REQUESTS` (default 64) requests complete, so the
+state the first requests build lazily joins the frozen set. Disable both with
+`SGLANG_OMNI_FREEZE_GC_AFTER_STARTUP=0`, or only the second with
+`..._AFTER_REQUESTS=0`; call the endpoint yourself after any further warmup. Freezing is idempotent and only affects GC scan cost, never
 correctness. The response carries per-stage generation counts and the API
 server's own counts under `api_server`.
 
