@@ -37,6 +37,7 @@ The worker server supports:
 - `POST /destroy_weights_update_group`
 - `POST /update_weights_from_distributed`
 - `GET|POST /weights_checker`
+- `POST /freeze_gc`
 
 `/update_weights_from_disk` is the primary implemented update path. It pauses
 the target scheduler, optionally aborts active requests, calls the underlying
@@ -56,6 +57,14 @@ aborted or safely retracted, cache is flushed by default, and the visible
 update fails, the scheduler remains paused because SGLang may have partially
 updated the model weights; recover by reloading or otherwise repairing the
 worker before calling `continue_generation`.
+
+`/freeze_gc` calls `gc.freeze()` in the API process and in every targeted stage
+process (all TP ranks). The launcher already does this once automatically when
+the pipeline becomes ready (disable with `SGLANG_OMNI_FREEZE_GC_AFTER_STARTUP=0`);
+call the endpoint again after your own warmup traffic so lazily created objects
+join the frozen set. Freezing is idempotent and only affects GC scan cost, never
+correctness. The response carries per-stage generation counts and the API
+server's own counts under `api_server`.
 
 `/update_weights_from_tensor` is still reserved for a future tensor data-plane
 integration and returns HTTP 501 from the worker and router HTTP APIs.

@@ -47,6 +47,11 @@ from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recor
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
 from sglang_omni.serve.openai_api import create_app
 from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
+from sglang_omni.utils.gc_control import (
+    FREEZE_GC_AFTER_STARTUP_ENV,
+    freeze_gc,
+    freeze_gc_after_startup_enabled,
+)
 from sglang_omni.utils.gpu_compat import apply_gpu_compat_env_defaults
 from sglang_omni.utils.gpu_memory import (
     GpuDeviceInfo,
@@ -446,6 +451,8 @@ async def _run_server(
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
         _mount_profiler_routes(app, profiler_ctl, profiler_dir)
 
+        await _freeze_gc_after_startup(client)
+
         config = uvicorn.Config(
             app,
             host=host,
@@ -459,6 +466,31 @@ async def _run_server(
         logger.info("Shutting down pipeline …")
         await mp_runner.stop()
         logger.info("Pipeline stopped.")
+
+
+async def _freeze_gc_after_startup(client: Client) -> None:
+    """Freeze the cyclic GC in every pipeline process once startup is complete.
+
+    Stage processes have finished model load and CUDA graph capture by the time
+    ``mp_runner.start()`` returns, so the static object set is in place.  The
+    freeze is process-local and idempotent; ``POST /freeze_gc`` can repeat it
+    after operator warmup traffic.  Disable with
+    ``SGLANG_OMNI_FREEZE_GC_AFTER_STARTUP=0``.
+    """
+    if not freeze_gc_after_startup_enabled():
+        logger.info(
+            "Skipping post-startup GC freeze (%s disabled it)",
+            FREEZE_GC_AFTER_STARTUP_ENV,
+        )
+        return
+    try:
+        result = await client.freeze_gc(timeout_s=30.0)
+    except Exception:
+        logger.warning("Post-startup GC freeze failed on the stages", exc_info=True)
+    else:
+        if not result.get("success", False):
+            logger.warning("Post-startup GC freeze reported failure: %s", result)
+    freeze_gc("api server")
 
 
 async def _serve_with_failure_watch(
