@@ -32,3 +32,17 @@ def test_freeze_gc_after_startup_env_parsing(monkeypatch) -> None:
         assert freeze_gc_after_startup_enabled() is False
     monkeypatch.setenv(FREEZE_GC_AFTER_STARTUP_ENV, "1")
     assert freeze_gc_after_startup_enabled() is True
+
+
+def test_gc_stats_hook_counts_collections(monkeypatch) -> None:
+    from sglang_omni.utils.gc_control import GC_STATS_ENV, install_gc_stats_if_enabled
+
+    monkeypatch.setenv(GC_STATS_ENV, "0")
+    assert install_gc_stats_if_enabled("t") is False
+    monkeypatch.setenv(GC_STATS_ENV, "1")
+    before = len(gc.callbacks)
+    assert install_gc_stats_if_enabled("t") is True
+    try:
+        gc.collect(2)  # exercises start/stop without raising
+    finally:
+        del gc.callbacks[before:]

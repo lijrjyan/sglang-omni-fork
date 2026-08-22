@@ -62,3 +62,78 @@ def freeze_gc(context: str) -> dict[str, Any]:
         "after": {"gen0": after[0], "gen1": after[1], "gen2": after[2]},
         "frozen": frozen,
     }
+
+
+GC_STATS_ENV = "SGLANG_OMNI_GC_STATS"
+_GC_STATS_SUMMARY_INTERVAL_S = 30.0
+_GC_STATS_SLOW_GEN2_S = 0.05
+
+
+def gc_stats_enabled() -> bool:
+    raw = os.environ.get(GC_STATS_ENV, "0").strip().lower()
+    return raw not in {"", "0", "false", "no", "off"}
+
+
+def install_gc_stats_if_enabled(context: str) -> bool:
+    """Opt-in diagnostic: count cyclic GC passes per generation in this process.
+
+    With ``SGLANG_OMNI_GC_STATS=1`` a ``gc.callbacks`` hook accumulates the
+    number, total and maximum duration of collections per generation, logs one
+    summary line every 30 s of GC activity, and logs every gen2 pass slower
+    than 50 ms on its own.  This is the evidence path for the post-startup
+    freeze: compare gen2 count / stall time with and without it.  Off by
+    default; the hook costs one ``time.monotonic()`` per collection.
+    """
+    if not gc_stats_enabled():
+        return False
+    import time
+
+    state = {
+        "start": {},
+        "count": [0, 0, 0],
+        "total": [0.0, 0.0, 0.0],
+        "max": [0.0, 0.0, 0.0],
+        "last_log": time.monotonic(),
+    }
+
+    def _cb(phase: str, info: dict[str, Any]) -> None:
+        gen = int(info.get("generation", 0))
+        now = time.monotonic()
+        if phase == "start":
+            state["start"][gen] = now
+            return
+        dur = now - state["start"].pop(gen, now)
+        state["count"][gen] += 1
+        state["total"][gen] += dur
+        state["max"][gen] = max(state["max"][gen], dur)
+        if gen == 2 and dur >= _GC_STATS_SLOW_GEN2_S:
+            logger.info(
+                "GC gen2 pass in %s (pid=%d): %.1f ms, collected=%s, frozen=%d",
+                context,
+                os.getpid(),
+                dur * 1000.0,
+                info.get("collected"),
+                gc.get_freeze_count(),
+            )
+        if now - state["last_log"] >= _GC_STATS_SUMMARY_INTERVAL_S:
+            state["last_log"] = now
+            logger.info(
+                "GC stats %s (pid=%d): gen0 n=%d tot=%.0fms max=%.1fms | "
+                "gen1 n=%d tot=%.0fms max=%.1fms | gen2 n=%d tot=%.0fms max=%.1fms | frozen=%d",
+                context,
+                os.getpid(),
+                state["count"][0],
+                state["total"][0] * 1000.0,
+                state["max"][0] * 1000.0,
+                state["count"][1],
+                state["total"][1] * 1000.0,
+                state["max"][1] * 1000.0,
+                state["count"][2],
+                state["total"][2] * 1000.0,
+                state["max"][2] * 1000.0,
+                gc.get_freeze_count(),
+            )
+
+    gc.callbacks.append(_cb)
+    logger.info("GC stats enabled in %s process (pid=%d)", context, os.getpid())
+    return True

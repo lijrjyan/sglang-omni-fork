@@ -51,6 +51,7 @@ from sglang_omni.utils.gc_control import (
     FREEZE_GC_AFTER_STARTUP_ENV,
     freeze_gc,
     freeze_gc_after_startup_enabled,
+    install_gc_stats_if_enabled,
 )
 from sglang_omni.utils.gpu_compat import apply_gpu_compat_env_defaults
 from sglang_omni.utils.gpu_memory import (
@@ -387,6 +388,7 @@ async def _run_server(
     """
     # 0. Check port availability before loading models
     port = _find_available_port(host, port)
+    install_gc_stats_if_enabled("api server")
 
     mp_runner = MultiProcessPipelineRunner(pipeline_config)
     startup_timeout = float(os.environ.get("SGLANG_OMNI_STARTUP_TIMEOUT", "600"))
