@@ -53,6 +53,9 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
             "max_prefill_tokens": 8192,
             "sampling_backend": "pytorch",
             "trust_remote_code": True,
+            # PROBE ONLY (private #87): rule the radix/prefix cache in or out as the
+            # source of the uptime throughput decay. Never merge.
+            "disable_radix_cache": True,
         }
 
     def setup_model(
