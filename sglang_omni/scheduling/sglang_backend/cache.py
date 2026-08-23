@@ -25,9 +25,16 @@ def create_tree_cache(
         chunked_prefill_size=server_args.chunked_prefill_size,
     )
 
-    if server_args.disable_radix_cache:
+    import os
+
+    if server_args.disable_radix_cache or (
+        os.environ.get("SGLANG_OMNI_PROBE_DISABLE_RADIX", "").strip() == "1"
+    ):
+        # PROBE ONLY (private #87): env gate so paired A/B arms run identical
+        # code and differ only by this variable. Never merge.
         from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
+        params.disable = True
         return ChunkCache(params)
 
     return RadixCache(params)
