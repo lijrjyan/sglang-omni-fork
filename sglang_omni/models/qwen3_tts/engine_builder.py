@@ -53,6 +53,8 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
             "max_prefill_tokens": 8192,
             "sampling_backend": "pytorch",
             "trust_remote_code": True,
+            # PROBE ONLY (private #87): radix-off on pristine main. Never merge.
+            "disable_radix_cache": True,
         }
 
     def setup_model(
