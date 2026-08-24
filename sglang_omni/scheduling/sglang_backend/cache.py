@@ -37,4 +37,23 @@ def create_tree_cache(
         params.disable = True
         return ChunkCache(params)
 
+    if os.environ.get("SGLANG_OMNI_PROBE_NO_MATCH", "").strip() == "1":
+        # PROBE ONLY (private #87): emulate production all-unique traffic —
+        # every match misses, every finished request still inserts/retains.
+        # Never merge.
+        class _NoMatchRadixCache(RadixCache):
+            def match_prefix(self, *args, **kwargs):
+                result = super().match_prefix(*args, **kwargs)
+                try:
+                    empty = result.device_indices[:0]
+                    return type(result)(
+                        device_indices=empty,
+                        last_device_node=self.root_node,
+                        last_host_node=self.root_node,
+                    )
+                except Exception:
+                    return result
+
+        return _NoMatchRadixCache(params)
+
     return RadixCache(params)
