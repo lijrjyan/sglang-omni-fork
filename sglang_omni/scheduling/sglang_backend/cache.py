@@ -42,6 +42,19 @@ def create_tree_cache(
         # every match misses, every finished request still inserts/retains.
         # Never merge.
         class _NoMatchRadixCache(RadixCache):
+            def cache_finished_req(self, req, *args, **kwargs):
+                # Salt the partition key so every finished request retains a
+                # private chain: emulates all-unique production audio for
+                # tree-growth purposes (insert-dedup defeated).
+                import uuid
+
+                try:
+                    base = getattr(req, "extra_key", None)
+                    req.extra_key = f"{base or ''}-salt-{uuid.uuid4().hex}"
+                except Exception:
+                    pass
+                return super().cache_finished_req(req, *args, **kwargs)
+
             def match_prefix(self, *args, **kwargs):
                 result = super().match_prefix(*args, **kwargs)
                 try:
