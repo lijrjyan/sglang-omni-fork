@@ -40,12 +40,12 @@ def _make(cache_cls):
     )
 
 
-def _run_trace(cache, seed: int, steps: int = 4000) -> list[tuple[int, ...]]:
+def _run_trace(cache, seed: int, steps: int = 4000, drain: bool = True) -> list:
     """Drive an identical insert/lock/unlock/evict trace; return eviction order."""
     order = []
     orig_delete = cache._delete_leaf
     cache._delete_leaf = lambda node: (
-        order.append(tuple(node.key.token_ids)),
+        order.append((node.key.extra_key, tuple(node.key.token_ids))),
         orig_delete(node),
     )[1]
 
@@ -71,7 +71,8 @@ def _run_trace(cache, seed: int, steps: int = 4000) -> list[tuple[int, ...]]:
             cache.dec_lock_ref(locked.pop(rng.randrange(len(locked))))
         else:
             cache.evict(EvictParams(num_tokens=rng.randint(1, 40)))
-    cache.evict(EvictParams(num_tokens=1 << 20))
+    if drain:
+        cache.evict(EvictParams(num_tokens=1 << 20))
     return order
 
 
@@ -87,15 +88,38 @@ def test_eviction_trace_matches_stock():
 
 def test_heap_stays_bounded_and_recovers():
     cache = _make(EvictHeapRadixCache)
-    _run_trace(cache, seed=7, steps=2000)
-    # Post-evict, live entries are bounded by the compaction threshold.
+    _run_trace(cache, seed=7, steps=2000, drain=False)
+    # Mid-trace, before the final drain, so the bound is a live constraint.
+    assert cache.evictable_leaves
     assert len(cache._evict_heap) <= max(1024, 4 * len(cache.evictable_leaves))
+    cache.evict(EvictParams(num_tokens=1 << 20))
     # The cache keeps working after a full drain.
     key = RadixKey(token_ids=[1, 2, 3], extra_key="post")
     cache.insert(InsertParams(key=key, value=torch.arange(3)))
     result = cache.evict(EvictParams(num_tokens=1 << 20))
     assert result.num_tokens_evicted >= 3
     assert not cache.evictable_leaves
+
+
+def test_lock_churn_stays_bounded_without_eviction():
+    cache = _make(EvictHeapRadixCache)
+    rng = random.Random(11)
+    for i in range(300):
+        cache.insert(
+            InsertParams(
+                key=RadixKey(
+                    token_ids=[rng.randint(0, 30) for _ in range(8)],
+                    extra_key=str(i),
+                ),
+                value=torch.arange(8),
+            )
+        )
+    nodes = sorted(cache.evictable_leaves, key=lambda x: x.id)
+    for i in range(5000):
+        node = nodes[i % len(nodes)]
+        cache.inc_lock_ref(node)
+        cache.dec_lock_ref(node)
+    assert len(cache._evict_heap) <= max(1024, 4 * len(cache.evictable_leaves))
 
 
 def test_reset_then_reuse():
