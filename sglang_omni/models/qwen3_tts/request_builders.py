@@ -1200,7 +1200,17 @@ def build_sglang_qwen3_tts_request(
         sampling_params=sampling_params,
         eos_token_ids={int(model.config.codec_eos_token_id)},
         vocab_size=int(model.config.vocab_size),
-        extra_key=f"qwen3_tts:{uuid.uuid4().hex}",
+        # PROBE (#1723): partition by reference signature instead of uuid so
+        # replayed same-speaker traffic can hit; never merge.
+        extra_key="qwen3_tts:"
+        + hashlib.blake2b(
+            str(
+                getattr(state, "ref_text", None)
+                or getattr(state, "voice", None)
+                or "none"
+            ).encode(),
+            digest_size=8,
+        ).hexdigest(),
     )
     req.tokenizer = None
     req._input_embeds_are_projected = True
