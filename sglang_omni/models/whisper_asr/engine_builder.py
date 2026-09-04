@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 from sglang_omni.models.whisper_asr.encoder_service import (
@@ -20,6 +21,7 @@ from sglang_omni.scheduling.engine_factory import AsrEngineBuilder
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ENCODER_GRAPH_BATCH_BUCKETS = (1, 2, 4, 8, 12, 16)
+_WHISPER_GENERATION_ARCHITECTURES = {"WhisperForConditionalGeneration"}
 
 
 def _normalize_encoder_graph_buckets(buckets: list[int] | None) -> tuple[int, ...]:
@@ -64,6 +66,44 @@ def _resolve_encoder_graph_buckets(
     return tuple(sorted(resolved))
 
 
+def _validate_whisper_speculative_configs(
+    target_config: Any,
+    draft_config: Any,
+    *,
+    num_draft_tokens: int,
+    decoder_context_len: int,
+) -> None:
+    draft_architectures = set(draft_config.architectures or [])
+    if not draft_architectures.intersection(_WHISPER_GENERATION_ARCHITECTURES):
+        raise ValueError(
+            "Whisper speculative decoding requires a Whisper architecture for the "
+            f"draft checkpoint; got {sorted(draft_architectures)!r}"
+        )
+
+    compatibility_values = (
+        ("d_model", target_config.d_model, draft_config.d_model),
+        ("vocab_size", target_config.vocab_size, draft_config.vocab_size),
+        ("num_mel_bins", target_config.num_mel_bins, draft_config.num_mel_bins),
+        (
+            "max_source_positions",
+            target_config.max_source_positions,
+            draft_config.max_source_positions,
+        ),
+    )
+    for field, target_value, draft_value in compatibility_values:
+        if draft_value != target_value:
+            raise ValueError(
+                "Whisper target and draft configs must match for speculative "
+                f"decoding: {field} target={target_value!r}, draft={draft_value!r}"
+            )
+
+    if num_draft_tokens > decoder_context_len:
+        raise ValueError(
+            "Whisper speculative_num_draft_tokens exceeds the decoder budget: "
+            f"{num_draft_tokens} > {decoder_context_len}"
+        )
+
+
 class WhisperASREngineBuilder(AsrEngineBuilder):
     model_name = "Whisper ASR"
     model_arch_override = "WhisperForConditionalGeneration"
@@ -88,6 +128,13 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         prefill_coalesce_when_idle: bool = True,
         prefill_coalesce_requires_pending_builds: bool = True,
         prefill_coalesce_after_builds_during_decode: bool = False,
+        enable_speculative: bool = False,
+        speculative_draft_model_path: str | None = None,
+        speculative_num_steps: int = 3,
+        speculative_num_draft_tokens: int = 4,
+        speculative_cuda_graph: bool = False,
+        speculative_draft_cuda_graph: bool = False,
+        speculative_share_encoder: bool = True,
         enable_pre_lm_encoder: bool = True,
         pre_lm_cache_max_entries: int = 4096,
         pre_lm_cache_size_bytes: int = 2 * 1024**3,
@@ -113,6 +160,13 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         self.enable_encoder_torch_compile = bool(enable_encoder_torch_compile)
         self.encoder_torch_compile_mode = encoder_torch_compile_mode
         self.quantization_scope = validate_quantization_scope(quantization_scope)
+        if enable_speculative and enable_async_decode:
+            # note (Junnan Li): the STANDALONE lane is synchronous by design, so
+            # the async-decode default is turned off instead of failing startup.
+            logger.info(
+                "Whisper speculative decoding disables enable_async_decode"
+            )
+            enable_async_decode = False
         self.enable_async_decode = enable_async_decode
         self.async_decode_min_batch_size = async_decode_min_batch_size
         self.request_build_max_workers = request_build_max_workers
@@ -126,6 +180,13 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         self.prefill_coalesce_after_builds_during_decode = (
             prefill_coalesce_after_builds_during_decode
         )
+        self.enable_speculative = enable_speculative
+        self.speculative_draft_model_path = speculative_draft_model_path
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        self.speculative_cuda_graph = bool(speculative_cuda_graph)
+        self.speculative_draft_cuda_graph = bool(speculative_draft_cuda_graph)
+        self.speculative_share_encoder = bool(speculative_share_encoder)
         self.enable_pre_lm_encoder = bool(enable_pre_lm_encoder)
         self.pre_lm_cache_max_entries = int(pre_lm_cache_max_entries)
         self.pre_lm_cache_size_bytes = int(pre_lm_cache_size_bytes)
@@ -137,6 +198,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         self.encoder_token_count = 0
         self.context_length = 0
         self.decoder_context_len = 0
+        self._target_hf_config: Any = None
         self.audio_encoder_service: Any | None = None
 
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
@@ -146,6 +208,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             MAX_PREV_CONTEXT_TOKENS,
         )
 
+        self._target_hf_config = AutoConfig.from_pretrained(checkpoint_dir)
         self.processor = AutoProcessor.from_pretrained(checkpoint_dir)
         self.tokenizer = self.processor.tokenizer
         self.generation_config = GenerationConfig.from_pretrained(checkpoint_dir)
@@ -156,8 +219,23 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             self.encoder_token_count + MAX_PREV_CONTEXT_TOKENS + self.max_new_tokens + 8
         )
         self.decoder_context_len = int(
-            AutoConfig.from_pretrained(checkpoint_dir).max_target_positions or 448
+            self._target_hf_config.max_target_positions or 448
         )
+
+    def setup_speculative_models(self, model: Any, draft_model: Any) -> None:
+        if not self.speculative_share_encoder:
+            return
+        from sglang_omni.models.whisper_asr.encoder_share import EncoderStateShare
+
+        # note (Junnan Li): distil-whisper drafts ship the target's encoder
+        # weights verbatim, so the draft reads the target's states instead of
+        # re-running a 1500-position encoder per request.
+        share = EncoderStateShare()
+        model.encoder_share = share
+        model.encoder_share_role = "target"
+        draft_model.encoder_share = share
+        draft_model.encoder_share_role = "draft"
+        logger.info("Whisper speculative draft shares the target encoder output")
 
     def setup_model_resources(
         self,
@@ -229,6 +307,30 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         )
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
+        if (
+            overrides.get("speculative_algorithm") is not None
+            and os.environ.get("SGLANG_OMNI_SPEC_ALLOW_ENCDEC") != "1"
+        ):
+            raise RuntimeError(
+                "speculative decoding for encoder-decoder models requires "
+                "upstream encoder-decoder correctness fixes (P3)"
+            )
+        if overrides.get("speculative_algorithm") is not None:
+            from transformers import AutoConfig
+
+            if self._target_hf_config is None:
+                raise RuntimeError(
+                    "Whisper target config must be loaded before speculative validation"
+                )
+            draft_config = AutoConfig.from_pretrained(
+                overrides["speculative_draft_model_path"]
+            )
+            _validate_whisper_speculative_configs(
+                self._target_hf_config,
+                draft_config,
+                num_draft_tokens=overrides["speculative_num_draft_tokens"],
+                decoder_context_len=self.decoder_context_len,
+            )
         if int(overrides.get("chunked_prefill_size") or 0) > 0:
             raise ValueError(
                 "Whisper ASR requires chunked_prefill_size=0 because its encoder "

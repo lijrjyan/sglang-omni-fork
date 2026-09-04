@@ -32,6 +32,7 @@ from sglang_omni.models.whisper_asr.encoder_compile import compile_encoder_layer
 from sglang_omni.models.whisper_asr.encoder_cuda_graph import (
     WhisperEncoderCudaGraphRunner,
 )
+from sglang_omni.models.whisper_asr.encoder_share import EncoderStateShare
 from sglang_omni.models.whisper_asr.quantization_scope import decoder_quant_config
 
 logger = logging.getLogger(__name__)
@@ -449,6 +450,8 @@ class WhisperForConditionalGeneration(nn.Module):
         self.end_layer = int(config.decoder_layers) * 2
         self._encoder_graph_runner: WhisperEncoderCudaGraphRunner | None = None
         self.encoder_compiled = False
+        self.encoder_share: EncoderStateShare | None = None
+        self.encoder_share_role: str | None = None
 
     def compile_encoder(
         self,
@@ -513,12 +516,13 @@ class WhisperForConditionalGeneration(nn.Module):
     def _batch_audio_inputs(
         self,
         forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor | None, list[int] | None]:
+    ) -> tuple[torch.Tensor | None, list[int] | None, list[int]]:
         if forward_batch.forward_mode.is_decode() or all(forward_batch.encoder_cached):
-            return None, None
+            return None, None, []
 
         features: list[torch.Tensor] = []
         encoder_lens: list[int] = []
+        req_pool_indices: list[int] = []
         for index, mm_input in enumerate(forward_batch.mm_inputs):
             if forward_batch.encoder_cached[index] or mm_input is None:
                 continue
@@ -529,10 +533,11 @@ class WhisperForConditionalGeneration(nn.Module):
                 continue
             features.append(torch.cat(item_features, dim=0))
             encoder_lens.append(int(forward_batch.encoder_lens[index].item()))
+            req_pool_indices.append(int(forward_batch.req_pool_indices[index].item()))
 
         if not features:
-            return None, None
-        return torch.cat(features, dim=0), encoder_lens
+            return None, None, []
+        return torch.cat(features, dim=0), encoder_lens, req_pool_indices
 
     def _batch_precomputed_encoder_states(
         self,
@@ -598,13 +603,22 @@ class WhisperForConditionalGeneration(nn.Module):
 
         cross_attention_states = self._batch_precomputed_encoder_states(forward_batch)
         if cross_attention_states is None:
-            audio_features, encoder_lens = self._batch_audio_inputs(forward_batch)
+            audio_features, encoder_lens, req_pool_indices = self._batch_audio_inputs(
+                forward_batch
+            )
             if audio_features is not None and encoder_lens is not None:
-                encoder_states = self._run_encoder(audio_features)
-                cross_attention_states = self._flat_encoder_result(
-                    encoder_states,
-                    encoder_lens,
-                )
+                if self.encoder_share_role == "draft":
+                    cross_attention_states = self.encoder_share.take(req_pool_indices)
+                if cross_attention_states is None:
+                    encoder_states = self._run_encoder(audio_features)
+                    cross_attention_states = self._flat_encoder_result(
+                        encoder_states,
+                        encoder_lens,
+                    )
+                    if self.encoder_share_role == "target":
+                        self.encoder_share.publish(
+                            req_pool_indices, cross_attention_states, encoder_lens
+                        )
 
         if get_is_capture_mode():
             skip_cross_attention = False

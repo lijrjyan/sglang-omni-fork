@@ -27,6 +27,110 @@ def _operator_selected_prefill_graph_backend(
     return "backend" in nested_prefill_overrides(server_args_overrides)
 
 
+_SPECULATIVE_OVERRIDE_FIELDS = (
+    "speculative_draft_model_path",
+    "speculative_num_steps",
+    "speculative_eagle_topk",
+    "speculative_num_draft_tokens",
+)
+
+
+def configure_speculative_overrides(
+    overrides: Mapping[str, Any],
+    *,
+    enable_speculative: bool,
+    speculative_draft_model_path: str | None,
+    speculative_num_steps: int,
+    speculative_num_draft_tokens: int,
+    speculative_cuda_graph: bool = False,
+    speculative_draft_cuda_graph: bool = False,
+) -> dict[str, Any]:
+    """Validate Omni's STANDALONE speculative decoding configuration."""
+    configured = dict(overrides)
+    if speculative_draft_cuda_graph and not speculative_cuda_graph:
+        raise ValueError(
+            "speculative_draft_cuda_graph=True requires speculative_cuda_graph=True"
+        )
+    if enable_speculative:
+        requested = {
+            "speculative_algorithm": "STANDALONE",
+            "speculative_draft_model_path": speculative_draft_model_path,
+            "speculative_num_steps": speculative_num_steps,
+            "speculative_eagle_topk": 1,
+            "speculative_num_draft_tokens": speculative_num_draft_tokens,
+        }
+        for name, value in requested.items():
+            existing = configured.get(name)
+            conflicts = existing is not None and existing != value
+            if name == "speculative_algorithm" and existing is not None:
+                conflicts = str(existing).upper() != value
+            if conflicts:
+                raise ValueError(
+                    f"Conflicting first-class {name}={value!r} and "
+                    f"server_args_overrides {name}={existing!r}"
+                )
+            configured[name] = value
+
+    algorithm = configured.get("speculative_algorithm")
+    if algorithm is None:
+        configured_fields = [
+            name
+            for name in _SPECULATIVE_OVERRIDE_FIELDS
+            if configured.get(name) is not None
+        ]
+        if configured_fields:
+            raise ValueError(
+                "speculative_algorithm='STANDALONE' is required when setting "
+                + ", ".join(configured_fields)
+            )
+        if speculative_cuda_graph:
+            raise ValueError(
+                "speculative_cuda_graph=True requires STANDALONE speculative decoding"
+            )
+        return configured
+
+    normalized_algorithm = str(algorithm).upper()
+    if normalized_algorithm != "STANDALONE":
+        raise ValueError(
+            "sglang-omni only supports STANDALONE speculative decoding in the "
+            f"synchronous lane; got speculative_algorithm={algorithm!r}"
+        )
+    configured["speculative_algorithm"] = normalized_algorithm
+
+    draft_path = configured.get("speculative_draft_model_path")
+    if not isinstance(draft_path, str) or not draft_path.strip():
+        raise ValueError(
+            "speculative_draft_model_path is required for STANDALONE "
+            "speculative decoding"
+        )
+
+    topk = configured.setdefault("speculative_eagle_topk", 1)
+    if topk != 1:
+        raise ValueError(
+            "speculative_eagle_topk must be 1 for the STANDALONE lane; " f"got {topk!r}"
+        )
+    num_steps = int(configured.setdefault("speculative_num_steps", 3))
+    num_draft_tokens = int(configured.setdefault("speculative_num_draft_tokens", 4))
+    if num_steps < 0:
+        raise ValueError(f"speculative_num_steps must be >= 0, got {num_steps}")
+    if num_draft_tokens != num_steps + 1:
+        raise ValueError(
+            "topk=1 requires speculative_num_draft_tokens == "
+            f"speculative_num_steps + 1; got {num_draft_tokens} and {num_steps}"
+        )
+    configured["speculative_num_steps"] = num_steps
+    configured["speculative_num_draft_tokens"] = num_draft_tokens
+
+    # note (Junnan Li): target and draft graph capture follow multi-token parity.
+    configured["disable_overlap_schedule"] = True
+    configured["disable_cuda_graph"] = not speculative_cuda_graph
+    if "cuda_graph_backend_prefill" in configured:
+        configured["cuda_graph_backend_prefill"] = "disabled"
+        configured.pop("cuda_graph_bs_prefill", None)
+        configured.pop("cuda_graph_max_bs_prefill", None)
+    return configured
+
+
 class SGLangGenerationEngineBuilder(ABC):
     """Build the model-neutral parts of a SGLang AR engine stage.
 
@@ -42,6 +146,12 @@ class SGLangGenerationEngineBuilder(ABC):
     # Set True only by builders whose model has adopted the breakable prefill
     # CUDA graph contract; a deployment override cannot enable it otherwise.
     supports_breakable_prefill_cuda_graph: bool = False
+    enable_speculative: bool = False
+    speculative_draft_model_path: str | None = None
+    speculative_num_steps: int = 3
+    speculative_num_draft_tokens: int = 4
+    speculative_cuda_graph: bool = False
+    speculative_draft_cuda_graph: bool = False
 
     def build(
         self,
@@ -78,6 +188,15 @@ class SGLangGenerationEngineBuilder(ABC):
         overrides = build_generation_batch_overrides(
             server_args_overrides=server_args_overrides,
             **self.generation_defaults(dtype=dtype),
+        )
+        overrides = configure_speculative_overrides(
+            overrides,
+            enable_speculative=self.enable_speculative,
+            speculative_draft_model_path=self.speculative_draft_model_path,
+            speculative_num_steps=self.speculative_num_steps,
+            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            speculative_cuda_graph=self.speculative_cuda_graph,
+            speculative_draft_cuda_graph=self.speculative_draft_cuda_graph,
         )
         self.adjust_overrides(overrides)
         # Left unset, SGLang re-detects off a CUDA-first ladder that can contradict
@@ -122,7 +241,14 @@ class SGLangGenerationEngineBuilder(ABC):
                     "cuda_graph_backend_prefill='breakable'"
                 )
             infra_kwargs.setdefault("enable_prefill_input_embeds", True)
-        want_cuda_graph, (
+        want_cuda_graph, infrastructure = (
+            scheduling_bootstrap.create_sglang_infrastructure_defer_cuda_graph(
+                server_args,
+                gpu_id,
+                **infra_kwargs,
+            )
+        )
+        (
             model_worker,
             tree_cache,
             req_to_token_pool,
@@ -130,11 +256,18 @@ class SGLangGenerationEngineBuilder(ABC):
             prefill_mgr,
             decode_mgr,
             model_config,
-        ) = scheduling_bootstrap.create_sglang_infrastructure_defer_cuda_graph(
-            server_args,
-            gpu_id,
-            **infra_kwargs,
-        )
+            *spec_workers,
+        ) = infrastructure
+        if spec_workers:
+            if len(spec_workers) != 2:
+                raise RuntimeError(
+                    "SGLang infrastructure returned an invalid speculative "
+                    "worker payload"
+                )
+            target_worker_adapter, draft_worker = spec_workers
+        else:
+            target_worker_adapter = None
+            draft_worker = None
         model = model_worker.model_runner.model
 
         self.setup_model(
@@ -144,6 +277,10 @@ class SGLangGenerationEngineBuilder(ABC):
             gpu_id=gpu_id,
             server_args=server_args,
         )
+        if draft_worker is not None:
+            self.setup_speculative_models(
+                model, scheduling_bootstrap.speculative_draft_model(draft_worker)
+            )
 
         self.validate_after_model_setup(model, server_args)
 
@@ -151,6 +288,11 @@ class SGLangGenerationEngineBuilder(ABC):
 
         if want_cuda_graph:
             scheduling_bootstrap.init_sglang_cuda_graphs(model_worker)
+            if draft_worker is not None:
+                scheduling_bootstrap.init_speculative_draft_cuda_graphs(
+                    draft_worker,
+                    capture_draft_decode_graph=self.speculative_draft_cuda_graph,
+                )
             self.post_cuda_graph_setup(model, server_args)
             if prefill_graph_backend != CudaGraphBackend.DISABLED:
                 from sglang_omni.utils import cuda_graph_batch_validator
@@ -185,6 +327,8 @@ class SGLangGenerationEngineBuilder(ABC):
                 model_config=model_config,
                 prefill_manager=prefill_mgr,
                 decode_manager=decode_mgr,
+                target_worker_adapter=target_worker_adapter,
+                draft_worker=draft_worker,
             )
             self.post_scheduler_setup(scheduler, model_runner)
             return scheduler
@@ -238,6 +382,10 @@ class SGLangGenerationEngineBuilder(ABC):
         del model
         return None
 
+    def setup_speculative_models(self, model: Any, draft_model: Any) -> None:
+        """Link the target and speculative draft models after both are loaded."""
+        del model, draft_model
+
     def compile_model(self, model: Any, server_args: Any) -> None:
         del model, server_args
 
@@ -277,6 +425,8 @@ class SGLangGenerationEngineBuilder(ABC):
         model_config: Any,
         prefill_manager: Any,
         decode_manager: Any,
+        target_worker_adapter: Any = None,
+        draft_worker: Any = None,
     ) -> tuple[Any, Any]:
         request_builder, result_adapter = self.make_adapters(model)
         scheduler_kwargs = self.extra_scheduler_kwargs()
@@ -294,6 +444,8 @@ class SGLangGenerationEngineBuilder(ABC):
             request_builder=request_builder,
             result_adapter=result_adapter,
             extra_scheduler_kwargs=scheduler_kwargs,
+            target_worker_adapter=target_worker_adapter,
+            draft_worker=draft_worker,
         )
         return scheduler, model_runner
 
@@ -327,6 +479,8 @@ class SGLangGenerationEngineBuilder(ABC):
         request_builder: Any,
         result_adapter: Any,
         extra_scheduler_kwargs: dict[str, Any],
+        target_worker_adapter: Any = None,
+        draft_worker: Any = None,
     ) -> Any:
         from sglang_omni.scheduling import omni_scheduler
 
@@ -344,6 +498,8 @@ class SGLangGenerationEngineBuilder(ABC):
             "result_adapter": result_adapter,
             "abort_callback": self.make_abort_callback(),
             "request_finished_callback": self.make_request_finished_callback(),
+            "target_worker_adapter": target_worker_adapter,
+            "draft_worker": draft_worker,
         }
         scheduler_kwargs.update(self.extra_scheduler_callbacks())
         scheduler_kwargs.update(extra_scheduler_kwargs)
@@ -356,6 +512,8 @@ class SGLangGenerationEngineBuilder(ABC):
 class AsrEngineBuilder(SGLangGenerationEngineBuilder):
     """Shared lifecycle policy for SGLang-backed ASR stages."""
 
+    tokenizer: Any = None
+
     def resolve_checkpoint(self, model_path: str) -> str:
         # ASR model loaders accept either a repo id or a local path and should
         # preserve the operator-provided value through server-args creation.
@@ -366,6 +524,9 @@ class AsrEngineBuilder(SGLangGenerationEngineBuilder):
             model_name=self.model_name,
             server_args=server_args,
         )
+
+    def infra_kwargs(self) -> dict[str, Any]:
+        return {"target_tokenizer": self.tokenizer}
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         from sglang_omni.model_runner.base import ModelRunner
@@ -419,6 +580,8 @@ class TtsEngineBuilder(SGLangGenerationEngineBuilder):
         model_runner: Any,
         request_builder: Any,
         result_adapter: Any,
+        target_worker_adapter: Any = None,
+        draft_worker: Any = None,
     ) -> Any:
         from sglang_omni.scheduling import omni_scheduler
 
@@ -436,6 +599,8 @@ class TtsEngineBuilder(SGLangGenerationEngineBuilder):
             result_adapter=result_adapter,
             abort_callback=self.make_abort_callback(),
             request_finished_callback=self.make_request_finished_callback(),
+            target_worker_adapter=target_worker_adapter,
+            draft_worker=draft_worker,
             **self.extra_scheduler_kwargs(),
         )
 
@@ -452,10 +617,12 @@ class TtsEngineBuilder(SGLangGenerationEngineBuilder):
         model_config: Any,
         prefill_manager: Any,
         decode_manager: Any,
+        target_worker_adapter: Any = None,
+        draft_worker: Any = None,
     ) -> tuple[Any, Any]:
         model_runner = self.make_model_runner(model_worker, output_proc)
         request_builder, result_adapter = self.make_adapters(model)
-        scheduler = self.make_scheduler(
+        scheduler_kwargs = dict(
             model_worker=model_worker,
             tree_cache=tree_cache,
             req_to_token_pool=req_to_token_pool,
@@ -468,4 +635,10 @@ class TtsEngineBuilder(SGLangGenerationEngineBuilder):
             request_builder=request_builder,
             result_adapter=result_adapter,
         )
+        if draft_worker is not None:
+            scheduler_kwargs.update(
+                target_worker_adapter=target_worker_adapter,
+                draft_worker=draft_worker,
+            )
+        scheduler = self.make_scheduler(**scheduler_kwargs)
         return scheduler, model_runner

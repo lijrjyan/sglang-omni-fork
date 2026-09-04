@@ -128,12 +128,14 @@ def test_create_sglang_infrastructure_runs_0515_initialization_phases(
     )
 
     server_args = SimpleNamespace(
+        speculative_algorithm=None,
         attention_backend=None,
         decode_attention_backend=None,
         prefill_attention_backend=None,
         sampling_backend=None,
         page_size=1,
         disable_overlap_schedule=False,
+        disable_cuda_graph=False,
         chunked_prefill_size=8,
         max_prefill_tokens=16,
     )
@@ -148,6 +150,149 @@ def test_create_sglang_infrastructure_runs_0515_initialization_phases(
         "get_memory_pool",
     ]
     assert infrastructure[0].model_runner.model is FakeRunner.model
+
+
+def test_speculative_bootstrap_constructs_workers_pools_and_backends_in_order(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeRunner:
+        model = object()
+        model_config = SimpleNamespace(context_len=4096, vocab_size=151936)
+        ps = "parallel-state"
+        dist_port = 23456
+        memory_pool_config = "target-pool-config"
+
+        def alloc_memory_pool(self) -> None:
+            events.append("target_pool")
+
+        def init_attention_backends(self) -> None:
+            events.append("target_backend")
+
+        def init_cuda_graphs(self) -> None:
+            events.append("target_eager_runner")
+
+    class FakeWorker:
+        model_config = FakeRunner.model_config
+        enable_prefill_input_embeds = False
+
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+            events.append("target_worker")
+            self.model_runner = FakeRunner()
+
+        def get_memory_pool(self):
+            events.append("target_get_pool")
+            return "req_pool", "kv_allocator"
+
+    class FakeTargetAdapter:
+        def __init__(self, worker, *, tokenizer) -> None:
+            assert isinstance(worker, FakeWorker)
+            assert tokenizer == "target-tokenizer"
+            events.append("target_adapter")
+
+    class FakeDraftWorker:
+        def __init__(self, **kwargs) -> None:
+            assert kwargs["gpu_id"] == 0
+            assert kwargs["ps"] == "parallel-state"
+            assert kwargs["nccl_port"] == 23456
+            assert isinstance(kwargs["target_worker"], FakeTargetAdapter)
+            events.append("draft_worker")
+
+        def alloc_memory_pool(self, **kwargs) -> None:
+            assert kwargs == {
+                "memory_pool_config": "target-pool-config",
+                "req_to_token_pool": "req_pool",
+                "token_to_kv_pool_allocator": "kv_allocator",
+            }
+            events.append("draft_pool")
+
+        def init_attention_backends(self) -> None:
+            events.append("draft_backend")
+
+        def init_cuda_graphs(self, **kwargs) -> None:
+            assert kwargs == {
+                "capture_draft_decode_graph": False,
+                "capture_draft_extend_graph": False,
+            }
+            events.append("draft_eager_runner")
+
+    fake_algorithm = SimpleNamespace(
+        is_none=lambda: False,
+        create_worker=lambda _server_args: FakeDraftWorker,
+    )
+
+    class FakePrefillManager:
+        def __init__(self, **kwargs) -> None:
+            assert kwargs["spec_algorithm"] is fake_algorithm
+
+        def add_one_request(self, req) -> None:
+            del req
+
+    class FakeDecodeManager:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+    monkeypatch.setattr(
+        bootstrap,
+        "_describe_sglang_runtime_configuration",
+        lambda *_args: "runtime configuration",
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_parse_speculative_algorithm",
+        lambda _args: fake_algorithm,
+    )
+    monkeypatch.setattr(model_worker_module, "ModelWorker", FakeWorker)
+    monkeypatch.setattr(
+        model_worker_module,
+        "SpeculativeTargetWorkerAdapter",
+        FakeTargetAdapter,
+    )
+    monkeypatch.setattr(
+        model_worker_module,
+        "register_speculative_omni_models",
+        lambda architecture: events.append(f"register_models:{architecture}"),
+    )
+    monkeypatch.setattr(sglang_backend, "PrefillManager", FakePrefillManager)
+    monkeypatch.setattr(sglang_backend, "DecodeManager", FakeDecodeManager)
+    monkeypatch.setattr(
+        sglang_backend,
+        "create_tree_cache",
+        lambda *args: ("tree", args),
+    )
+
+    server_args = SimpleNamespace(
+        speculative_algorithm="STANDALONE",
+        speculative_draft_model_path="qwen3-asr-self-draft",
+        attention_backend=None,
+        sampling_backend=None,
+        get_attention_backends=lambda: (None, None),
+        page_size=1,
+        disable_overlap_schedule=True,
+        disable_cuda_graph=True,
+        chunked_prefill_size=-1,
+        max_prefill_tokens=4096,
+    )
+
+    infrastructure = bootstrap.create_sglang_infrastructure(
+        server_args,
+        0,
+        target_tokenizer="target-tokenizer",
+        model_arch_override="Qwen3ASRForConditionalGeneration",
+    )
+
+    assert events.index("draft_worker") < events.index("target_pool")
+    assert "register_models:Qwen3ASRForConditionalGeneration" in events
+    assert events.index("target_pool") < events.index("draft_pool")
+    assert events.index("draft_pool") < events.index("target_backend")
+    assert events.index("target_backend") < events.index("draft_backend")
+    assert events.index("draft_backend") < events.index("target_eager_runner")
+    assert events.index("target_eager_runner") < events.index("draft_eager_runner")
+    assert server_args.disable_cuda_graph is True
+    assert infrastructure[-2].__class__ is FakeTargetAdapter
+    assert infrastructure[-1].__class__ is FakeDraftWorker
 
 
 def test_cuda_graph_init_scopes_prefill_embedding_capture_flag() -> None:
@@ -165,6 +310,46 @@ def test_cuda_graph_init_scopes_prefill_embedding_capture_flag() -> None:
 
     assert capture_values == [True]
     assert model_config.is_multimodal is False
+
+
+def test_speculative_draft_init_can_capture_decode_without_extend() -> None:
+    calls: list[tuple[bool, bool]] = []
+    draft_worker = SimpleNamespace(
+        init_cuda_graphs=lambda **kwargs: calls.append(
+            (
+                kwargs["capture_draft_decode_graph"],
+                kwargs["capture_draft_extend_graph"],
+            )
+        )
+    )
+
+    bootstrap.init_speculative_draft_cuda_graphs(
+        draft_worker,
+        capture_draft_decode_graph=True,
+    )
+
+    assert calls == [(True, False)]
+
+
+def test_speculative_draft_init_installs_eager_runner_when_decode_graph_is_off() -> (
+    None
+):
+    calls: list[tuple[bool, bool]] = []
+    draft_worker = SimpleNamespace(
+        init_cuda_graphs=lambda **kwargs: calls.append(
+            (
+                kwargs["capture_draft_decode_graph"],
+                kwargs["capture_draft_extend_graph"],
+            )
+        )
+    )
+
+    bootstrap.init_speculative_draft_cuda_graphs(
+        draft_worker,
+        capture_draft_decode_graph=False,
+    )
+
+    assert calls == [(False, False)]
 
 
 @pytest.mark.parametrize(
@@ -300,12 +485,14 @@ def test_hidden_capture_is_installed_before_graph_initialization(monkeypatch) ->
         lambda *args: ("tree_cache", args),
     )
     server_args = SimpleNamespace(
+        speculative_algorithm=None,
         attention_backend=None,
         decode_attention_backend=None,
         prefill_attention_backend=None,
         sampling_backend=None,
         page_size=1,
         disable_overlap_schedule=False,
+        disable_cuda_graph=False,
         chunked_prefill_size=8192,
         max_prefill_tokens=16384,
         context_length=32768,

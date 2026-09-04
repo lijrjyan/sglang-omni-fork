@@ -33,6 +33,10 @@ def create_sglang_qwen3_asr_executor(
     pre_lm_cache_size_bytes: int = 2 * 1024**3,
     pre_lm_max_batch_size: int = 8,
     pre_lm_max_batch_wait_ms: int = 0,
+    enable_speculative: bool = False,
+    speculative_draft_model_path: str | None = None,
+    speculative_num_steps: int = 3,
+    speculative_num_draft_tokens: int = 4,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     from sglang_omni.models.qwen3_asr.engine_builder import Qwen3ASREngineBuilder
@@ -63,6 +67,10 @@ def create_sglang_qwen3_asr_executor(
         pre_lm_cache_size_bytes=pre_lm_cache_size_bytes,
         pre_lm_max_batch_size=pre_lm_max_batch_size,
         pre_lm_max_batch_wait_ms=pre_lm_max_batch_wait_ms,
+        enable_speculative=enable_speculative,
+        speculative_draft_model_path=speculative_draft_model_path,
+        speculative_num_steps=speculative_num_steps,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
     ).build(
         model_path,
         device=device,

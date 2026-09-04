@@ -5,7 +5,6 @@ from typing import List, Optional
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import PrefillAdder
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +20,7 @@ class PrefillManager:
         tree_cache,
         model_config,
         enable_overlap,
+        spec_algorithm,
     ):
         self.page_size = page_size
         self.chunked_prefill_size = chunked_prefill_size
@@ -30,6 +30,7 @@ class PrefillManager:
         self.tree_cache = tree_cache
         self.model_config = model_config
         self.enable_overlap = enable_overlap
+        self.spec_algorithm = spec_algorithm
 
         self.waiting_queue = []
 
@@ -93,14 +94,13 @@ class PrefillManager:
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-
             if len(adder.can_run_list) >= num_allocatable_reqs:
                 if running_batch is not None:
                     running_batch.batch_is_full = True
                 break
 
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(
+            adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 # NOTE(ocss8884): not support deterministic infer for now
@@ -139,7 +139,7 @@ class PrefillManager:
             tree_cache=self.tree_cache,
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
+            spec_algorithm=self.spec_algorithm,
             chunked_req=self.chunked_req,
         )
         new_batch.prepare_for_extend()

@@ -23,6 +23,122 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_SPECULATIVE_OMNI_MODELS = (
+    "Qwen3ASRForConditionalGeneration",
+    "WhisperForConditionalGeneration",
+)
+
+
+def register_speculative_omni_models(model_architecture: str) -> None:
+    """Register the selected Omni architecture for native draft loading."""
+    from sglang.srt.models.registry import ModelRegistry
+
+    if model_architecture == "Qwen3ASRForConditionalGeneration":
+        from sglang_omni.models.qwen3_asr.sglang_model import (
+            Qwen3ASRForConditionalGeneration,
+        )
+
+        model_class = Qwen3ASRForConditionalGeneration
+    elif model_architecture == "WhisperForConditionalGeneration":
+        from sglang_omni.models.whisper_asr.sglang_model import (
+            WhisperForConditionalGeneration,
+        )
+
+        model_class = WhisperForConditionalGeneration
+    else:
+        supported = ", ".join(sorted(_SPECULATIVE_OMNI_MODELS))
+        raise ValueError(
+            "STANDALONE speculative decoding is only wired for Omni model "
+            f"architectures {supported}; got {model_architecture!r}"
+        )
+    ModelRegistry.models[model_architecture] = model_class
+
+
+class SpeculativeTargetWorkerAdapter:
+    """Present Omni's target worker through native TpModelWorker semantics."""
+
+    def __init__(self, worker: ModelWorker, *, tokenizer: Any) -> None:
+        if tokenizer is None:
+            raise ValueError(
+                "STANDALONE speculative decoding requires the target tokenizer "
+                "during worker bootstrap"
+            )
+        self.worker = worker
+        self.server_args = worker.server_args
+        self.model_runner = worker.model_runner
+        self.model_config = worker.model_config
+        self.device = worker.device
+        self.gpu_id = worker.gpu_id
+        self.tokenizer = tokenizer
+
+    def forward_batch_generation(
+        self,
+        batch,
+        forward_batch=None,
+        pp_proxy_tensors=None,
+        is_verify: bool = False,
+        skip_attn_backend_init: bool | None = None,
+        *,
+        capture_hidden_mode=None,
+    ):
+        """Run native target prefill or verify on Omni's target runner."""
+        import torch
+        from sglang.srt.managers.utils import GenerationBatchResult
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+        if batch is not None:
+            forward_batch = ForwardBatch.init_new(
+                batch,
+                self.model_runner,
+                capture_hidden_mode=capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+            )
+        else:
+            if forward_batch is None:
+                raise ValueError("forward_batch is required when batch is None")
+            if capture_hidden_mode is not None:
+                raise ValueError(
+                    "capture_hidden_mode override requires a ScheduleBatch input"
+                )
+
+        forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+        out = self.model_runner.forward(
+            forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        logits_output = out.logits_output
+        batch_result = GenerationBatchResult(
+            logits_output=logits_output,
+            can_run_cuda_graph=out.can_run_graph,
+            expert_distribution_metrics=out.expert_distribution_metrics,
+            routed_experts_output=out.routed_experts_output,
+            indexer_topk_output=out.indexer_topk_output,
+        )
+        if is_verify:
+            return batch_result
+
+        if not forward_batch.is_prefill_only:
+            batch_result.next_token_ids = self.model_runner.sample(
+                logits_output,
+                forward_batch,
+            )
+        else:
+            batch_result.next_token_ids = torch.zeros(
+                len(forward_batch.seq_lens),
+                dtype=torch.long,
+                device=forward_batch.input_ids.device,
+            )
+            if (
+                forward_batch.return_logprob
+                and logits_output.next_token_logits is not None
+            ):
+                self.model_runner.compute_logprobs_only(
+                    logits_output,
+                    forward_batch,
+                )
+        return batch_result
+
+
 @dataclass
 class ModelWorkerConfig:
     model_arch_override: str | None = None

@@ -36,6 +36,14 @@ class FakeExecutionBridge:
 class FakeServerArgs(SimpleNamespace):
     """ServerArgs double exposing the 0.5.16 override() mutation entry point."""
 
+    def __init__(self, **fields: object) -> None:
+        fields.setdefault("speculative_algorithm", None)
+        fields.setdefault("speculative_draft_model_path", None)
+        fields.setdefault("speculative_num_steps", 3)
+        fields.setdefault("speculative_eagle_topk", 1)
+        fields.setdefault("speculative_num_draft_tokens", 4)
+        super().__init__(**fields)
+
     def override(self, source: str, **fields: object) -> None:
         del source
         for name, value in fields.items():

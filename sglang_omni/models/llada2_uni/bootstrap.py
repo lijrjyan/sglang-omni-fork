@@ -47,6 +47,7 @@ def create_dllm_thinker_scheduler(
         _,
         _,
         model_config,
+        *_spec_workers,
     ) = create_sglang_infrastructure(
         server_args,
         gpu_id,

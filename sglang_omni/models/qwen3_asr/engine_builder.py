@@ -59,6 +59,10 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         pre_lm_cache_size_bytes: int = 2 * 1024**3,
         pre_lm_max_batch_size: int = 8,
         pre_lm_max_batch_wait_ms: int = 0,
+        enable_speculative: bool = False,
+        speculative_draft_model_path: str | None = None,
+        speculative_num_steps: int = 3,
+        speculative_num_draft_tokens: int = 4,
     ) -> None:
         if pre_lm_max_batch_size < 1:
             raise ValueError(
@@ -93,6 +97,10 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         self.pre_lm_cache_size_bytes = pre_lm_cache_size_bytes
         self.pre_lm_max_batch_size = pre_lm_max_batch_size
         self.pre_lm_max_batch_wait_ms = pre_lm_max_batch_wait_ms
+        self.enable_speculative = enable_speculative
+        self.speculative_draft_model_path = speculative_draft_model_path
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.tokenizer: Any = None
         self.feature_extractor: Any = None
         self.context_length = 0
@@ -171,6 +179,13 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         self._log_memory_checkpoint("post_static_allocation")
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
+        if (
+            overrides.get("speculative_algorithm") is not None
+            and self.enable_async_decode
+        ):
+            raise ValueError(
+                "STANDALONE speculative decoding requires enable_async_decode=False"
+            )
         if "context_length" in overrides:
             self.context_length = int(overrides.pop("context_length"))
         if overrides.get("cuda_graph_backend_prefill") == CudaGraphBackend.DISABLED:

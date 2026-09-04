@@ -60,8 +60,183 @@ def test_whisper_stage_defaults() -> None:
         signature.parameters["prefill_coalesce_after_builds_during_decode"].default
         is False
     )
+    assert signature.parameters["enable_speculative"].default is False
+    assert signature.parameters["speculative_draft_model_path"].default is None
+    assert signature.parameters["speculative_num_steps"].default == 3
+    assert signature.parameters["speculative_num_draft_tokens"].default == 4
+    assert signature.parameters["speculative_cuda_graph"].default is False
+    assert signature.parameters["speculative_draft_cuda_graph"].default is False
     assert signature.parameters["enable_pre_lm_encoder"].default is True
     assert signature.parameters["pre_lm_max_batch_size"].default == 8
+
+
+def test_whisper_stage_forwards_first_class_speculative_args(monkeypatch) -> None:
+    from sglang_omni.models.whisper_asr import engine_builder as whisper_builder
+
+    seen: dict[str, object] = {}
+
+    class FakeBuilder:
+        def __init__(self, **kwargs) -> None:
+            seen["builder"] = kwargs
+
+        def build(self, model_path, **kwargs):
+            seen["build"] = {"model_path": model_path, **kwargs}
+            return "executor"
+
+    monkeypatch.setattr(whisper_builder, "WhisperASREngineBuilder", FakeBuilder)
+
+    result = whisper_asr_stages.create_sglang_whisper_asr_executor(
+        "/models/whisper-large-v3",
+        enable_speculative=True,
+        speculative_draft_model_path="/models/distil-whisper-large-v3",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        speculative_cuda_graph=True,
+        speculative_draft_cuda_graph=True,
+        server_args_overrides={"max_running_requests": 2},
+    )
+
+    assert result == "executor"
+    builder_args = seen["builder"]
+    assert builder_args["enable_speculative"] is True
+    assert (
+        builder_args["speculative_draft_model_path"]
+        == "/models/distil-whisper-large-v3"
+    )
+    assert builder_args["speculative_num_steps"] == 3
+    assert builder_args["speculative_num_draft_tokens"] == 4
+    assert builder_args["speculative_cuda_graph"] is True
+    assert builder_args["speculative_draft_cuda_graph"] is True
+    assert seen["build"]["server_args_overrides"] == {"max_running_requests": 2}
+
+
+def test_whisper_speculative_requires_p3_unless_probe_env_is_set(monkeypatch) -> None:
+    from transformers import AutoConfig
+
+    from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
+
+    builder = WhisperASREngineBuilder(
+        max_running_requests=4,
+        max_new_tokens=32,
+        mem_fraction_static=0.2,
+        enable_speculative=True,
+        speculative_draft_model_path="/models/distil-whisper-large-v3",
+    )
+    overrides = {
+        "speculative_algorithm": "STANDALONE",
+        "speculative_draft_model_path": "/models/distil-whisper-large-v3",
+        "speculative_num_steps": 3,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 4,
+    }
+    config = SimpleNamespace(
+        architectures=["WhisperForConditionalGeneration"],
+        d_model=1280,
+        vocab_size=51866,
+        num_mel_bins=128,
+        max_source_positions=1500,
+    )
+    builder._target_hf_config = config
+    builder.decoder_context_len = 448
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda _path: config)
+
+    monkeypatch.delenv("SGLANG_OMNI_SPEC_ALLOW_ENCDEC", raising=False)
+    with pytest.raises(RuntimeError, match=r"requires .* \(P3\)"):
+        builder.adjust_overrides(dict(overrides))
+
+    monkeypatch.setenv("SGLANG_OMNI_SPEC_ALLOW_ENCDEC", "1")
+    allowed = dict(overrides)
+    builder.adjust_overrides(allowed)
+    assert allowed["speculative_algorithm"] == "STANDALONE"
+
+
+def test_whisper_speculative_config_requires_compatible_draft() -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import (
+        _validate_whisper_speculative_configs,
+    )
+
+    target = SimpleNamespace(
+        architectures=["WhisperForConditionalGeneration"],
+        d_model=1280,
+        vocab_size=51866,
+        num_mel_bins=128,
+        max_source_positions=1500,
+    )
+    draft = SimpleNamespace(**vars(target))
+
+    _validate_whisper_speculative_configs(
+        target,
+        draft,
+        num_draft_tokens=4,
+        decoder_context_len=448,
+    )
+
+    draft.architectures = ["LlamaForCausalLM"]
+    with pytest.raises(ValueError, match="Whisper architecture"):
+        _validate_whisper_speculative_configs(
+            target,
+            draft,
+            num_draft_tokens=4,
+            decoder_context_len=448,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "draft_value"),
+    [
+        ("d_model", 1024),
+        ("vocab_size", 51865),
+        ("num_mel_bins", 80),
+        ("max_source_positions", 1024),
+    ],
+)
+def test_whisper_speculative_config_rejects_target_draft_mismatch(
+    field: str,
+    draft_value: int,
+) -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import (
+        _validate_whisper_speculative_configs,
+    )
+
+    target = SimpleNamespace(
+        architectures=["WhisperForConditionalGeneration"],
+        d_model=1280,
+        vocab_size=51866,
+        num_mel_bins=128,
+        max_source_positions=1500,
+    )
+    draft = SimpleNamespace(**vars(target))
+    setattr(draft, field, draft_value)
+
+    with pytest.raises(ValueError, match=field):
+        _validate_whisper_speculative_configs(
+            target,
+            draft,
+            num_draft_tokens=4,
+            decoder_context_len=448,
+        )
+
+
+def test_whisper_speculative_config_rejects_draft_window_over_budget() -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import (
+        _validate_whisper_speculative_configs,
+    )
+
+    config = SimpleNamespace(
+        architectures=["WhisperForConditionalGeneration"],
+        d_model=1280,
+        vocab_size=51866,
+        num_mel_bins=128,
+        max_source_positions=1500,
+    )
+
+    with pytest.raises(ValueError, match="decoder budget"):
+        _validate_whisper_speculative_configs(
+            config,
+            config,
+            num_draft_tokens=449,
+            decoder_context_len=448,
+        )
 
 
 def test_whisper_encoder_cuda_graph_setup_is_ordered_after_generation_graphs() -> None:
@@ -428,3 +603,22 @@ def test_whisper_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
     assert build_kwargs["max_prefill_tokens"] == 6144
     assert scheduler_kwargs["enable_async_decode"] is False
     assert scheduler_kwargs["async_decode_min_batch_size"] == 4
+
+
+def test_whisper_speculative_turns_off_async_decode_default() -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
+
+    builder = WhisperASREngineBuilder(
+        max_running_requests=4,
+        max_new_tokens=32,
+        mem_fraction_static=0.2,
+        enable_speculative=True,
+        speculative_draft_model_path="/models/distil-whisper-large-v3",
+    )
+    assert builder.enable_async_decode is False
+    assert builder.extra_scheduler_kwargs()["enable_async_decode"] is False
+
+    plain = WhisperASREngineBuilder(
+        max_running_requests=4, max_new_tokens=32, mem_fraction_static=0.2
+    )
+    assert plain.enable_async_decode is True
