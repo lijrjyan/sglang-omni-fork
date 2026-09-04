@@ -33,6 +33,7 @@ def test_speech_generation_error_keeps_other_failures_as_500() -> None:
         "Request requires more tokens than the thinker KV cache can hold",
         "Request req-1 exceeds the maximum number of tokens: 8193 > 8192",
         "Request req-1 requires too many SWA KV tokens for decode preallocation",
+        "Whisper speculative decoding does not support segment_timestamps; use a non-speculative stage",
     ],
 )
 def test_speech_generation_error_maps_context_rejection_to_400(

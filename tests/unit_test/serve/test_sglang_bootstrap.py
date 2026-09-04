@@ -114,6 +114,7 @@ def test_create_sglang_infrastructure_runs_0515_initialization_phases(
     )
 
     server_args = SimpleNamespace(
+        speculative_algorithm=None,
         attention_backend=None,
         decode_attention_backend=None,
         prefill_attention_backend=None,
@@ -136,6 +137,105 @@ def test_create_sglang_infrastructure_runs_0515_initialization_phases(
     assert infrastructure[0].model_runner.model is FakeRunner.model
 
 
+def test_speculative_bootstrap_shares_pools_before_initializing_backends(monkeypatch):
+    events = []
+    runner = SimpleNamespace(
+        ps="parallel-state",
+        dist_port=12345,
+        memory_pool_config="pool-config",
+        spec_aux_config=SimpleNamespace(eagle_draft_num_layers=36),
+        alloc_memory_pool=lambda: events.append("target-pools"),
+        init_attention_backends=lambda: events.append("target-attention"),
+    )
+    worker = SimpleNamespace(
+        model_runner=runner,
+        model_config="model-config",
+        get_memory_pool=lambda: ("req-pool", "kv-pool"),
+    )
+    adapter = object()
+
+    def draft_pools(**kwargs):
+        assert kwargs == dict(
+            memory_pool_config="pool-config",
+            req_to_token_pool="req-pool",
+            token_to_kv_pool_allocator="kv-pool",
+        )
+        events.append("draft-pools")
+
+    draft = SimpleNamespace(
+        draft_worker=SimpleNamespace(
+            draft_runner=SimpleNamespace(
+                layer_info=SimpleNamespace(num_effective_layers=4)
+            )
+        ),
+        alloc_memory_pool=draft_pools,
+        init_attention_backends=lambda: events.append("draft-attention"),
+    )
+
+    def create_draft(**kwargs):
+        assert kwargs["target_worker"] is adapter
+        events.append("draft-load")
+        return draft
+
+    algorithm = SimpleNamespace(
+        is_none=lambda: False, create_worker=lambda args: create_draft
+    )
+    monkeypatch.setattr(
+        bootstrap, "_parse_speculative_algorithm", lambda args: algorithm
+    )
+    monkeypatch.setattr(
+        bootstrap, "_describe_sglang_runtime_configuration", lambda *args: "test"
+    )
+    monkeypatch.setattr(model_worker_module, "ModelWorker", lambda **kwargs: worker)
+    monkeypatch.setattr(
+        model_worker_module,
+        "SpeculativeTargetWorkerAdapter",
+        lambda *args, **kwargs: adapter,
+    )
+    monkeypatch.setattr(
+        model_worker_module, "register_speculative_omni_models", lambda arch: None
+    )
+    monkeypatch.setattr(sglang_backend, "create_tree_cache", lambda *args: "tree")
+    monkeypatch.setattr(
+        bootstrap,
+        "init_sglang_cuda_graphs",
+        lambda worker: events.append("target-graphs"),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "init_speculative_draft_cuda_graphs",
+        lambda worker, **kwargs: events.append("draft-graphs"),
+    )
+    args = SimpleNamespace(
+        disable_overlap_schedule=True, page_size=1, speculative_draft_model_path="draft"
+    )
+    result = bootstrap.create_sglang_infrastructure(
+        args,
+        0,
+        model_arch_override="WhisperForConditionalGeneration",
+        target_tokenizer=object(),
+    )
+    assert result == (
+        worker,
+        "tree",
+        "req-pool",
+        "kv-pool",
+        "model-config",
+        adapter,
+        draft,
+    )
+    assert runner.spec_aux_config.eagle_draft_num_layers == 4
+    assert events == [
+        "draft-load",
+        "target-pools",
+        "draft-pools",
+        "target-attention",
+        "draft-attention",
+        "target-graphs",
+        "draft-graphs",
+    ]
+
+
 def test_an_engine_is_refused_in_a_process_with_a_published_context(
     monkeypatch,
 ) -> None:
@@ -154,6 +254,7 @@ def test_an_engine_is_refused_in_a_process_with_a_published_context(
     )
     monkeypatch.setattr(model_worker_module, "ModelWorker", constructed)
     server_args = SimpleNamespace(
+        speculative_algorithm=None,
         attention_backend=None,
         decode_attention_backend=None,
         prefill_attention_backend=None,
@@ -183,6 +284,7 @@ def test_a_construction_that_failed_after_publishing_is_not_retried(
     )
     monkeypatch.setattr(model_worker_module, "ModelWorker", publish_then_fail)
     server_args = SimpleNamespace(
+        speculative_algorithm=None,
         attention_backend=None,
         decode_attention_backend=None,
         prefill_attention_backend=None,
@@ -345,6 +447,7 @@ def test_hidden_capture_is_installed_before_graph_initialization(monkeypatch) ->
         lambda *args: ("tree_cache", args),
     )
     server_args = SimpleNamespace(
+        speculative_algorithm=None,
         attention_backend=None,
         decode_attention_backend=None,
         prefill_attention_backend=None,
@@ -486,6 +589,7 @@ def test_create_sglang_infrastructure_consumes_scoped_kv_budget(
     )
 
     server_args = SimpleNamespace(
+        speculative_algorithm=None,
         attention_backend=None,
         decode_attention_backend=None,
         prefill_attention_backend=None,

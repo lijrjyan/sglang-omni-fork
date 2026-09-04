@@ -68,7 +68,9 @@ class _FakeTokenizer:
         return [_SOT_PREV] + [1000 + i for i in range(len(text))]
 
 
-def _make_request_builder(tokenizer: _FakeTokenizer | None = None):
+def _make_request_builder(
+    tokenizer: _FakeTokenizer | None = None, *, enable_speculative: bool = False
+):
     fake_processor = SimpleNamespace(
         feature_extractor=lambda audio, *, sampling_rate, return_tensors: (
             SimpleNamespace(input_features=torch.zeros((1, 128, 3000)))
@@ -80,6 +82,7 @@ def _make_request_builder(tokenizer: _FakeTokenizer | None = None):
         generation_config=_generation_config(),
         encoder_token_count=_ENCODER_TOKEN_COUNT,
         max_new_tokens=32,
+        enable_speculative=enable_speculative,
     )
     return request_builder
 
@@ -101,6 +104,16 @@ def _build(monkeypatch, params: dict | None = None):
         lambda source, **kwargs: np.zeros(1600, dtype=np.float32),
     )
     return _make_request_builder()(_make_payload(params))
+
+
+def test_speculative_rejects_timestamps_before_audio_preparation(monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("unsupported request reached audio preparation")
+
+    monkeypatch.setattr(whisper_request_builders, "prepare_audio", unexpected)
+    builder = _make_request_builder(enable_speculative=True)
+    with pytest.raises(ValueError, match="does not support segment_timestamps"):
+        builder(_make_payload({"segment_timestamps": True}))
 
 
 def test_request_builder_rejects_audio_past_the_mel_window(monkeypatch) -> None:

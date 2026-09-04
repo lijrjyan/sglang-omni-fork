@@ -17,6 +17,7 @@ _BAD_REQUEST_MARKERS = (
     "sequence exceeds max_length",
     "multimodal_train_inputs",
     "disallowed special token",
+    "Whisper speculative decoding does not support segment_timestamps",
 )
 _BAD_REQUEST_PATTERNS = (
     re.compile(r"^Request\s+\S+\s+exceeds the maximum number of tokens:"),

@@ -35,6 +35,159 @@ def test_asr_engine_builder_preserves_model_path() -> None:
     assert AsrEngineBuilder.resolve_checkpoint(object(), "repo/id") == "repo/id"
 
 
+@pytest.mark.parametrize("algorithm", ["EAGLE", "EAGLE3", "NGRAM", "DFLASH"])
+def test_speculative_overrides_reject_non_standalone_algorithms(algorithm: str) -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    with pytest.raises(ValueError, match="only supports STANDALONE"):
+        configure_speculative_overrides(
+            {"speculative_algorithm": algorithm},
+            enable_speculative=False,
+            speculative_draft_model_path=None,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+
+
+def test_speculative_overrides_require_draft_model_path() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    with pytest.raises(ValueError, match="speculative_draft_model_path is required"):
+        configure_speculative_overrides(
+            {"speculative_algorithm": "STANDALONE"},
+            enable_speculative=False,
+            speculative_draft_model_path=None,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+
+
+def test_speculative_overrides_require_topk_one() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    with pytest.raises(ValueError, match="speculative_eagle_topk must be 1"):
+        configure_speculative_overrides(
+            {
+                "speculative_algorithm": "STANDALONE",
+                "speculative_draft_model_path": "/models/draft",
+                "speculative_eagle_topk": 2,
+            },
+            enable_speculative=False,
+            speculative_draft_model_path=None,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+
+
+def test_first_class_speculative_args_populate_eager_server_overrides() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    overrides = configure_speculative_overrides(
+        {"max_running_requests": 8, "disable_cuda_graph": False},
+        enable_speculative=True,
+        speculative_draft_model_path="/models/distil-whisper-large-v3",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+    )
+
+    assert overrides == {
+        "max_running_requests": 8,
+        "disable_cuda_graph": True,
+        "disable_overlap_schedule": True,
+        "speculative_algorithm": "STANDALONE",
+        "speculative_draft_model_path": "/models/distil-whisper-large-v3",
+        "speculative_num_steps": 3,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 4,
+    }
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_speculative_nested_prefill_graph_is_disabled_without_mutating_input(enabled):
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    graph_config = {
+        "prefill": {"backend": "breakable", "max_bs": 8},
+        "decode": {"backend": "full", "max_bs": 4},
+    }
+    result = configure_speculative_overrides(
+        {"cuda_graph_config": graph_config, "cuda_graph_backend_decode": "full"},
+        enable_speculative=True,
+        speculative_draft_model_path="/models/distil-whisper-large-v3",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        speculative_cuda_graph=enabled,
+    )
+    assert result["cuda_graph_config"]["prefill"] == {"backend": "disabled"}
+    assert graph_config["prefill"] == {"backend": "breakable", "max_bs": 8}
+    assert graph_config["decode"] == {"backend": "full", "max_bs": 4}
+    expected = "full" if enabled else "disabled"
+    assert result["cuda_graph_config"]["decode"] == {"backend": expected, "max_bs": 4}
+    assert result["cuda_graph_backend_decode"] == expected
+
+
+@pytest.mark.parametrize(
+    "architecture", [None, "Qwen3ASRForConditionalGeneration", "Qwen3ForCausalLM"]
+)
+def test_speculative_registry_rejects_non_whisper(architecture):
+    from sglang_omni.model_runner.model_worker import register_speculative_omni_models
+
+    with pytest.raises(ValueError, match="only supported for Whisper"):
+        register_speculative_omni_models(architecture)
+
+
+def test_speculative_target_cuda_graph_opt_in_enables_generation_graphs() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    overrides = configure_speculative_overrides(
+        {"max_running_requests": 8, "disable_cuda_graph": True},
+        enable_speculative=True,
+        speculative_draft_model_path="/models/distil-whisper-large-v3",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        speculative_cuda_graph=True,
+    )
+
+    assert overrides["disable_cuda_graph"] is False
+    assert overrides["disable_overlap_schedule"] is True
+
+
+def test_speculative_draft_cuda_graph_requires_target_graphs() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    with pytest.raises(ValueError, match="requires speculative_cuda_graph=True"):
+        configure_speculative_overrides(
+            {
+                "speculative_algorithm": "STANDALONE",
+                "speculative_draft_model_path": "/draft",
+            },
+            enable_speculative=False,
+            speculative_draft_model_path=None,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_cuda_graph=False,
+            speculative_draft_cuda_graph=True,
+        )
+
+
+def test_speculative_overrides_require_topk_one_chain_invariant() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    with pytest.raises(ValueError, match=r"num_steps \+ 1"):
+        configure_speculative_overrides(
+            {
+                "speculative_algorithm": "STANDALONE",
+                "speculative_draft_model_path": "/models/draft",
+                "speculative_num_steps": 3,
+                "speculative_num_draft_tokens": 5,
+            },
+            enable_speculative=False,
+            speculative_draft_model_path=None,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+
+
 def test_legacy_tts_engine_factory_paths_remain_importable() -> None:
     module_names = (
         "sglang_omni.models.moss_tts.stages",

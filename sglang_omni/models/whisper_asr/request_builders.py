@@ -155,6 +155,7 @@ def make_whisper_scheduler_adapters(
     max_new_tokens: int,
     decoder_context_len: int | None = None,
     audio_encoder_service: Any | None = None,
+    enable_speculative: bool = False,
 ) -> tuple[
     Callable[[StagePayload], WhisperASRRequestData], Callable[[Any], StagePayload]
 ]:
@@ -193,6 +194,11 @@ def make_whisper_scheduler_adapters(
 
     def request_builder(payload: StagePayload) -> WhisperASRRequestData:
         params = payload.request.params or {}
+        if enable_speculative and params.get("segment_timestamps"):
+            raise ValueError(
+                "Whisper speculative decoding does not support segment_timestamps; "
+                "use a non-speculative Whisper stage for timestamped transcription"
+            )
         prepared = prepare_audio(
             payload,
             source_name="Whisper ASR",

@@ -64,6 +64,50 @@ sgl-omni serve \
   --port 8000
 ```
 
+## Speculative Decoding (Experimental)
+
+This opt-in path supports **Whisper only**, using native synchronous STANDALONE
+decoding with a compatible Whisper draft. Other model pipelines retain their
+normal decoding path. Stock SGLang 0.5.18 needs the companion
+[encoder-decoder patch](../../patches/sglang-0.5.18-whisper-speculative.patch).
+Apply it to the `v0.5.18` source checkout in an environment with the matching
+SGLang dependencies; the Omni package does not patch installed packages:
+
+```bash
+git -C /path/to/sglang apply --check /path/to/sglang-omni/patches/sglang-0.5.18-whisper-speculative.patch
+git -C /path/to/sglang apply /path/to/sglang-omni/patches/sglang-0.5.18-whisper-speculative.patch
+python -m pip install --no-deps -e /path/to/sglang/python
+hf download distil-whisper/distil-large-v3
+
+sgl-omni serve --model-path openai/whisper-large-v3 \
+  --asr.factory.enable_speculative true \
+  --asr.factory.speculative_draft_model_path distil-whisper/distil-large-v3 \
+  --port 8000
+```
+
+Defaults are three draft steps, four verification tokens, and eager speculative
+execution. `speculative_num_draft_tokens` must equal `speculative_num_steps + 1`;
+top-k is fixed to one. To capture target verification and draft decode graphs,
+set both `asr.factory.speculative_cuda_graph` and
+`asr.factory.speculative_draft_cuda_graph` to `true`. Draft extension remains
+eager. The speculative graph flags take precedence over generic graph backend
+overrides; async decode and overlap scheduling are disabled in this path.
+
+The default pre-LM encoder output is reused by both decoders. For encoder-in-prefill
+execution, `speculative_share_encoder` shares target encoder states with the draft;
+only enable sharing for drafts with identical encoder weights, such as
+`distil-large-v3`. Independently trained encoders require both
+`enable_pre_lm_encoder: false` and `speculative_share_encoder: false`; turning off
+sharing alone does not disable reuse of pre-LM encoder states.
+
+Limitations: timestamped requests (`srt`, `vtt`, or internal `segment_timestamps`)
+are rejected because native speculative verification bypasses the timestamp logit
+processor. Use a non-speculative stage for them. Two speculative windows are
+reserved from the decoder position budget, reducing the maximum combined prompt
+and output length (440 positions with the default four-token window). Draft
+positional capacity must cover the target. Validation covers large-v3/distil-large-v3;
+it does not establish accuracy for other checkpoints or a throughput improvement.
+
 ## Transcribe Audio
 
 ```bash
