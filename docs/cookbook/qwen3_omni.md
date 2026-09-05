@@ -110,3 +110,54 @@ Standard sampling parameters apply to the thinker stage. When `modalities` inclu
 - **`content` must be `""` when the query is entirely in `audios`, `videos`, or `images`.** Leaving a text query in `content` alongside audio causes the model to process both, which is usually not what you want.
 - **Colocated topology does not support `--thinker.tp_size 2`.** The server raises a `ValueError` at startup ("Qwen Phase 1 colocation does not support thinker TP"). Use disaggregated topology for TP=2.
 - **Requests that exceed the model's context length are rejected with an error.** The preprocessor raises a `ValueError` when the prompt token count alone meets or exceeds `max_seq_len`, or when `prompt tokens + max_new_tokens ≥ max_seq_len`. Reduce input length or lower `max_tokens` to stay within the limit.
+
+## Speculative Decoding (text-only thinker)
+
+The text-only thinker can run SGLang's native EAGLE3 or DFlash draft workers
+(`sglang.srt.speculative`) without any patch to SGLang. Omni owns the draft
+configuration, worker bootstrap, the synchronous scheduler lane, and the
+Qwen3-Omni prefill hook that hands the composed audio/image embeddings to the
+draft-extend step; SGLang owns drafting, verification, and graph replay.
+
+Public drafts trained on target-regenerated ASR labels:
+
+| Draft | Algorithm | Serve with |
+|---|---|---|
+| `yuekai/qwen3_omni_30b_a3b_instruct_eagle3_audio` | EAGLE3 | `speculative_num_steps: 3`, `speculative_num_draft_tokens: 4` |
+| `yuekai/qwen3_omni_30b_a3b_instruct_dflash_block8` | DFLASH | `speculative_num_draft_tokens: 8` (the draft's block size) |
+
+```yaml
+config_cls: Qwen3OmniPipelineConfig
+model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+stages:
+  thinker:
+    engine:
+      max_running_requests: 8
+    factory:
+      enable_speculative: true
+      speculative_algorithm: EAGLE3
+      speculative_draft_model_path: yuekai/qwen3_omni_30b_a3b_instruct_eagle3_audio
+      speculative_num_steps: 3
+      speculative_num_draft_tokens: 4
+      speculative_cuda_graph: true
+```
+
+```bash
+sgl-omni serve --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct --config spec.yaml --text-only
+```
+
+Constraints:
+
+- Text-only pipeline only (`--text-only`); the speech pipeline's talker stays
+  non-speculative.
+- The thinker runs the synchronous lane: async decode, prefill admission
+  coalescing, mixed prefill/decode chunks, and prefill CUDA graphs are turned
+  off. `speculative_cuda_graph: true` captures the target verify graph and the
+  draft decode / draft-extend graphs (stock SGLang captures both draft graphs
+  whenever the decode graph backend is enabled).
+- `speculative_eagle_topk` is fixed at 1; EAGLE3 requires
+  `speculative_num_draft_tokens == speculative_num_steps + 1`.
+- Visual deepstack prefills (image/video input) are not supported in the
+  speculative lane; audio and text input are.
+- ASR drafts are prompt- and domain-sensitive: accept length is measured with
+  the draft's training prompt (`Transcribe the English audio into text.`).

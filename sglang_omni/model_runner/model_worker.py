@@ -25,20 +25,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def register_speculative_omni_models(model_architecture: str) -> None:
-    """Register Whisper for native speculative draft loading."""
-    from sglang.srt.models.registry import ModelRegistry
+# Target architectures admitted to Omni's native speculative lane. A value
+# names the Omni model class the *draft* loader must resolve through SGLang's
+# registry (STANDALONE drafts share the target architecture); ``None`` means
+# the draft is a native SGLang architecture and nothing needs registering.
+_SPECULATIVE_TARGET_ARCHITECTURES: dict[str, str | None] = {
+    "WhisperForConditionalGeneration": (
+        "sglang_omni.models.whisper_asr.sglang_model:WhisperForConditionalGeneration"
+    ),
+    # EAGLE3 / DFlash drafts (LlamaForCausalLMEagle3, DFlashDraftModel) are
+    # stock SGLang models; the thinker itself resolves through SGLModelRunner.
+    "Qwen3OmniThinkerForCausalLM": None,
+}
 
-    if model_architecture != "WhisperForConditionalGeneration":
+
+def register_speculative_omni_models(model_architecture: str) -> None:
+    """Admit a target architecture and register its Omni draft class if any."""
+    if model_architecture not in _SPECULATIVE_TARGET_ARCHITECTURES:
         raise ValueError(
-            "Omni speculative decoding is only supported for Whisper; "
+            "Omni speculative decoding supports target architectures "
+            f"{sorted(_SPECULATIVE_TARGET_ARCHITECTURES)}; "
             f"got {model_architecture!r}"
         )
-    from sglang_omni.models.whisper_asr.sglang_model import (
-        WhisperForConditionalGeneration,
-    )
+    class_path = _SPECULATIVE_TARGET_ARCHITECTURES[model_architecture]
+    if class_path is None:
+        return
+    from importlib import import_module
 
-    ModelRegistry.models[model_architecture] = WhisperForConditionalGeneration
+    from sglang.srt.models.registry import ModelRegistry
+
+    module_name, class_name = class_path.split(":")
+    ModelRegistry.models[model_architecture] = getattr(
+        import_module(module_name), class_name
+    )
 
 
 class SpeculativeTargetWorkerAdapter:
@@ -47,7 +66,7 @@ class SpeculativeTargetWorkerAdapter:
     def __init__(self, worker: ModelWorker, *, tokenizer: Any) -> None:
         if tokenizer is None:
             raise ValueError(
-                "STANDALONE speculative decoding requires the target tokenizer "
+                "Omni speculative decoding requires the target tokenizer "
                 "during worker bootstrap"
             )
         self.worker = worker
@@ -57,6 +76,69 @@ class SpeculativeTargetWorkerAdapter:
         self.device = worker.device
         self.gpu_id = worker.gpu_id
         self.tokenizer = tokenizer
+        # Optional Omni model runner whose prefill hooks compose the
+        # multimodal input embeddings (e.g. the Qwen3-Omni thinker splices
+        # audio-encoder rows over placeholder tokens).
+        self.omni_model_runner: Any = None
+
+    def bind_omni_model_runner(self, model_runner: Any) -> None:
+        """Route target prefill through an Omni runner's prefill hooks."""
+        if self.omni_model_runner is not None and self.omni_model_runner is not (
+            model_runner
+        ):
+            raise RuntimeError(
+                "SpeculativeTargetWorkerAdapter already has an Omni model runner"
+            )
+        self.omni_model_runner = model_runner
+
+    @staticmethod
+    def _omni_requests(batch: Any) -> list[Any]:
+        from sglang_omni.scheduling.types import SchedulerRequest
+
+        return [
+            SchedulerRequest(request_id=req.rid, data=req._omni_data)
+            for req in batch.reqs
+        ]
+
+    @staticmethod
+    def _runs_omni_prefill_hooks(forward_batch: Any) -> bool:
+        mode = forward_batch.forward_mode
+        return bool(mode.is_extend() and not mode.is_target_verify())
+
+    def _prepare_omni_prefill(
+        self, forward_batch: Any, batch: Any, requests: list[Any]
+    ) -> None:
+        """Compose the extend-window embeddings through Omni's prefill hooks.
+
+        The native draft-extend replays the target's multimodal input
+        embeddings (``LogitsProcessorOutput.mm_input_embeds``); publish the
+        composed rows so the draft sees exactly what the target consumed.
+        """
+        from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
+
+        runner = self.omni_model_runner
+        runner.before_prefill(forward_batch, batch, requests)
+        custom_result = runner.custom_prefill_forward(forward_batch, batch, requests)
+        if custom_result is not None:
+            raise NotImplementedError(
+                "Omni speculative decoding cannot run a runner-owned prefill "
+                "forward (visual deepstack embeddings); use the non-speculative "
+                "thinker for this request"
+            )
+        sidecar = get_omni_prefill_inputs(forward_batch)
+        input_embeds = (
+            sidecar.input_embeds if sidecar is not None else forward_batch.input_embeds
+        )
+        if input_embeds is not None:
+            forward_batch.mm_input_embeds = input_embeds
+
+    def _finish_omni_prefill(
+        self, forward_batch: Any, batch: Any, requests: list[Any]
+    ) -> None:
+        from sglang_omni.model_runner.prefill_inputs import clear_omni_prefill_inputs
+
+        clear_omni_prefill_inputs(forward_batch)
+        self.omni_model_runner.cleanup_prefill(forward_batch, batch, requests)
 
     def forward_batch_generation(
         self,
@@ -89,10 +171,23 @@ class SpeculativeTargetWorkerAdapter:
                 )
 
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
-        out = self.model_runner.forward(
-            forward_batch,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        omni_prefill_requests = None
+        try:
+            if (
+                self.omni_model_runner is not None
+                and batch is not None
+                and not is_verify
+                and self._runs_omni_prefill_hooks(forward_batch)
+            ):
+                omni_prefill_requests = self._omni_requests(batch)
+                self._prepare_omni_prefill(forward_batch, batch, omni_prefill_requests)
+            out = self.model_runner.forward(
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        finally:
+            if omni_prefill_requests is not None:
+                self._finish_omni_prefill(forward_batch, batch, omni_prefill_requests)
         logits_output = out.logits_output
         batch_result = GenerationBatchResult(
             logits_output=logits_output,

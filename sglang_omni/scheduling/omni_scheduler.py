@@ -63,6 +63,10 @@ from sglang_omni.proto.admin import (
     ADMIN_WEIGHTS_CHECKER,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.speculative_support import (
+    is_omni_supported_speculative_algorithm,
+    unsupported_speculative_algorithm_message,
+)
 from sglang_omni.scheduling.types import DeferredAdmission
 
 logger = logging.getLogger(__name__)
@@ -299,22 +303,23 @@ class OmniScheduler:
             server_args.speculative_algorithm
         )
         if not self.spec_algorithm.is_none():
-            if not self.spec_algorithm.is_standalone():
+            if not is_omni_supported_speculative_algorithm(self.spec_algorithm):
                 raise ValueError(
-                    "sglang-omni only supports STANDALONE speculative decoding in "
-                    "the eager synchronous lane"
+                    unsupported_speculative_algorithm_message(
+                        server_args.speculative_algorithm
+                    )
                 )
             if self.enable_overlap:
                 raise ValueError(
-                    "STANDALONE speculative decoding requires enable_overlap=False"
+                    "Omni speculative decoding requires enable_overlap=False"
                 )
             if self.enable_async_decode:
                 raise ValueError(
-                    "STANDALONE speculative decoding requires enable_async_decode=False"
+                    "Omni speculative decoding requires enable_async_decode=False"
                 )
             if target_worker_adapter is None or draft_worker is None:
                 raise ValueError(
-                    "STANDALONE speculative decoding requires prebuilt target and "
+                    "Omni speculative decoding requires prebuilt target and "
                     "draft workers"
                 )
 
@@ -1727,7 +1732,12 @@ class OmniScheduler:
                 model_runner = self._model_runner
                 if model_runner is not None:
                     model_runner.on_request_finished(rid, data)
-                data.output_ids = list(req.output_ids)
+                # note (Junnan Li): native speculative verify appends the whole
+                # accepted run to req.output_ids; upstream trims tokens after
+                # the stop position only through this view.
+                data.output_ids = list(
+                    getattr(req, "output_ids_through_stop", req.output_ids)
+                )
                 data.weight_version = get_serving().weight_version
                 finished_reason = req.finished_reason
                 data.finish_reason = (

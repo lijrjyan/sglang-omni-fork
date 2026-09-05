@@ -68,11 +68,51 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(self.config)
         self._fused_rope_gate = install_thinker_fused_rope(self.model)
+        # Native speculative decoding (EAGLE3 / DFlash) asks the target to
+        # return intermediate layer outputs next to the final hidden states.
+        self.capture_aux_hidden_states = False
 
     @property
     def thinker(self) -> "Qwen3OmniThinkerForCausalLM":
         # Existing Qwen thinker runner/hook code expects model.thinker.model.
         return self
+
+    # ------------------------------------------------------------------
+    # Native speculative decoding hooks (mirrors upstream Qwen3MoeForCausalLM)
+    # ------------------------------------------------------------------
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
+    def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Share the token embedding and LM head weights with an EAGLE draft."""
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[list[int]] = None
+    ) -> None:
+        """Capture the EAGLE3 auxiliary hidden states inside the text backbone.
+
+        ``layer_ids`` follow the draft checkpoint's ``eagle_config`` numbering
+        (the output of decoder layer ``i``); upstream shifts them by one because
+        the backbone records a layer's *input* residual stream.
+        """
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.set_eagle3_layers_to_capture(
+                [2, num_layers // 2, num_layers - 3]
+            )
+        else:
+            self.model.set_eagle3_layers_to_capture(
+                [int(layer_id) + 1 for layer_id in layer_ids]
+            )
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture(
+            [int(layer_id) + 1 for layer_id in layer_ids]
+        )
 
     def forward(
         self,
@@ -99,11 +139,15 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
             input_deepstack_embeds=input_deepstack_embeds,
         )
+        aux_hidden_states = None
+        if getattr(self, "capture_aux_hidden_states", False):
+            hidden_states, aux_hidden_states = hidden_states
         return self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
             forward_batch,
+            aux_hidden_states,
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:

@@ -19,6 +19,7 @@ def create_thinker_scheduler(
     prefill_coalesce_requests: int = 0,
     prefill_coalesce_wait_ms: float = 60.0,
     prefill_coalesce_when_idle: bool = False,
+    speculative_draft_cuda_graph: bool = False,
 ):
     """Create the Qwen thinker scheduler."""
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -35,6 +36,7 @@ def create_thinker_scheduler(
     from sglang_omni.scheduling.bootstrap import (
         create_sglang_infrastructure,
         init_sglang_cuda_graphs,
+        init_speculative_draft_cuda_graphs,
     )
     from sglang_omni.scheduling.generation_batch_policy import (
         CudaGraphBackend,
@@ -44,12 +46,32 @@ def create_thinker_scheduler(
     from sglang_omni.scheduling.sglang_backend import SGLangOutputProcessor
     from sglang_omni.utils import cuda_graph_batch_validator
 
+    speculative_enabled = (
+        getattr(server_args, "speculative_algorithm", None) is not None
+    )
+    if speculative_enabled and speech_enabled:
+        raise ValueError(
+            "Qwen3-Omni speculative decoding is supported only for the text-only "
+            "thinker; the speech pipeline's talker stays non-speculative"
+        )
+    if speculative_enabled and enable_async_decode:
+        raise ValueError(
+            "Qwen3-Omni speculative decoding requires enable_async_decode=False"
+        )
+
     capture_hidden_layers = [0, 24] if speech_enabled else None
     capture_hidden = speech_enabled
     prefill_graph_backend = get_prefill_cuda_graph_backend(server_args)
     enable_prefill_input_embeds = prefill_graph_backend == CudaGraphBackend.BREAKABLE
     want_cuda_graph = not bool(server_args.disable_cuda_graph)
     defer_cuda_graph_capture = want_cuda_graph and capture_hidden
+
+    # The native draft worker needs the target tokenizer at bootstrap.
+    tokenizer = (
+        get_tokenizer(server_args.model_path, trust_remote_code=True)
+        if speculative_enabled
+        else None
+    )
 
     infrastructure = create_sglang_infrastructure(
         server_args,
@@ -61,6 +83,7 @@ def create_thinker_scheduler(
         total_gpu_memory_fraction=total_gpu_memory_fraction,
         defer_cuda_graph_capture=defer_cuda_graph_capture,
         enable_prefill_input_embeds=enable_prefill_input_embeds,
+        target_tokenizer=tokenizer if speculative_enabled else None,
     )
 
     (
@@ -69,13 +92,24 @@ def create_thinker_scheduler(
         req_to_token_pool,
         token_to_kv_pool_allocator,
         model_config,
+        *spec_workers,
     ) = infrastructure
+    if spec_workers:
+        target_worker_adapter, draft_worker = spec_workers
+    else:
+        target_worker_adapter = None
+        draft_worker = None
 
     if defer_cuda_graph_capture:
         # Deferring capture must not also skip the omni wrapper: without it the
         # prefill embeds view is never applied, so the graph's input_embeds slot
         # exists only when the model config happens to be multimodal.
         init_sglang_cuda_graphs(model_worker)
+        if draft_worker is not None:
+            init_speculative_draft_cuda_graphs(
+                draft_worker,
+                capture_draft_decode_graph=speculative_draft_cuda_graph,
+            )
 
     if prefill_graph_backend == CudaGraphBackend.BREAKABLE:
         cuda_graph_batch_validator.attest_prefill_cuda_graphs(
@@ -96,11 +130,16 @@ def create_thinker_scheduler(
         model_runner = ThinkerModelRunner(model_worker, output_proc)
     else:
         model_runner = Qwen3OmniThinkerModelRunner(model_worker, output_proc)
+    if target_worker_adapter is not None:
+        # Target prefill under the native draft worker must still splice the
+        # audio/image embeddings the Omni runner composes.
+        target_worker_adapter.bind_omni_model_runner(model_runner)
 
-    tokenizer = get_tokenizer(
-        model_config.model_path,
-        trust_remote_code=True,
-    )
+    if tokenizer is None:
+        tokenizer = get_tokenizer(
+            model_config.model_path,
+            trust_remote_code=True,
+        )
     thinker_config = model_config.hf_config.thinker_config
     request_builder, result_adapter = make_thinker_scheduler_adapters(
         tokenizer=tokenizer,
@@ -125,6 +164,8 @@ def create_thinker_scheduler(
         prefill_coalesce_requests=prefill_coalesce_requests,
         prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
         prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+        target_worker_adapter=target_worker_adapter,
+        draft_worker=draft_worker,
     )
 
 

@@ -607,3 +607,56 @@ def test_create_sglang_infrastructure_consumes_scoped_kv_budget(
     captured.clear()
     bootstrap.create_sglang_infrastructure(server_args, 0)
     assert captured["kv_cache_bytes"] is None
+
+
+@pytest.mark.parametrize("algorithm", ["STANDALONE", "EAGLE3", "DFLASH"])
+def test_parse_speculative_algorithm_admits_native_v2_workers(algorithm: str) -> None:
+    parsed = bootstrap._parse_speculative_algorithm(
+        SimpleNamespace(speculative_algorithm=algorithm)
+    )
+    assert parsed.name == algorithm
+
+
+@pytest.mark.parametrize("algorithm", ["EAGLE", "NGRAM"])
+def test_parse_speculative_algorithm_rejects_other_workers(algorithm: str) -> None:
+    with pytest.raises(ValueError, match="only supports STANDALONE, EAGLE3, DFLASH"):
+        bootstrap._parse_speculative_algorithm(
+            SimpleNamespace(speculative_algorithm=algorithm)
+        )
+
+
+def test_draft_graph_init_dispatches_on_worker_signature() -> None:
+    calls = []
+    inner = SimpleNamespace(
+        cuda_graph_runner=None, cuda_graph_runner_for_draft_extend=None
+    )
+    args = SimpleNamespace(speculative_algorithm="EAGLE3")
+
+    stock = SimpleNamespace(
+        server_args=args,
+        _draft_worker=inner,
+        init_cuda_graphs=lambda: calls.append("stock"),
+    )
+    bootstrap.init_speculative_draft_cuda_graphs(stock, capture_draft_decode_graph=True)
+
+    def patched_init(*, capture_draft_decode_graph, capture_draft_extend_graph):
+        calls.append(
+            ("patched", capture_draft_decode_graph, capture_draft_extend_graph)
+        )
+
+    patched = SimpleNamespace(
+        server_args=args, draft_worker=inner, init_cuda_graphs=patched_init
+    )
+    bootstrap.init_speculative_draft_cuda_graphs(
+        patched, capture_draft_decode_graph=False
+    )
+
+    assert calls == ["stock", ("patched", False, False)]
+    assert (
+        bootstrap.speculative_draft_model(
+            SimpleNamespace(
+                _draft_worker=SimpleNamespace(draft_runner=SimpleNamespace(model="m"))
+            )
+        )
+        == "m"
+    )

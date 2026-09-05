@@ -30,6 +30,7 @@ from sglang_omni.models.qwen3_omni.request_builders import (
 )
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
 from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
     validate_generation_batch_policy,
@@ -1012,6 +1013,13 @@ def create_sglang_thinker_executor_from_config(
     prefill_coalesce_requests: int = 0,
     prefill_coalesce_wait_ms: float = 60.0,
     prefill_coalesce_when_idle: bool = False,
+    enable_speculative: bool = False,
+    speculative_algorithm: str = "EAGLE3",
+    speculative_draft_model_path: str | None = None,
+    speculative_num_steps: int = 3,
+    speculative_num_draft_tokens: int = 4,
+    speculative_cuda_graph: bool = False,
+    speculative_draft_cuda_graph: bool = False,
 ):
     """Returns OmniScheduler for thinker."""
     # note (luojiaxuan):
@@ -1035,6 +1043,26 @@ def create_sglang_thinker_executor_from_config(
         sampling_backend="pytorch",
     )
     overrides["tp_size"] = tp_size
+    overrides = configure_speculative_overrides(
+        overrides,
+        enable_speculative=enable_speculative,
+        speculative_algorithm=speculative_algorithm,
+        speculative_draft_model_path=speculative_draft_model_path,
+        speculative_num_steps=speculative_num_steps,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        speculative_cuda_graph=speculative_cuda_graph,
+        speculative_draft_cuda_graph=speculative_draft_cuda_graph,
+    )
+    speculative_enabled = overrides.get("speculative_algorithm") is not None
+    if speculative_enabled:
+        # note (Junnan Li): the native draft worker owns the decode step, so
+        # the thinker runs the synchronous lane: no async decode, no admission
+        # coalescing, no mixed prefill/decode chunks.
+        if enable_async_decode:
+            logger.info("Qwen3-Omni speculative decoding disables enable_async_decode")
+        enable_async_decode = False
+        prefill_coalesce_requests = 0
+        overrides["enable_mixed_chunk"] = False
     from sglang_omni.platforms import current_platform
 
     if not current_platform.enable_thinker_decode_graph():
@@ -1118,6 +1146,7 @@ def create_sglang_thinker_executor_from_config(
         prefill_coalesce_requests=prefill_coalesce_requests,
         prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
         prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+        speculative_draft_cuda_graph=speculative_draft_cuda_graph,
     )
     post_load_process_mem = get_process_gpu_memory_bytes(gpu_id)
     logger.info(

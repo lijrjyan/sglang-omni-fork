@@ -35,11 +35,11 @@ def test_asr_engine_builder_preserves_model_path() -> None:
     assert AsrEngineBuilder.resolve_checkpoint(object(), "repo/id") == "repo/id"
 
 
-@pytest.mark.parametrize("algorithm", ["EAGLE", "EAGLE3", "NGRAM", "DFLASH"])
-def test_speculative_overrides_reject_non_standalone_algorithms(algorithm: str) -> None:
+@pytest.mark.parametrize("algorithm", ["EAGLE", "NGRAM", "DSPARK", "MULTI_LAYER_EAGLE"])
+def test_speculative_overrides_reject_unsupported_algorithms(algorithm: str) -> None:
     from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
 
-    with pytest.raises(ValueError, match="only supports STANDALONE"):
+    with pytest.raises(ValueError, match="only supports STANDALONE, EAGLE3, DFLASH"):
         configure_speculative_overrides(
             {"speculative_algorithm": algorithm},
             enable_speculative=False,
@@ -132,7 +132,7 @@ def test_speculative_nested_prefill_graph_is_disabled_without_mutating_input(ena
 def test_speculative_registry_rejects_non_whisper(architecture):
     from sglang_omni.model_runner.model_worker import register_speculative_omni_models
 
-    with pytest.raises(ValueError, match="only supported for Whisper"):
+    with pytest.raises(ValueError, match="supports target architectures"):
         register_speculative_omni_models(architecture)
 
 
@@ -937,3 +937,56 @@ def test_tts_engine_builder_base_scheduler_preserves_abort_with_extra_kwargs(
     assert captured_kwargs["tp_worker"] == "worker"
     assert captured_kwargs["request_builder"] == "request_builder"
     assert captured_kwargs["result_adapter"] == "result_adapter"
+
+
+def test_speculative_overrides_first_class_eagle3() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    configured = configure_speculative_overrides(
+        {"disable_cuda_graph": False},
+        enable_speculative=True,
+        speculative_algorithm="eagle3",
+        speculative_draft_model_path="draft",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+    )
+
+    assert configured["speculative_algorithm"] == "EAGLE3"
+    assert configured["speculative_num_steps"] == 3
+    assert configured["speculative_num_draft_tokens"] == 4
+    assert configured["speculative_eagle_topk"] == 1
+    assert configured["disable_overlap_schedule"] is True
+    assert configured["disable_cuda_graph"] is True
+
+
+def test_speculative_overrides_dflash_uses_block_size_without_steps() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    configured = configure_speculative_overrides(
+        {},
+        enable_speculative=True,
+        speculative_algorithm="DFLASH",
+        speculative_draft_model_path="draft",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=8,
+        speculative_cuda_graph=True,
+    )
+
+    assert configured["speculative_algorithm"] == "DFLASH"
+    assert configured["speculative_num_draft_tokens"] == 8
+    assert "speculative_num_steps" not in configured
+    assert configured["disable_cuda_graph"] is False
+
+
+def test_speculative_overrides_eagle3_keeps_chain_length_rule() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    with pytest.raises(ValueError, match="speculative_num_steps \\+ 1"):
+        configure_speculative_overrides(
+            {},
+            enable_speculative=True,
+            speculative_algorithm="EAGLE3",
+            speculative_draft_model_path="draft",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=6,
+        )

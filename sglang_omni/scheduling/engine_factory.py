@@ -16,6 +16,10 @@ from sglang_omni.scheduling.generation_batch_policy import (
     nested_prefill_overrides,
     validate_generation_batch_policy,
 )
+from sglang_omni.scheduling.speculative_support import (
+    OMNI_SPECULATIVE_ALGORITHMS,
+    unsupported_speculative_algorithm_message,
+)
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -61,21 +65,33 @@ def configure_speculative_overrides(
     speculative_num_draft_tokens: int,
     speculative_cuda_graph: bool = False,
     speculative_draft_cuda_graph: bool = False,
+    speculative_algorithm: str = "STANDALONE",
 ) -> dict[str, Any]:
-    """Validate Omni's STANDALONE speculative decoding configuration."""
+    """Validate Omni's native speculative decoding configuration.
+
+    STANDALONE and EAGLE3 drafts run ``speculative_num_steps`` chain steps and
+    verify ``steps + 1`` tokens; DFLASH verifies one fixed block of
+    ``speculative_num_draft_tokens`` and takes no step count.
+    """
     configured = dict(overrides)
     if speculative_draft_cuda_graph and not speculative_cuda_graph:
         raise ValueError(
             "speculative_draft_cuda_graph=True requires speculative_cuda_graph=True"
         )
     if enable_speculative:
+        first_class_algorithm = str(speculative_algorithm).upper()
+        if first_class_algorithm not in OMNI_SPECULATIVE_ALGORITHMS:
+            raise ValueError(
+                unsupported_speculative_algorithm_message(speculative_algorithm)
+            )
         requested = {
-            "speculative_algorithm": "STANDALONE",
+            "speculative_algorithm": first_class_algorithm,
             "speculative_draft_model_path": speculative_draft_model_path,
-            "speculative_num_steps": speculative_num_steps,
             "speculative_eagle_topk": 1,
             "speculative_num_draft_tokens": speculative_num_draft_tokens,
         }
+        if first_class_algorithm != "DFLASH":
+            requested["speculative_num_steps"] = speculative_num_steps
         for name, value in requested.items():
             existing = configured.get(name)
             conflicts = existing is not None and existing != value
@@ -102,41 +118,49 @@ def configure_speculative_overrides(
             )
         if speculative_cuda_graph:
             raise ValueError(
-                "speculative_cuda_graph=True requires STANDALONE speculative decoding"
+                "speculative_cuda_graph=True requires native speculative decoding"
             )
         return configured
 
     normalized_algorithm = str(algorithm).upper()
-    if normalized_algorithm != "STANDALONE":
-        raise ValueError(
-            "sglang-omni only supports STANDALONE speculative decoding in the "
-            f"synchronous lane; got speculative_algorithm={algorithm!r}"
-        )
+    if normalized_algorithm not in OMNI_SPECULATIVE_ALGORITHMS:
+        raise ValueError(unsupported_speculative_algorithm_message(algorithm))
     configured["speculative_algorithm"] = normalized_algorithm
 
     draft_path = configured.get("speculative_draft_model_path")
     if not isinstance(draft_path, str) or not draft_path.strip():
         raise ValueError(
-            "speculative_draft_model_path is required for STANDALONE "
-            "speculative decoding"
+            "speculative_draft_model_path is required for "
+            f"{normalized_algorithm} speculative decoding"
         )
 
     topk = configured.setdefault("speculative_eagle_topk", 1)
     if topk != 1:
         raise ValueError(
-            "speculative_eagle_topk must be 1 for the STANDALONE lane; " f"got {topk!r}"
+            "speculative_eagle_topk must be 1 for the synchronous lane; "
+            f"got {topk!r}"
         )
-    num_steps = int(configured.setdefault("speculative_num_steps", 3))
-    num_draft_tokens = int(configured.setdefault("speculative_num_draft_tokens", 4))
-    if num_steps < 0:
-        raise ValueError(f"speculative_num_steps must be >= 0, got {num_steps}")
-    if num_draft_tokens != num_steps + 1:
-        raise ValueError(
-            "topk=1 requires speculative_num_draft_tokens == "
-            f"speculative_num_steps + 1; got {num_draft_tokens} and {num_steps}"
-        )
-    configured["speculative_num_steps"] = num_steps
-    configured["speculative_num_draft_tokens"] = num_draft_tokens
+    if normalized_algorithm == "DFLASH":
+        block_size = int(configured.setdefault("speculative_num_draft_tokens", 8))
+        if block_size < 1:
+            raise ValueError(
+                "DFLASH speculative_num_draft_tokens is the draft block size and "
+                f"must be >= 1; got {block_size}"
+            )
+        configured["speculative_num_draft_tokens"] = block_size
+        configured.pop("speculative_num_steps", None)
+    else:
+        num_steps = int(configured.setdefault("speculative_num_steps", 3))
+        num_draft_tokens = int(configured.setdefault("speculative_num_draft_tokens", 4))
+        if num_steps < 0:
+            raise ValueError(f"speculative_num_steps must be >= 0, got {num_steps}")
+        if num_draft_tokens != num_steps + 1:
+            raise ValueError(
+                "topk=1 requires speculative_num_draft_tokens == "
+                f"speculative_num_steps + 1; got {num_draft_tokens} and {num_steps}"
+            )
+        configured["speculative_num_steps"] = num_steps
+        configured["speculative_num_draft_tokens"] = num_draft_tokens
 
     # note (Junnan Li): target and draft graph capture follow multi-token parity.
     configured["disable_overlap_schedule"] = True
