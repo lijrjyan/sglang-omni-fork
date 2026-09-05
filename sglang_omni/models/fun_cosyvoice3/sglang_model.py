@@ -19,6 +19,8 @@ from torch import nn
 
 from sglang_omni.utils.spec_debug import SPEC_DEBUG, spec_trace
 
+from . import divprobe as _divprobe
+
 VOCAB_SIZE = 6561
 TOTAL_VOCAB_SIZE = VOCAB_SIZE + 200
 
@@ -125,13 +127,21 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
             # cannot rebuild text/speaker embeddings from speech ids).
             forward_batch.mm_input_embeds = input_embeds
 
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
+        probe_kind = (
+            _divprobe.match(forward_batch, positions) if _divprobe.ENABLED else None
         )
+        probe_hooks = _divprobe.Hooks(self.model) if probe_kind else None
+        try:
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        finally:
+            if probe_hooks is not None:
+                probe_hooks.remove()
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
@@ -152,9 +162,29 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
             forward_batch,
             aux_hidden_states,
         )
+        if probe_kind:
+            try:
+                _divprobe.save(
+                    probe_kind,
+                    self,
+                    probe_hooks,
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    input_embeds,
+                    hidden_states,
+                    logits_output,
+                )
+            except Exception as exc:  # diagnostic must not kill the server
+                import traceback
+
+                print(f"[divprobe] capture failed: {exc!r}", flush=True)
+                traceback.print_exc()
         is_verify = getattr(fwd_mode, "is_target_verify", lambda: False)()
         if is_verify and SPEC_DEBUG and getattr(self, "_verify_trace", 0) < 4:
-            self._trace_verify_rows(input_ids, positions, hidden_states, forward_batch, logits_output)
+            self._trace_verify_rows(
+                input_ids, positions, hidden_states, forward_batch, logits_output
+            )
         if is_verify and _is_dspark_forward(forward_batch):
             if False:
                 self._verify_trace = getattr(self, "_verify_trace", 0) + 1
@@ -185,7 +215,9 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
             )
         return logits_output
 
-    def _trace_verify_rows(self, input_ids, positions, hidden_states, forward_batch, logits_output):
+    def _trace_verify_rows(
+        self, input_ids, positions, hidden_states, forward_batch, logits_output
+    ):
         self._verify_trace = getattr(self, "_verify_trace", 0) + 1
         logits = logits_output.next_token_logits
         top = logits[0].float().topk(4)
@@ -268,7 +300,9 @@ def repetition_penalty_values(sampling_info: Any) -> Optional[torch.Tensor]:
             "repetition penalty from sampling_params: "
             f"penalizers={[(type(p).__name__, hasattr(p, 'repetition_penalties'), getattr(p, '_is_prepared', None)) for p in orchestrator.penalizers.values()]}"
         )
-    return torch.tensor(penalties, dtype=torch.float32, device=orchestrator.device).view(-1, 1)
+    return torch.tensor(
+        penalties, dtype=torch.float32, device=orchestrator.device
+    ).view(-1, 1)
 
 
 @torch.no_grad()
@@ -805,7 +839,9 @@ class CosyVoice3MarkovHead(VanillaMarkov):
     def to_target_space(self, draft_logits: torch.Tensor) -> torch.Tensor:
         """(n, draft_vocab) draft logits -> (n, speech vocab) with -inf fill."""
         draft_ids, target_ids = self._valid_ids(draft_logits.device)
-        out = draft_logits.new_full((draft_logits.shape[0], self.vocab_size), float("-inf"))
+        out = draft_logits.new_full(
+            (draft_logits.shape[0], self.vocab_size), float("-inf")
+        )
         out[:, target_ids] = draft_logits[:, draft_ids]
         return out
 
@@ -856,7 +892,9 @@ class CosyVoice3MarkovHead(VanillaMarkov):
         for step_idx in range(proposal_len):
             step_hidden = None if hidden_states is None else hidden_states[:, step_idx]
             step_logits = self.apply_step_logits(
-                base_logits[:, step_idx, :], token_ids=prev_tokens, hidden_states=step_hidden
+                base_logits[:, step_idx, :],
+                token_ids=prev_tokens,
+                hidden_states=step_hidden,
             )
             if penalties is not None:
                 if rep_values is not None:

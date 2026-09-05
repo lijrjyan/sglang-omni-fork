@@ -90,6 +90,21 @@ class _PendingStreamIngress:
         self.done = False
 
 
+def finished_output_ids(req: Any) -> list:
+    """Output ids up to and including the stop position.
+
+    A speculative step commits a whole accepted run into ``req.output_ids``
+    (upstream ``batch_result_processor``), so the list can run past
+    ``max_new_tokens`` or a stop token by up to the verify window; upstream
+    records the cut in ``req.finished_len`` (``output_ids_through_stop``).
+    Non-speculative requests have ``finished_len`` None.
+    """
+    finished_len = getattr(req, "finished_len", None)
+    if finished_len is not None:
+        return list(req.output_ids[:finished_len])
+    return list(req.output_ids)
+
+
 def _detach_request_data(req: Any) -> None:
     """Break Req -> data; async snapshots retain the one-way data -> Req edge."""
     req._omni_data = None
@@ -1609,7 +1624,9 @@ class OmniScheduler:
                 f"vocab={vocab_size} head={columns[0][:9]}"
             )
         for k in range(max_new):
-            step_ids = [column[k] if k < len(column) else column[-1] for column in columns]
+            step_ids = [
+                column[k] if k < len(column) else column[-1] for column in columns
+            ]
             orchestrator.cumulate_output_tokens(
                 torch.tensor(step_ids, dtype=torch.int64, device=device)
             )
@@ -1940,7 +1957,7 @@ class OmniScheduler:
                 model_runner = self._model_runner
                 if model_runner is not None:
                     model_runner.on_request_finished(rid, data)
-                data.output_ids = list(req.output_ids)
+                data.output_ids = finished_output_ids(req)
                 data.weight_version = get_serving().weight_version
                 finished_reason = req.finished_reason
                 data.finish_reason = (

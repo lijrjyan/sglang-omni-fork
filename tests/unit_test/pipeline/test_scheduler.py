@@ -3116,3 +3116,19 @@ def test_omni_scheduler_records_spec_accept_length(monkeypatch, tmp_path) -> Non
     assert stats["steps"] == 2 and stats["rows"] == 4 and stats["accepted"] == 12
     assert stats["window_steps"] == 0
     assert "accept_len=3.000" in stats_path.read_text()
+
+
+def test_finished_output_ids_trims_speculative_overshoot_at_finished_len() -> None:
+    """A spec step commits a whole accepted run; the payload must stop at the
+    upstream-recorded stop position (``req.finished_len``), like
+    ``Req.output_ids_through_stop``."""
+    from sglang_omni.scheduling.omni_scheduler import finished_output_ids
+
+    spec_req = SimpleNamespace(output_ids=array("i", [5, 6, 7, 8, 9]), finished_len=3)
+    assert finished_output_ids(spec_req) == [5, 6, 7]
+
+    non_spec_req = SimpleNamespace(output_ids=[5, 6, 7], finished_len=None)
+    assert finished_output_ids(non_spec_req) == [5, 6, 7]
+
+    legacy_req = SimpleNamespace(output_ids=[1, 2])
+    assert finished_output_ids(legacy_req) == [1, 2]
