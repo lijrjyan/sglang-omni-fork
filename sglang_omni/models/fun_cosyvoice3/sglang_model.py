@@ -11,6 +11,8 @@ from typing import Any, Iterable, Optional, Tuple
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.models.dspark import DSparkDraftModel, VanillaMarkov
 from sglang.srt.models.llama_eagle3 import LlamaForCausalLMEagle3
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from torch import nn
@@ -29,6 +31,17 @@ CONTROL_TOKEN_IDS: tuple[int, ...] = tuple(range(VOCAB_SIZE, TOTAL_VOCAB_SIZE))
 
 # Draft architecture name published by the AngelSlim EAGLE3 checkpoint.
 EAGLE3_DRAFT_ARCHITECTURE = "CosyVoice3Eagle3LlamaForCausalLM"
+
+# Omni-owned DSpark draft (yuekai/cosyvoice3_llm_dspark remapped to the
+# speech id space); registered under this architecture name.
+DSPARK_DRAFT_ARCHITECTURE = "CosyVoice3DSparkDraftModel"
+# The DSpark checkpoint was trained on the HF-format LLM whose unified vocab
+# places the 6761 speech ids at this offset; its mask token is the row right
+# after the speech range.
+DSPARK_UNIFIED_SPEECH_OFFSET = 151924
+# Draft-owned embedding rows: the speech vocab plus one trained mask row.
+DSPARK_MASK_TOKEN_ID = TOTAL_VOCAB_SIZE
+DSPARK_EMBED_ROWS = TOTAL_VOCAB_SIZE + 1
 
 
 class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
@@ -67,6 +80,27 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         """Speech-token embedding and head shared with native speculative drafts."""
         return self.speech_embedding.weight, self.llm_decoder.weight
 
+    def set_speculative_repetition_penalties(self, values: Optional[torch.Tensor]):
+        """Scheduler hook: per-request repetition penalty (bs, 1) for this step.
+
+        The forward-time sampling info is a copy without the penalizer
+        orchestrator, so the scheduler publishes the values explicitly for the
+        verify-block penalty and the draft mirror.
+        """
+        _DRAFT_SAMPLING_INFO["rep_values"] = values
+
+    def set_dspark_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        """DSpark aux capture: HF-style "after layer k" ids, like EAGLE3."""
+        if layer_ids is None:
+            raise ValueError("DSpark requires explicit target layer ids to capture")
+        layer_ids = list(layer_ids)
+        # Bring-up probe: the checkpoint's aux ids are read as "output of
+        # layer k" (SGLang's DFlash/EAGLE3 convention, captured before layer
+        # k+1); set 0 to capture the input of layer k instead.
+        if os.environ.get("SGLANG_OMNI_COSYVOICE3_DSPARK_CAPTURE_AFTER", "1") == "0":
+            layer_ids = [max(i - 1, 0) for i in layer_ids]
+        self.set_eagle3_layers_to_capture(layer_ids)
+
     @torch.no_grad()
     def forward(
         self,
@@ -78,6 +112,9 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         pp_proxy_tensors: Optional[Any] = None,
     ) -> Any:
         fwd_mode = forward_batch.forward_mode
+        # The draft-side sampling mirror reads the live batch sampling state
+        # (penalties are refreshed in place before every speculative step).
+        _DRAFT_SAMPLING_INFO["info"] = getattr(forward_batch, "sampling_info", None)
         if input_embeds is None:
             # Decode, TARGET_VERIFY and any other id-driven forward: every
             # input id is a speech token.
@@ -108,12 +145,62 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
                 f"capture_mode={getattr(forward_batch, 'capture_hidden_mode', None)}"
             )
 
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids,
             hidden_states,
             self.llm_decoder,
             forward_batch,
             aux_hidden_states,
+        )
+        is_verify = getattr(fwd_mode, "is_target_verify", lambda: False)()
+        if is_verify and SPEC_DEBUG and getattr(self, "_verify_trace", 0) < 4:
+            self._trace_verify_rows(input_ids, positions, hidden_states, forward_batch, logits_output)
+        if is_verify and _is_dspark_forward(forward_batch):
+            if False:
+                self._verify_trace = getattr(self, "_verify_trace", 0) + 1
+                logits = logits_output.next_token_logits
+                spec_trace(
+                    f"verify rows: ids={input_ids[:9].tolist()} "
+                    f"argmax_pre_penalty={logits[:9].argmax(dim=-1).tolist()} "
+                    f"logits_shape={tuple(logits.shape)} hidden_rows={hidden_states.shape[0]} "
+                    f"positions={positions[:9].tolist()} seq_lens={forward_batch.seq_lens[:2].tolist()} "
+                    f"out_cache_loc={forward_batch.out_cache_loc[:9].tolist()} "
+                    f"capture={forward_batch.capture_hidden_mode} "
+                    f"hs_store={None if logits_output.hidden_states is None else tuple(logits_output.hidden_states.shape)}"
+                )
+            apply_block_repetition_penalty(
+                logits_output.next_token_logits, input_ids, forward_batch.sampling_info
+            )
+            if SPEC_DEBUG and getattr(self, "_verify_trace", 0) <= 4:
+                lg = logits_output.next_token_logits[0].float()
+                top = lg.topk(4)
+                spec_trace(
+                    f"verify row0 post-penalty: argmax={int(lg.argmax())} top_ids={top.indices.tolist()} "
+                    f"top_vals={[round(v, 3) for v in top.values.tolist()]} "
+                    f"logit3={lg[3].item():.3f} logit0={lg[0].item():.3f} contiguous={logits_output.next_token_logits.is_contiguous()}"
+                )
+        elif SPEC_DEBUG and is_verify:
+            spec_trace(
+                f"verify penalty skipped: spec_algorithm={getattr(forward_batch, 'spec_algorithm', None)}"
+            )
+        return logits_output
+
+    def _trace_verify_rows(self, input_ids, positions, hidden_states, forward_batch, logits_output):
+        self._verify_trace = getattr(self, "_verify_trace", 0) + 1
+        logits = logits_output.next_token_logits
+        top = logits[0].float().topk(4)
+        spec_trace(
+            f"verify row0 pre-penalty top_ids={top.indices.tolist()} top_vals={[round(v, 3) for v in top.values.tolist()]}"
+        )
+        spec_trace(
+            f"verify rows: spec={getattr(forward_batch, 'spec_algorithm', None)} ids={input_ids[:9].tolist()} "
+            f"argmax_pre_penalty={logits[:9].argmax(dim=-1).tolist()} "
+            f"logits_shape={tuple(logits.shape)} hidden_rows={hidden_states.shape[0]} "
+            f"positions={positions[:9].tolist()} seq_lens={forward_batch.seq_lens[:2].tolist()} "
+            f"out_cache_loc={forward_batch.out_cache_loc[:9].tolist()} "
+            f"input_embeds={None if forward_batch.input_embeds is None else tuple(forward_batch.input_embeds.shape)} "
+            f"capture={forward_batch.capture_hidden_mode} "
+            f"hs_store={None if logits_output.hidden_states is None else tuple(logits_output.hidden_states.shape)}"
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -150,6 +237,84 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
             super().load_weights(backbone_weights)
 
 
+def _is_dspark_forward(forward_batch: Any) -> bool:
+    algorithm = getattr(forward_batch, "spec_algorithm", None)
+    is_dspark = getattr(algorithm, "is_dspark", None)
+    return bool(is_dspark is not None and is_dspark())
+
+
+def repetition_penalty_values(sampling_info: Any) -> Optional[torch.Tensor]:
+    """Per-request repetition penalty (bs, 1) from the live penalizer, or None."""
+    provided = getattr(sampling_info, "_omni_repetition_penalties", None)
+    if provided is None:
+        provided = _DRAFT_SAMPLING_INFO.get("rep_values")
+    if provided is not None:
+        return provided
+    orchestrator = getattr(sampling_info, "penalizer_orchestrator", None)
+    if orchestrator is None or not orchestrator.is_required:
+        # The forward-time sampling info is a copy without the orchestrator.
+        return None
+    for penalizer in orchestrator.penalizers.values():
+        values = getattr(penalizer, "repetition_penalties", None)
+        if values is not None and getattr(penalizer, "_is_prepared", True):
+            return values
+    reqs = list(orchestrator.reqs())
+    penalties = [float(req.sampling_params.repetition_penalty) for req in reqs]
+    if not penalties or all(value == 1.0 for value in penalties):
+        return None
+    if SPEC_DEBUG and not getattr(orchestrator, "_omni_pen_traced", False):
+        orchestrator._omni_pen_traced = True
+        spec_trace(
+            "repetition penalty from sampling_params: "
+            f"penalizers={[(type(p).__name__, hasattr(p, 'repetition_penalties'), getattr(p, '_is_prepared', None)) for p in orchestrator.penalizers.values()]}"
+        )
+    return torch.tensor(penalties, dtype=torch.float32, device=orchestrator.device).view(-1, 1)
+
+
+@torch.no_grad()
+def apply_block_repetition_penalty(
+    logits: torch.Tensor, block_ids: torch.Tensor, sampling_info: Any
+) -> None:
+    """Omni's per-token repetition penalty on a DSpark verify block, in place.
+
+    SGLang's DFlash/DSpark verify only broadcasts additive penalties over the
+    block; the multiplicative repetition penalty is dropped, and CosyVoice3
+    degenerates without it. Row ``j`` of each request's ``T`` verify rows
+    penalises the tokens already generated (``acc_scaling_penalties``, refreshed
+    before the step) plus the block tokens ``0..j`` it has consumed, which is
+    exactly what token-by-token decoding would have applied.
+    """
+    if logits is None or sampling_info is None:
+        return
+    scaling = getattr(sampling_info, "acc_scaling_penalties", None)
+    if scaling is None:
+        return
+    bs = scaling.shape[0]
+    rows = logits.shape[0]
+    if bs == 0 or rows % bs != 0:
+        return
+    block = rows // bs
+    width = min(scaling.shape[1], logits.shape[1])
+    penalties = scaling[:, None, :width].expand(bs, block, width).clone()
+    values = repetition_penalty_values(sampling_info)
+    if SPEC_DEBUG and not getattr(sampling_info, "_omni_penalty_traced", False):
+        sampling_info._omni_penalty_traced = True
+        spec_trace(
+            f"verify block penalty: bs={bs} block={block} width={width} "
+            f"scaling_max={float(scaling.max()):.3f} values={None if values is None else values.flatten()[:4].tolist()} "
+            f"ids={block_ids.flatten()[:9].tolist()}"
+        )
+    if values is not None:
+        ids = block_ids.view(bs, block).clamp(max=width - 1)
+        for j in range(block):
+            penalties[:, j].scatter_(
+                1, ids[:, : j + 1], values.to(penalties.dtype).expand(bs, j + 1)
+            )
+    view = logits.view(bs, block, -1)[..., :width]
+    pen = penalties.to(view.dtype)
+    view.copy_(torch.where(view < 0, view * pen, view / pen))
+
+
 def _shift_prompt_embeds_default() -> bool:
     # EAGLE convention: the draft input at prompt position i is the embedding
     # of token i+1 (the target's input rows rolled left by one, last row =
@@ -158,7 +323,7 @@ def _shift_prompt_embeds_default() -> bool:
     return os.environ.get("SGLANG_OMNI_COSYVOICE3_EAGLE3_UNSHIFTED_PROMPT", "0") != "1"
 
 
-_DRAFT_SAMPLING_INFO: dict = {"info": None}
+_DRAFT_SAMPLING_INFO: dict = {"info": None, "rep_values": None}
 
 
 def _mirror_draft_logits(logits: torch.Tensor, sampling_info: Any) -> torch.Tensor:
@@ -583,6 +748,263 @@ def normalize_cosyvoice3_eagle3_config(config: Any) -> Any:
     if getattr(config, "draft_vocab_size", None) is None:
         config.draft_vocab_size = TOTAL_VOCAB_SIZE
     return config
+
+
+_DSPARK_MIRROR_DEFAULTS = {"REP": "1", "TOPKP": "0"}
+
+
+def _dspark_mirror_enabled(name: str) -> bool:
+    return (
+        os.environ.get(
+            f"SGLANG_OMNI_COSYVOICE3_DSPARK_DRAFT_{name}", _DSPARK_MIRROR_DEFAULTS[name]
+        )
+        == "1"
+    )
+
+
+class CosyVoice3MarkovHead(VanillaMarkov):
+    """DSpark Markov head over a reduced draft vocab, evaluated in the speech space.
+
+    The checkpoint's ``lm_head`` / ``markov_w2`` speak an 8192-id draft vocab
+    mapped to target ids by ``d2t``; ``markov_w1`` is indexed by target ids.
+    Every step's logits are scattered into the 6761 speech space (unmapped
+    draft ids and text ids drop out as ``-inf``) so the sampled tokens, the
+    proposal distribution ``q`` handed to rejection sampling and the verify
+    candidates all live in the target id space.
+    """
+
+    def __init__(self, *, vocab_size: int, draft_vocab_size: int, markov_rank: int):
+        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+        self.draft_vocab_size = int(draft_vocab_size)
+        self.markov_w2 = nn.Linear(self.markov_rank, self.draft_vocab_size, bias=False)
+        self.register_buffer(
+            "d2t_omni",
+            torch.full((self.draft_vocab_size,), -1, dtype=torch.long),
+            persistent=False,
+        )
+        self._valid_draft_ids: Optional[torch.Tensor] = None
+        self._valid_target_ids: Optional[torch.Tensor] = None
+
+    def set_d2t(self, d2t: torch.Tensor) -> None:
+        """``d2t`` is an EAGLE3-style offset table: target id = d2t[j] + j."""
+        d2t = d2t.to(torch.long)
+        absolute = d2t + torch.arange(d2t.numel(), device=d2t.device)
+        mapped = absolute - DSPARK_UNIFIED_SPEECH_OFFSET
+        valid = (mapped >= 0) & (mapped < self.vocab_size)
+        self.d2t_omni.copy_(torch.where(valid, mapped, torch.full_like(mapped, -1)))
+        self._valid_draft_ids = None
+        self._valid_target_ids = None
+
+    def _valid_ids(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._valid_draft_ids is None or self._valid_draft_ids.device != device:
+            valid = self.d2t_omni >= 0
+            self._valid_draft_ids = valid.nonzero(as_tuple=False).flatten().to(device)
+            self._valid_target_ids = self.d2t_omni[valid].to(device)
+        return self._valid_draft_ids, self._valid_target_ids
+
+    def to_target_space(self, draft_logits: torch.Tensor) -> torch.Tensor:
+        """(n, draft_vocab) draft logits -> (n, speech vocab) with -inf fill."""
+        draft_ids, target_ids = self._valid_ids(draft_logits.device)
+        out = draft_logits.new_full((draft_logits.shape[0], self.vocab_size), float("-inf"))
+        out[:, target_ids] = draft_logits[:, draft_ids]
+        return out
+
+    def apply_step_logits(self, logits, *, token_ids, hidden_states):
+        step = super().apply_step_logits(
+            logits, token_ids=token_ids, hidden_states=hidden_states
+        )
+        return self.to_target_space(step)
+
+    def apply_block_logits(self, base_logits, *, token_ids, hidden_states):
+        block = super().apply_block_logits(
+            base_logits, token_ids=token_ids, hidden_states=hidden_states
+        )
+        shape = block.shape
+        return self.to_target_space(block.reshape(-1, shape[-1])).view(
+            *shape[:-1], self.vocab_size
+        )
+
+    @torch.no_grad()
+    def sample_block(self, base_logits, *, first_prev_tokens, hidden_states, sampler):
+        batch_size, proposal_len = base_logits.shape[:2]
+        if proposal_len == 0:
+            empty = torch.empty(
+                batch_size, 0, dtype=torch.long, device=base_logits.device
+            )
+            return empty, base_logits.new_empty((batch_size, 0, self.vocab_size))
+        sampling_info = _DRAFT_SAMPLING_INFO["info"]
+        mirror_topkp = _dspark_mirror_enabled("TOPKP")
+        if SPEC_DEBUG and not getattr(self, "_mirror_traced", False):
+            self._mirror_traced = True
+            scaling = getattr(sampling_info, "acc_scaling_penalties", None)
+            spec_trace(
+                f"draft mirror: rep={_dspark_mirror_enabled('REP')} topkp={mirror_topkp} "
+                f"info={type(sampling_info).__name__} scaling={None if scaling is None else tuple(scaling.shape)} "
+                f"values={repetition_penalty_values(sampling_info)}"
+            )
+        # Draft-side mirror of the target's per-token repetition penalty: the
+        # accumulated history scaling plus every block token sampled so far.
+        penalties = None
+        rep_values = None
+        if _dspark_mirror_enabled("REP"):
+            scaling = getattr(sampling_info, "acc_scaling_penalties", None)
+            if scaling is not None and scaling.shape[0] == batch_size:
+                penalties = scaling[:, : self.vocab_size].clone()
+                rep_values = repetition_penalty_values(sampling_info)
+        sampled, corrected = [], []
+        prev_tokens = first_prev_tokens.long()
+        for step_idx in range(proposal_len):
+            step_hidden = None if hidden_states is None else hidden_states[:, step_idx]
+            step_logits = self.apply_step_logits(
+                base_logits[:, step_idx, :], token_ids=prev_tokens, hidden_states=step_hidden
+            )
+            if penalties is not None:
+                if rep_values is not None:
+                    penalties.scatter_(
+                        1,
+                        prev_tokens.view(-1, 1).clamp(max=penalties.shape[1] - 1),
+                        rep_values.to(penalties.dtype).view(-1, 1),
+                    )
+                step_logits = _scale_draft_logits(step_logits, penalties)
+            if mirror_topkp:
+                step_logits = _mask_draft_logits_top_kp(step_logits, sampling_info)
+            next_tokens = sampler(step_logits, step_idx)
+            sampled.append(next_tokens)
+            corrected.append(step_logits.unsqueeze(1))
+            prev_tokens = next_tokens
+        return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
+
+
+def _scale_draft_logits(logits: torch.Tensor, penalties: torch.Tensor) -> torch.Tensor:
+    """Multiplicative (repetition) penalty on draft logits, target semantics."""
+    width = min(penalties.shape[1], logits.shape[1])
+    pen = penalties[:, :width].to(logits.dtype)
+    head = logits[:, :width]
+    head = torch.where(head < 0, head * pen, head / pen)
+    if width == logits.shape[1]:
+        return head
+    return torch.cat([head, logits[:, width:]], dim=1)
+
+
+def _mask_draft_logits_top_kp(logits: torch.Tensor, sampling_info: Any) -> torch.Tensor:
+    """Restrict the draft proposal to its own top-k / top-p support (the target's
+    filter settings), keeping q consistent between sampling and verify."""
+    top_ks = getattr(sampling_info, "top_ks", None)
+    if top_ks is None or top_ks.shape[0] != logits.shape[0]:
+        return logits
+    probs = torch.softmax(logits.float(), dim=-1)
+    keep = torch.ones_like(probs, dtype=torch.bool)
+    if sampling_info.need_top_k_sampling:
+        k = top_ks.view(-1).clamp(min=1, max=probs.shape[1])
+        sorted_probs, _ = probs.sort(dim=-1, descending=True)
+        kth = sorted_probs.gather(1, (k - 1).view(-1, 1))
+        keep &= probs >= kth
+    if sampling_info.need_top_p_sampling:
+        sorted_probs, order = probs.sort(dim=-1, descending=True)
+        cum = sorted_probs.cumsum(dim=-1) - sorted_probs
+        keep_sorted = cum < sampling_info.top_ps.view(-1, 1)
+        keep &= torch.zeros_like(keep).scatter(1, order, keep_sorted)
+    return logits.masked_fill(~keep, float("-inf"))
+
+
+class CosyVoice3DSparkDraftModel(DSparkDraftModel):
+    """yuekai/cosyvoice3_llm_dspark remapped to Omni's 6761 speech id space.
+
+    The stock DSpark draft shares the target's embedding / lm_head; this
+    checkpoint ships its own (unified-vocab embedding, 8192-id draft head with
+    ``d2t``). The draft owns a speech-vocab embedding (+1 trained mask row),
+    the reduced head, and a Markov head evaluated in the speech space.
+    """
+
+    uses_own_vocab_modules = True
+
+    def __init__(self, config: Any, quant_config: Any = None, prefix: str = "") -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        hidden = int(config.hidden_size)
+        draft_vocab = int(getattr(config, "draft_vocab_size", 0) or 0)
+        if draft_vocab <= 0:
+            raise ValueError("CosyVoice3 DSpark draft requires draft_vocab_size")
+        self.embed_tokens = nn.Embedding(DSPARK_EMBED_ROWS, hidden)
+        self.lm_head = nn.Linear(hidden, draft_vocab, bias=False)
+        # Width of the proposal distribution handed to verify / graph buffers.
+        self.lm_head.org_vocab_size = TOTAL_VOCAB_SIZE
+        self.markov_head = CosyVoice3MarkovHead(
+            vocab_size=TOTAL_VOCAB_SIZE,
+            draft_vocab_size=draft_vocab,
+            markov_rank=int(config.markov_rank),
+        )
+        # Inference-only weights: the draft proposal runs on inference-mode
+        # activations, which autograd refuses to pair with grad-tracked params.
+        for module in (self.embed_tokens, self.lm_head, self.markov_head):
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+    def attach_shared_modules(self, *, embed_tokens: nn.Module, lm_head: nn.Module):
+        raise RuntimeError("CosyVoice3 DSpark draft owns its vocab modules")
+
+    def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    @torch.no_grad()
+    def compute_base_logits(self, hidden: torch.Tensor):
+        weight = self.lm_head.weight
+        if hidden.dtype != weight.dtype:
+            hidden = hidden.to(weight.dtype)
+        return torch.matmul(hidden, weight.T), None
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        params = dict(self.named_parameters())
+        backbone, confidence = [], []
+        offset = DSPARK_UNIFIED_SPEECH_OFFSET
+        for name, loaded in weights:
+            if name == "embed_tokens.weight":
+                rows = loaded[offset : offset + DSPARK_EMBED_ROWS]
+                default_weight_loader(params["embed_tokens.weight"], rows)
+            elif name == "lm_head.weight":
+                default_weight_loader(params["lm_head.weight"], loaded)
+            elif name == "markov_head.markov_w1.weight":
+                rows = loaded[offset : offset + TOTAL_VOCAB_SIZE]
+                default_weight_loader(params[name], rows)
+            elif name == "markov_head.markov_w2.weight":
+                default_weight_loader(params[name], loaded)
+            elif name == "d2t":
+                self.markov_head.set_d2t(loaded.to(self.markov_head.d2t_omni.device))
+            elif name == "t2d":
+                continue
+            elif name.startswith("confidence_head."):
+                confidence.append((name, loaded))
+            else:
+                backbone.append((name, loaded))
+        # Backbone / fc / norms go through the DFlash loader; the DSpark mixin
+        # loader would drop the vocab modules this draft owns.
+        DFlashDraftModel.load_weights(self, backbone)
+        self._load_confidence_weights(confidence_weights=confidence, params_dict=params)
+        if (self.markov_head.d2t_omni < 0).all():
+            raise ValueError("CosyVoice3 DSpark draft checkpoint has no usable d2t")
+
+
+def normalize_cosyvoice3_dspark_config(config: dict) -> dict:
+    """Flatten the speculators-format DSpark config for SGLang's loader.
+
+    Nested ``transformer_layer_config`` fields move to the top level, the
+    architecture becomes the Omni draft class, ``aux_hidden_state_layer_ids``
+    become DFlash ``target_layer_ids``, and the vocab / mask ids are expressed
+    in the draft-owned speech embedding space.
+    """
+    normalized = dict(config)
+    layer_config = normalized.pop("transformer_layer_config", None) or {}
+    for key, value in layer_config.items():
+        normalized.setdefault(key, value)
+    normalized.pop("auto_map", None)
+    normalized["architectures"] = [DSPARK_DRAFT_ARCHITECTURE]
+    normalized.setdefault("model_type", layer_config.get("model_type", "qwen3"))
+    aux_ids = normalized.get("aux_hidden_state_layer_ids")
+    if aux_ids is not None:
+        normalized["target_layer_ids"] = [int(i) for i in aux_ids]
+    normalized["vocab_size"] = DSPARK_EMBED_ROWS
+    normalized["mask_token_id"] = DSPARK_MASK_TOKEN_ID
+    normalized["tie_word_embeddings"] = False
+    return normalized
 
 
 EntryClass = FunCosyVoice3SGLangModel

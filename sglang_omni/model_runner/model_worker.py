@@ -39,7 +39,9 @@ def _speculative_model_classes(model_architecture: str) -> dict[str, Any]:
         return {model_architecture: WhisperForConditionalGeneration}
     if model_architecture == "FunCosyVoice3SGLangModel":
         from sglang_omni.models.fun_cosyvoice3.sglang_model import (
+            DSPARK_DRAFT_ARCHITECTURE,
             EAGLE3_DRAFT_ARCHITECTURE,
+            CosyVoice3DSparkDraftModel,
             CosyVoice3Eagle3LlamaForCausalLM,
             FunCosyVoice3SGLangModel,
         )
@@ -47,6 +49,7 @@ def _speculative_model_classes(model_architecture: str) -> dict[str, Any]:
         return {
             model_architecture: FunCosyVoice3SGLangModel,
             EAGLE3_DRAFT_ARCHITECTURE: CosyVoice3Eagle3LlamaForCausalLM,
+            DSPARK_DRAFT_ARCHITECTURE: CosyVoice3DSparkDraftModel,
         }
     raise ValueError(
         "Omni speculative decoding is only supported for Whisper and "
@@ -261,12 +264,18 @@ class ModelWorker:
             model_config.v_head_dim = model_config.head_dim
             return
         if arch == "FunCosyVoice3SGLangModel":
-            from sglang_omni.models.fun_cosyvoice3.sglang_model import TOTAL_VOCAB_SIZE
+            from sglang_omni.models.fun_cosyvoice3.sglang_model import (
+                DSPARK_EMBED_ROWS,
+                TOTAL_VOCAB_SIZE,
+            )
 
             # The Qwen2 text vocab in CosyVoice-BlankEN/config.json is not the
             # generation vocab; publish the speech vocab before native
             # speculative workers size their draft/verify buffers against it.
             model_config.vocab_size = TOTAL_VOCAB_SIZE
+            # DSpark bounds its (input-only) mask token by the embedding row
+            # count; the Omni DSpark draft owns speech rows + one mask row.
+            model_config.hf_text_config.padded_vocab_size = DSPARK_EMBED_ROWS
             return
         entry = _ARCH_CONFIG_MAP.get(arch)
         if entry is None:

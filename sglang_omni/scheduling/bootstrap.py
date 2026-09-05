@@ -75,7 +75,16 @@ def init_sglang_cuda_graphs(model_worker: Any) -> None:
 
 def _is_omni_native_spec(spec_algorithm: Any) -> bool:
     """Native SGLang speculative workers Omni drives synchronously."""
-    return spec_algorithm.is_standalone() or spec_algorithm.is_eagle3()
+    return (
+        spec_algorithm.is_standalone()
+        or spec_algorithm.is_eagle3()
+        or spec_algorithm.is_dspark()
+    )
+
+
+def is_omni_native_spec(spec_algorithm: Any) -> bool:
+    """Public alias for the scheduler-side admission check."""
+    return _is_omni_native_spec(spec_algorithm)
 
 
 def speculative_draft_model(draft_worker: Any) -> Any:
@@ -84,10 +93,30 @@ def speculative_draft_model(draft_worker: Any) -> Any:
 
 
 def init_speculative_draft_cuda_graphs(
-    draft_worker: Any, *, capture_draft_decode_graph: bool
+    draft_worker: Any, *, capture_draft_decode_graph: bool, spec_algorithm: Any = None
 ) -> None:
     """Install the draft runner, capturing decode only when explicitly enabled."""
-    if draft_worker.speculative_algorithm.is_standalone():
+    # note (Junnan Li): EAGLE-family workers carry ``speculative_algorithm``;
+    # the DSpark worker does not (its ``__getattr__`` forwards to the target).
+    algorithm = getattr(draft_worker, "speculative_algorithm", None)
+    if algorithm is None:
+        algorithm = spec_algorithm
+    is_dspark = getattr(algorithm, "is_dspark", None)
+    if is_dspark is not None and is_dspark():
+        draft_worker.init_cuda_graphs()
+        draft_runner = draft_worker.draft_model_runner
+        draft_decode_runner = getattr(draft_runner, "decode_cuda_graph_runner", None)
+        logger.info(
+            "DSPARK speculative graph startup: draft_decode=%s",
+            (
+                "captured"
+                if draft_decode_runner is not None
+                and not draft_runner.server_args.disable_cuda_graph
+                else "eager"
+            ),
+        )
+        return
+    if algorithm.is_standalone():
         # note (Junnan Li): the encoder-decoder STANDALONE patch exposes
         # per-graph capture switches; stock EAGLE workers follow the global
         # cuda-graph setting for both target verify and draft decode.
@@ -147,8 +176,8 @@ def _parse_speculative_algorithm(server_args: Any) -> Any:
     algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
     if not algorithm.is_none() and not _is_omni_native_spec(algorithm):
         raise ValueError(
-            "sglang-omni only supports STANDALONE or EAGLE3 speculative decoding "
-            "in the synchronous lane"
+            "sglang-omni only supports STANDALONE, EAGLE3 or DSPARK speculative "
+            "decoding in the synchronous lane"
         )
     return algorithm
 
@@ -295,7 +324,9 @@ def create_sglang_infrastructure(
             # note (Junnan Li): with graphs disabled this is the draft
             # eager-runner hook.
             init_speculative_draft_cuda_graphs(
-                draft_worker, capture_draft_decode_graph=False
+                draft_worker,
+                capture_draft_decode_graph=False,
+                spec_algorithm=spec_algorithm,
             )
 
     req_to_token_pool, token_to_kv_pool_allocator = model_worker.get_memory_pool()

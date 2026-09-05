@@ -303,12 +303,12 @@ class OmniScheduler:
             server_args.speculative_algorithm
         )
         if not self.spec_algorithm.is_none():
-            if not (
-                self.spec_algorithm.is_standalone() or self.spec_algorithm.is_eagle3()
-            ):
+            from sglang_omni.scheduling.bootstrap import is_omni_native_spec
+
+            if not is_omni_native_spec(self.spec_algorithm):
                 raise ValueError(
-                    "sglang-omni only supports STANDALONE or EAGLE3 speculative "
-                    "decoding in the eager synchronous lane"
+                    "sglang-omni only supports STANDALONE, EAGLE3 or DSPARK "
+                    "speculative decoding in the eager synchronous lane"
                 )
             if self.enable_overlap:
                 raise ValueError(
@@ -1528,6 +1528,31 @@ class OmniScheduler:
         sampling_info = getattr(batch, "sampling_info", None)
         orchestrator = getattr(sampling_info, "penalizer_orchestrator", None)
         if orchestrator is not None and orchestrator.is_required:
+            if self.spec_algorithm.is_dspark():
+                # note (Junnan Li): the EAGLE verify cumulates the last output
+                # token per step itself (eagle_utils); the DSpark worker never
+                # does, so feed every token accepted since the previous step
+                # into the penalizers here.
+                self._cumulate_speculative_output_tokens(batch)
+                # Per-request repetition penalty for the model-side per-token
+                # verify-block penalty and the draft mirror.
+                values = [
+                    float(req.sampling_params.repetition_penalty) for req in batch.reqs
+                ]
+                rep_values = (
+                    torch.tensor(values, dtype=torch.float32, device=batch.device).view(
+                        -1, 1
+                    )
+                    if any(value != 1.0 for value in values)
+                    else None
+                )
+                publish = getattr(
+                    self.model_worker.model_runner.model,
+                    "set_speculative_repetition_penalties",
+                    None,
+                )
+                if publish is not None:
+                    publish(rep_values)
             # note (Junnan Li): the native verify reads the accumulated
             # penalty buffers that upstream only fills on its overlap path
             # (copy_for_forward); refresh them here so repetition /
@@ -1549,12 +1574,55 @@ class OmniScheduler:
                 f"required={None if orchestrator is None else orchestrator.is_required}"
             )
 
+    def _cumulate_speculative_output_tokens(self, batch) -> None:
+        """Cumulate all tokens accepted since the previous step into the penalizers.
+
+        ``cumulate_output_tokens`` takes one token per request; requests with
+        fewer new tokens repeat their last (already cumulated) one, which is a
+        no-op for the membership-style penalizers CosyVoice3 uses (repetition,
+        min_new_tokens) but would over-count a frequency penalizer. A step where
+        some request has no generated token yet is deferred to the next step.
+        """
+        reqs = list(getattr(batch, "reqs", ()) or ())
+        if not reqs:
+            return
+        orchestrator = batch.sampling_info.penalizer_orchestrator
+        vocab_size = int(getattr(orchestrator, "vocab_size", 0) or 0)
+        columns: list[list[int]] = []
+        for req in reqs:
+            done = int(getattr(req, "_omni_penalized_len", 0))
+            output_ids = list(req.output_ids)
+            if not output_ids:
+                return
+            new_ids = [
+                int(t) for t in output_ids[done:] if 0 <= int(t) < vocab_size
+            ] or [int(output_ids[-1])]
+            columns.append(new_ids)
+        for req in reqs:
+            req._omni_penalized_len = len(req.output_ids)
+        max_new = max(len(column) for column in columns)
+        device = batch.device
+        if _SPEC_DEBUG and getattr(self, "_cumulate_trace", 0) < 3:
+            self._cumulate_trace = getattr(self, "_cumulate_trace", 0) + 1
+            _spec_trace(
+                f"cumulate spec output tokens: bs={len(reqs)} max_new={max_new} "
+                f"vocab={vocab_size} head={columns[0][:9]}"
+            )
+        for k in range(max_new):
+            step_ids = [column[k] if k < len(column) else column[-1] for column in columns]
+            orchestrator.cumulate_output_tokens(
+                torch.tensor(step_ids, dtype=torch.int64, device=device)
+            )
+
     _spec_log_interval = int(os.environ.get("SGLANG_OMNI_SPEC_LOG_INTERVAL", "40"))
 
     def _trace_draft_kv(self, batch) -> None:
         """Bring-up probe: are the draft's KV rows for a request's prompt populated?"""
         try:
-            draft_runner = self.draft_worker.draft_worker.draft_runner
+            inner = getattr(self.draft_worker, "draft_worker", None)
+            draft_runner = getattr(inner, "draft_runner", None)
+            if draft_runner is None:
+                draft_runner = self.draft_worker.draft_model_runner
             pool = draft_runner.token_to_kv_pool
             req_to_token = draft_runner.req_to_token_pool.req_to_token
             target_pool = self.model_worker.model_runner.token_to_kv_pool
@@ -1563,6 +1631,16 @@ class OmniScheduler:
             locs = req_to_token[req.req_pool_idx][:n].long()
             k = pool.get_key_buffer(0)[locs].float().flatten(1).norm(dim=-1)
             kt = target_pool.get_key_buffer(0)[locs].float().flatten(1).norm(dim=-1)
+            row = req_to_token[req.req_pool_idx]
+            kv = getattr(req, "kv", None)
+            _spec_trace(
+                f"draft kv probe pool_is_target={pool is target_pool} "
+                f"k0_same_ptr={pool.get_key_buffer(0).data_ptr() == target_pool.get_key_buffer(0).data_ptr()} "
+                f"seq_len={int(batch.seq_lens[0])} committed={getattr(req, 'kv_committed_len', None)} "
+                f"allocated={getattr(kv, 'kv_allocated_len', None)} "
+                f"row_tail={row[max(n - 2, 0): n + 10].tolist()} "
+                f"spec_info={type(batch.spec_info).__name__}"
+            )
             _spec_trace(
                 f"draft kv probe mode={batch.forward_mode} rid={req.rid} n={n} "
                 f"draft_zero_rows={int((k == 0).sum())} draft_norm_mean={k.mean().item():.3f} "
@@ -2991,11 +3069,14 @@ def _clear_empty_schedule_batch_rows(batch: Any) -> None:
     if spec_info is not None:
         device = batch.req_pool_indices.device
         empty_device_indices = torch.empty(0, dtype=torch.long, device=device)
-        spec_info.filter_batch(
-            new_indices=empty_device_indices,
-            has_been_filtered=False,
-            new_indices_cpu=[],
-        )
+        # EAGLE-family inputs take ``has_been_filtered``; the DFlash/DSpark
+        # input does not, so pass only the keywords the input accepts.
+        import inspect
+
+        filter_kwargs = {"new_indices": empty_device_indices, "new_indices_cpu": []}
+        if "has_been_filtered" in inspect.signature(spec_info.filter_batch).parameters:
+            filter_kwargs["has_been_filtered"] = False
+        spec_info.filter_batch(**filter_kwargs)
 
     batch.out_cache_loc = None
     batch.mamba_track_indices = None

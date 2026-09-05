@@ -35,11 +35,11 @@ def test_asr_engine_builder_preserves_model_path() -> None:
     assert AsrEngineBuilder.resolve_checkpoint(object(), "repo/id") == "repo/id"
 
 
-@pytest.mark.parametrize("algorithm", ["EAGLE", "NGRAM", "DFLASH", "DSPARK"])
+@pytest.mark.parametrize("algorithm", ["EAGLE", "NGRAM", "DFLASH"])
 def test_speculative_overrides_reject_unsupported_algorithms(algorithm: str) -> None:
     from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
 
-    with pytest.raises(ValueError, match="only supports STANDALONE/EAGLE3"):
+    with pytest.raises(ValueError, match="only supports STANDALONE/EAGLE3/DSPARK"):
         configure_speculative_overrides(
             {"speculative_algorithm": algorithm},
             enable_speculative=False,
@@ -976,12 +976,60 @@ def test_explicit_override_algorithm_wins_over_builder_default() -> None:
 def test_first_class_unsupported_algorithm_is_rejected() -> None:
     from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
 
-    with pytest.raises(ValueError, match="only supports STANDALONE/EAGLE3"):
+    with pytest.raises(ValueError, match="only supports STANDALONE/EAGLE3/DSPARK"):
         configure_speculative_overrides(
             {},
             enable_speculative=True,
             speculative_draft_model_path="/models/draft",
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
+            speculative_algorithm="EAGLE",
+        )
+
+
+def test_dspark_overrides_skip_the_chain_length_rule() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    overrides = configure_speculative_overrides(
+        {},
+        enable_speculative=True,
+        speculative_draft_model_path="/models/cosyvoice3-dspark",
+        speculative_num_steps=1,
+        speculative_num_draft_tokens=None,
+        speculative_algorithm="dspark",
+    )
+
+    assert overrides["speculative_algorithm"] == "DSPARK"
+    assert overrides["speculative_num_steps"] == 1
+    assert overrides["speculative_eagle_topk"] == 1
+    assert "speculative_num_draft_tokens" not in overrides
+    assert overrides["disable_overlap_schedule"] is True
+
+    explicit = configure_speculative_overrides(
+        {"speculative_num_draft_tokens": 9},
+        enable_speculative=True,
+        speculative_draft_model_path="/models/cosyvoice3-dspark",
+        speculative_num_steps=1,
+        speculative_num_draft_tokens=None,
+        speculative_algorithm="DSPARK",
+    )
+    assert explicit["speculative_num_draft_tokens"] == 9
+
+    with pytest.raises(ValueError, match="speculative_num_steps == 1"):
+        configure_speculative_overrides(
+            {},
+            enable_speculative=True,
+            speculative_draft_model_path="/models/cosyvoice3-dspark",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_algorithm="DSPARK",
+        )
+    with pytest.raises(ValueError, match=">= 2"):
+        configure_speculative_overrides(
+            {},
+            enable_speculative=True,
+            speculative_draft_model_path="/models/cosyvoice3-dspark",
+            speculative_num_steps=1,
+            speculative_num_draft_tokens=1,
             speculative_algorithm="DSPARK",
         )

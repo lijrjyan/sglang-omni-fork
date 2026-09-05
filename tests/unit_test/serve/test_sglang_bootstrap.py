@@ -691,7 +691,7 @@ def test_eagle3_bootstrap_keeps_stock_draft_layer_pricing(monkeypatch):
 def test_parse_speculative_algorithm_accepts_native_family_only() -> None:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    for name in ("STANDALONE", "EAGLE3"):
+    for name in ("STANDALONE", "EAGLE3", "DSPARK"):
         parsed = bootstrap._parse_speculative_algorithm(
             SimpleNamespace(speculative_algorithm=name)
         )
@@ -699,10 +699,38 @@ def test_parse_speculative_algorithm_accepts_native_family_only() -> None:
     assert bootstrap._parse_speculative_algorithm(
         SimpleNamespace(speculative_algorithm=None)
     ).is_none()
-    with pytest.raises(ValueError, match="STANDALONE or EAGLE3"):
+    with pytest.raises(ValueError, match="STANDALONE, EAGLE3 or DSPARK"):
         bootstrap._parse_speculative_algorithm(
             SimpleNamespace(speculative_algorithm="EAGLE")
         )
+
+
+def test_dspark_draft_cuda_graph_init_uses_the_scheduler_algorithm() -> None:
+    """The DSpark worker has no ``speculative_algorithm``; its ``__getattr__``
+    forwards to the target adapter, so bootstrap must dispatch on the parsed
+    algorithm and read the draft graph state from its draft runner."""
+    calls = []
+
+    class Target:
+        pass
+
+    class DSparkDraft:
+        def __init__(self) -> None:
+            self.draft_model_runner = SimpleNamespace(decode_cuda_graph_runner=None)
+            self._target = Target()
+
+        def __getattr__(self, name):
+            return getattr(self._target, name)
+
+        def init_cuda_graphs(self, **kwargs):
+            calls.append(kwargs)
+
+    algorithm = SimpleNamespace(is_dspark=lambda: True, is_standalone=lambda: False)
+    bootstrap.init_speculative_draft_cuda_graphs(
+        DSparkDraft(), capture_draft_decode_graph=True, spec_algorithm=algorithm
+    )
+
+    assert calls == [{}]
 
 
 def test_draft_cuda_graph_init_dispatches_on_algorithm() -> None:

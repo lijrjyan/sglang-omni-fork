@@ -439,7 +439,7 @@ def create_sglang_tts_engine_executor(
     speculative_algorithm: str = "EAGLE3",
     speculative_draft_model_path: str | None = None,
     speculative_num_steps: int = 3,
-    speculative_num_draft_tokens: int = 4,
+    speculative_num_draft_tokens: int | None = None,
     speculative_cuda_graph: bool = False,
     speculative_draft_cuda_graph: bool = False,
     speculative_use_rejection_sampling: bool = True,
