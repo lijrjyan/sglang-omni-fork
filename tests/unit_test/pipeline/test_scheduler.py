@@ -3031,3 +3031,88 @@ def test_omni_scheduler_running_abort_does_not_leak_prefill_dedup_state(
     assert ends == [("req-1", "aborted")]
     assert scheduler._prefill_start_done == set()
     assert scheduler._prefill_start_done == set()
+
+
+def test_omni_scheduler_prepares_spec_prefill_rows_and_penalties() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    rows = object()
+    seen = {}
+
+    class Runner:
+        def speculative_prefill_input_embeds(self, batch, requests):
+            seen["requests"] = requests
+            return rows
+
+    class Orchestrator:
+        is_required = True
+
+    class SamplingInfo:
+        penalizer_orchestrator = Orchestrator()
+        acc_scaling_penalties = None
+        acc_additive_penalties = None
+
+        def update_penalties(self):
+            seen["penalties"] = True
+
+    scheduler._model_runner = Runner()
+    scheduler._build_sched_output = lambda batch: SimpleNamespace(requests=["r"])
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: True, is_idle=lambda: False),
+        sampling_info=SamplingInfo(),
+        input_embeds=None,
+        reqs=[object()],
+    )
+
+    scheduler._prepare_speculative_batch(batch)
+
+    assert batch.input_embeds is rows
+    assert seen == {"requests": ["r"], "penalties": True}
+
+
+def test_omni_scheduler_spec_decode_batches_skip_prefill_rows() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._model_runner = SimpleNamespace(
+        speculative_prefill_input_embeds=lambda *_: pytest.fail("decode has no rows")
+    )
+
+    class Orchestrator:
+        is_required = False
+
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: False, is_idle=lambda: False),
+        sampling_info=SimpleNamespace(
+            penalizer_orchestrator=Orchestrator(),
+            update_penalties=lambda: pytest.fail("no penalties required"),
+        ),
+        input_embeds=None,
+    )
+
+    scheduler._prepare_speculative_batch(batch)
+
+    assert batch.input_embeds is None
+
+
+def test_omni_scheduler_records_spec_accept_length(monkeypatch, tmp_path) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._spec_log_interval = 2
+    scheduler.server_args = SimpleNamespace(speculative_num_draft_tokens=4)
+    stats_path = tmp_path / "stats.log"
+    monkeypatch.setenv("SGLANG_OMNI_SPEC_STATS", str(stats_path))
+    decode = SimpleNamespace(forward_mode=SimpleNamespace(is_extend=lambda: False))
+    decode.reqs = [object(), object()]
+    extend = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: True), reqs=[object()]
+    )
+
+    scheduler._record_speculative_step(extend, SimpleNamespace(accept_lens=None))
+    scheduler._record_speculative_step(
+        decode, SimpleNamespace(accept_lens=torch.tensor([3, 1]))
+    )
+    scheduler._record_speculative_step(
+        decode, SimpleNamespace(accept_lens=torch.tensor([4, 4]))
+    )
+
+    stats = scheduler._omni_spec_stats
+    assert stats["steps"] == 2 and stats["rows"] == 4 and stats["accepted"] == 12
+    assert stats["window_steps"] == 0
+    assert "accept_len=3.000" in stats_path.read_text()

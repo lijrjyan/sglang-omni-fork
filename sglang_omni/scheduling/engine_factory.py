@@ -51,6 +51,22 @@ _SPECULATIVE_OVERRIDE_FIELDS = (
     "speculative_num_draft_tokens",
 )
 
+# Native SGLang speculative workers Omni drives through its synchronous lane.
+# Both use the EAGLE V2 worker family (chain verify, topk=1); STANDALONE runs
+# a full draft model, EAGLE3 a one-layer draft fed by target aux hidden states.
+SUPPORTED_SPECULATIVE_ALGORITHMS = ("STANDALONE", "EAGLE3")
+
+
+def _normalize_speculative_algorithm(algorithm: Any) -> str:
+    normalized = str(algorithm).upper()
+    if normalized not in SUPPORTED_SPECULATIVE_ALGORITHMS:
+        raise ValueError(
+            "sglang-omni only supports "
+            f"{'/'.join(SUPPORTED_SPECULATIVE_ALGORITHMS)} speculative decoding "
+            f"in the synchronous lane; got speculative_algorithm={algorithm!r}"
+        )
+    return normalized
+
 
 def configure_speculative_overrides(
     overrides: Mapping[str, Any],
@@ -61,8 +77,9 @@ def configure_speculative_overrides(
     speculative_num_draft_tokens: int,
     speculative_cuda_graph: bool = False,
     speculative_draft_cuda_graph: bool = False,
+    speculative_algorithm: str = "STANDALONE",
 ) -> dict[str, Any]:
-    """Validate Omni's STANDALONE speculative decoding configuration."""
+    """Validate Omni's native (STANDALONE / EAGLE3) speculative configuration."""
     configured = dict(overrides)
     if speculative_draft_cuda_graph and not speculative_cuda_graph:
         raise ValueError(
@@ -70,7 +87,9 @@ def configure_speculative_overrides(
         )
     if enable_speculative:
         requested = {
-            "speculative_algorithm": "STANDALONE",
+            "speculative_algorithm": _normalize_speculative_algorithm(
+                speculative_algorithm
+            ),
             "speculative_draft_model_path": speculative_draft_model_path,
             "speculative_num_steps": speculative_num_steps,
             "speculative_eagle_topk": 1,
@@ -81,6 +100,11 @@ def configure_speculative_overrides(
             conflicts = existing is not None and existing != value
             if name == "speculative_algorithm" and existing is not None:
                 conflicts = str(existing).upper() != value
+                if conflicts and enable_speculative:
+                    # A builder-level algorithm default yields to an explicit
+                    # server_args_overrides choice among the supported set.
+                    value = _normalize_speculative_algorithm(existing)
+                    conflicts = False
             if conflicts:
                 raise ValueError(
                     f"Conflicting first-class {name}={value!r} and "
@@ -102,29 +126,26 @@ def configure_speculative_overrides(
             )
         if speculative_cuda_graph:
             raise ValueError(
-                "speculative_cuda_graph=True requires STANDALONE speculative decoding"
+                "speculative_cuda_graph=True requires native speculative decoding "
+                "(speculative_algorithm STANDALONE or EAGLE3)"
             )
         return configured
 
-    normalized_algorithm = str(algorithm).upper()
-    if normalized_algorithm != "STANDALONE":
-        raise ValueError(
-            "sglang-omni only supports STANDALONE speculative decoding in the "
-            f"synchronous lane; got speculative_algorithm={algorithm!r}"
-        )
+    normalized_algorithm = _normalize_speculative_algorithm(algorithm)
     configured["speculative_algorithm"] = normalized_algorithm
 
     draft_path = configured.get("speculative_draft_model_path")
     if not isinstance(draft_path, str) or not draft_path.strip():
         raise ValueError(
-            "speculative_draft_model_path is required for STANDALONE "
-            "speculative decoding"
+            "speculative_draft_model_path is required for "
+            f"{normalized_algorithm} speculative decoding"
         )
 
     topk = configured.setdefault("speculative_eagle_topk", 1)
     if topk != 1:
         raise ValueError(
-            "speculative_eagle_topk must be 1 for the STANDALONE lane; " f"got {topk!r}"
+            "speculative_eagle_topk must be 1 for the synchronous speculative "
+            f"lane; got {topk!r}"
         )
     num_steps = int(configured.setdefault("speculative_num_steps", 3))
     num_draft_tokens = int(configured.setdefault("speculative_num_draft_tokens", 4))
@@ -186,6 +207,7 @@ class SGLangGenerationEngineBuilder(ABC):
     # CUDA graph contract; a deployment override cannot enable it otherwise.
     supports_breakable_prefill_cuda_graph: bool = False
     enable_speculative: bool = False
+    speculative_algorithm: str = "STANDALONE"
     speculative_draft_model_path: str | None = None
     speculative_num_steps: int = 3
     speculative_num_draft_tokens: int = 4
@@ -263,6 +285,7 @@ class SGLangGenerationEngineBuilder(ABC):
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             speculative_cuda_graph=self.speculative_cuda_graph,
             speculative_draft_cuda_graph=self.speculative_draft_cuda_graph,
+            speculative_algorithm=self.speculative_algorithm,
         )
         self.adjust_overrides(overrides)
         if "context_length" in overrides:
@@ -665,6 +688,8 @@ class TtsEngineBuilder(SGLangGenerationEngineBuilder):
         model_runner: Any,
         request_builder: Any,
         result_adapter: Any,
+        target_worker_adapter: Any = None,
+        draft_worker: Any = None,
     ) -> Any:
         from sglang_omni.scheduling import omni_scheduler
 
@@ -680,6 +705,8 @@ class TtsEngineBuilder(SGLangGenerationEngineBuilder):
             result_adapter=result_adapter,
             abort_callback=self.make_abort_callback(),
             request_finished_callback=self.make_request_finished_callback(),
+            target_worker_adapter=target_worker_adapter,
+            draft_worker=draft_worker,
             **self.extra_scheduler_kwargs(),
         )
 
@@ -694,9 +721,18 @@ class TtsEngineBuilder(SGLangGenerationEngineBuilder):
         token_to_kv_pool_allocator: Any,
         server_args: Any,
         model_config: Any,
+        target_worker_adapter: Any = None,
+        draft_worker: Any = None,
     ) -> tuple[Any, Any]:
         model_runner = self.make_model_runner(model_worker, output_proc)
         request_builder, result_adapter = self.make_adapters(model)
+        # Only native speculative stages pass the extra workers, so builders
+        # with a narrower make_scheduler signature keep working unchanged.
+        speculative_kwargs = (
+            dict(target_worker_adapter=target_worker_adapter, draft_worker=draft_worker)
+            if draft_worker is not None
+            else {}
+        )
         scheduler = self.make_scheduler(
             model_worker=model_worker,
             tree_cache=tree_cache,
@@ -707,5 +743,6 @@ class TtsEngineBuilder(SGLangGenerationEngineBuilder):
             model_runner=model_runner,
             request_builder=request_builder,
             result_adapter=result_adapter,
+            **speculative_kwargs,
         )
         return scheduler, model_runner

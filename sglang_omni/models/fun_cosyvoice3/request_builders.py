@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -33,7 +34,14 @@ from sglang_omni.utils.audio import decode_audio_data_uri as _decode_audio_data_
 from sglang_omni.utils.audio import load_audio as _shared_load_audio
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 
-from .sglang_model import CONTROL_TOKEN_IDS, EOS_ID, SOS_ID, TASK_ID, TOTAL_VOCAB_SIZE
+from .sglang_model import (
+    CONTROL_TOKEN_IDS,
+    EOS_ID,
+    SOS_ID,
+    TASK_ID,
+    TOTAL_VOCAB_SIZE,
+    VOCAB_SIZE,
+)
 from .utils import (
     CosyVoice3Tokenizer,
     SpeakerEncoder,
@@ -163,6 +171,9 @@ class CosyVoice3SGLangRequestData(SGLangARRequestData):
     output_codes: list[torch.Tensor] = None
     prompt_input_embeds: torch.Tensor | None = None
     engine_start_s: float = 0.0
+    # note (Junnan Li): native speculative batches bypass the Omni runner's
+    # post_decode collection; the result adapter then reads req.output_ids.
+    speculative: bool = False
 
     def __post_init__(self):
         if self.output_codes is None:
@@ -809,8 +820,17 @@ def apply_sglang_cosyvoice3_result(
     data: CosyVoice3SGLangRequestData,
 ) -> StagePayload:
     code_parts: list[torch.Tensor] = []
-    if data.output_codes:
+    if data.speculative:
+        output_ids = data.output_ids or list(data.req.output_ids)
+        speech_ids = [int(token) for token in output_ids if int(token) < VOCAB_SIZE]
+        if speech_ids:
+            code_parts.append(torch.tensor(speech_ids, dtype=torch.long))
+        completion_tokens = len(speech_ids)
+    elif data.output_codes:
         code_parts.append(torch.stack(data.output_codes, dim=0).to(dtype=torch.long))
+        completion_tokens = len(data.output_codes)
+    else:
+        completion_tokens = 0
 
     if code_parts:
         device = code_parts[0].device
@@ -826,9 +846,10 @@ def apply_sglang_cosyvoice3_result(
     state.prompt_tokens = (
         int(data.input_ids.numel()) if data.input_ids is not None else 0
     )
-    state.completion_tokens = len(data.output_codes)
+    state.completion_tokens = completion_tokens
     state.engine_time_s = time.perf_counter() - data.engine_start_s
     state.sample_rate = _SAMPLE_RATE
+    _maybe_dump_codes(payload, codes, state, data)
 
     return StagePayload(
         request_id=payload.request_id,
@@ -837,9 +858,43 @@ def apply_sglang_cosyvoice3_result(
     )
 
 
-def make_cosyvoice3_scheduler_adapters(*, model: Any):
+def _maybe_dump_codes(
+    payload: StagePayload, codes: torch.Tensor, state: Any, data: Any = None
+) -> None:
+    """Evidence hook: append the LLM-stage speech codes to a JSONL file."""
+    dump_path = os.environ.get("SGLANG_OMNI_COSYVOICE3_CODES_DUMP")
+    if not dump_path:
+        return
+    request = payload.request
+    inputs = getattr(request, "inputs", None)
+    if isinstance(inputs, dict):
+        text = inputs.get("input") or inputs.get("text")
+    else:
+        text = inputs
+    record = {
+        "request_id": payload.request_id,
+        "input": text if isinstance(text, str) else None,
+        "inputs_repr": None if isinstance(text, str) else repr(inputs)[:300],
+        "codes": [int(code) for code in codes.reshape(-1).tolist()],
+        "completion_tokens": int(state.completion_tokens),
+        "prompt_tokens": int(state.prompt_tokens),
+        "engine_time_s": float(state.engine_time_s),
+        "ts": time.time(),
+    }
+    req = getattr(data, "req", None)
+    verify_ct = getattr(req, "spec_verify_ct", None)
+    if verify_ct:
+        record["spec_verify_ct"] = int(verify_ct)
+        record["spec_accept_len"] = len(getattr(req, "output_ids", ())) / int(verify_ct)
+    with open(dump_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, default=str) + "\n")
+
+
+def make_cosyvoice3_scheduler_adapters(*, model: Any, enable_speculative: bool = False):
     def request_builder(payload: StagePayload) -> CosyVoice3SGLangRequestData:
-        return build_sglang_cosyvoice3_request(payload, model=model)
+        data = build_sglang_cosyvoice3_request(payload, model=model)
+        data.speculative = bool(enable_speculative)
+        return data
 
     def result_adapter(data: CosyVoice3SGLangRequestData) -> StagePayload:
         return apply_sglang_cosyvoice3_result(data.stage_payload, data)

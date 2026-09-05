@@ -25,31 +25,49 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def register_speculative_omni_models(model_architecture: str) -> None:
-    """Register Whisper for native speculative draft loading."""
-    from sglang.srt.models.registry import ModelRegistry
+def _speculative_model_classes(model_architecture: str) -> dict[str, Any]:
+    """Omni model classes SGLang's registry must know for native spec workers.
 
-    if model_architecture != "WhisperForConditionalGeneration":
-        raise ValueError(
-            "Omni speculative decoding is only supported for Whisper; "
-            f"got {model_architecture!r}"
+    Keyed by target architecture; each entry maps registry names to classes
+    (the target itself plus any Omni-owned draft architecture).
+    """
+    if model_architecture == "WhisperForConditionalGeneration":
+        from sglang_omni.models.whisper_asr.sglang_model import (
+            WhisperForConditionalGeneration,
         )
-    from sglang_omni.models.whisper_asr.sglang_model import (
-        WhisperForConditionalGeneration,
+
+        return {model_architecture: WhisperForConditionalGeneration}
+    if model_architecture == "FunCosyVoice3SGLangModel":
+        from sglang_omni.models.fun_cosyvoice3.sglang_model import (
+            EAGLE3_DRAFT_ARCHITECTURE,
+            CosyVoice3Eagle3LlamaForCausalLM,
+            FunCosyVoice3SGLangModel,
+        )
+
+        return {
+            model_architecture: FunCosyVoice3SGLangModel,
+            EAGLE3_DRAFT_ARCHITECTURE: CosyVoice3Eagle3LlamaForCausalLM,
+        }
+    raise ValueError(
+        "Omni speculative decoding is only supported for Whisper and "
+        f"Fun-CosyVoice3; got {model_architecture!r}"
     )
 
-    ModelRegistry.models[model_architecture] = WhisperForConditionalGeneration
+
+def register_speculative_omni_models(model_architecture: str) -> None:
+    """Register the target (and Omni-owned draft) classes for native spec loading."""
+    from sglang.srt.models.registry import ModelRegistry
+
+    for name, model_class in _speculative_model_classes(model_architecture).items():
+        ModelRegistry.models[name] = model_class
 
 
 class SpeculativeTargetWorkerAdapter:
     """Present Omni's target worker through native TpModelWorker semantics."""
 
     def __init__(self, worker: ModelWorker, *, tokenizer: Any) -> None:
-        if tokenizer is None:
-            raise ValueError(
-                "STANDALONE speculative decoding requires the target tokenizer "
-                "during worker bootstrap"
-            )
+        # note (Junnan Li): native workers read ``tokenizer`` only for grammar
+        # and disaggregation paths; codec stages that sample raw ids pass None.
         self.worker = worker
         self.server_args = worker.server_args
         self.model_runner = worker.model_runner
@@ -241,6 +259,14 @@ class ModelWorker:
             model_config.vocab_size = int(cfg.vocab_size)
             model_config.head_dim = int(cfg.d_model) // int(cfg.decoder_attention_heads)
             model_config.v_head_dim = model_config.head_dim
+            return
+        if arch == "FunCosyVoice3SGLangModel":
+            from sglang_omni.models.fun_cosyvoice3.sglang_model import TOTAL_VOCAB_SIZE
+
+            # The Qwen2 text vocab in CosyVoice-BlankEN/config.json is not the
+            # generation vocab; publish the speech vocab before native
+            # speculative workers size their draft/verify buffers against it.
+            model_config.vocab_size = TOTAL_VOCAB_SIZE
             return
         entry = _ARCH_CONFIG_MAP.get(arch)
         if entry is None:

@@ -35,11 +35,11 @@ def test_asr_engine_builder_preserves_model_path() -> None:
     assert AsrEngineBuilder.resolve_checkpoint(object(), "repo/id") == "repo/id"
 
 
-@pytest.mark.parametrize("algorithm", ["EAGLE", "EAGLE3", "NGRAM", "DFLASH"])
-def test_speculative_overrides_reject_non_standalone_algorithms(algorithm: str) -> None:
+@pytest.mark.parametrize("algorithm", ["EAGLE", "NGRAM", "DFLASH", "DSPARK"])
+def test_speculative_overrides_reject_unsupported_algorithms(algorithm: str) -> None:
     from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
 
-    with pytest.raises(ValueError, match="only supports STANDALONE"):
+    with pytest.raises(ValueError, match="only supports STANDALONE/EAGLE3"):
         configure_speculative_overrides(
             {"speculative_algorithm": algorithm},
             enable_speculative=False,
@@ -937,3 +937,51 @@ def test_tts_engine_builder_base_scheduler_preserves_abort_with_extra_kwargs(
     assert captured_kwargs["tp_worker"] == "worker"
     assert captured_kwargs["request_builder"] == "request_builder"
     assert captured_kwargs["result_adapter"] == "result_adapter"
+
+
+def test_first_class_eagle3_args_populate_server_overrides() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    overrides = configure_speculative_overrides(
+        {},
+        enable_speculative=True,
+        speculative_draft_model_path="/models/cosyvoice3-eagle3",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        speculative_algorithm="eagle3",
+    )
+
+    assert overrides["speculative_algorithm"] == "EAGLE3"
+    assert overrides["speculative_draft_model_path"] == "/models/cosyvoice3-eagle3"
+    assert overrides["speculative_eagle_topk"] == 1
+    assert overrides["disable_overlap_schedule"] is True
+    assert overrides["disable_cuda_graph"] is True
+
+
+def test_explicit_override_algorithm_wins_over_builder_default() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    overrides = configure_speculative_overrides(
+        {"speculative_algorithm": "EAGLE3"},
+        enable_speculative=True,
+        speculative_draft_model_path="/models/draft",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        speculative_algorithm="STANDALONE",
+    )
+
+    assert overrides["speculative_algorithm"] == "EAGLE3"
+
+
+def test_first_class_unsupported_algorithm_is_rejected() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    with pytest.raises(ValueError, match="only supports STANDALONE/EAGLE3"):
+        configure_speculative_overrides(
+            {},
+            enable_speculative=True,
+            speculative_draft_model_path="/models/draft",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_algorithm="DSPARK",
+        )

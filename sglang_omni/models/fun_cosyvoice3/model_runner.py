@@ -90,10 +90,30 @@ class FunCosyVoice3ModelRunner(ModelRunner):
                 torch.tensor([token_id], dtype=torch.long)
             )
 
+    def speculative_prefill_input_embeds(
+        self, schedule_batch: Any, requests: list
+    ) -> torch.Tensor | None:
+        """Projected prompt rows for a native speculative target prefill."""
+        del schedule_batch
+        if not requests:
+            return None
+        device = next(self.model.parameters()).device
+        return self._build_prefill_input_embeds_on(requests, device=device)
+
     def _build_prefill_input_embeds(
         self,
         forward_batch: Any,
         requests: list,
+    ) -> torch.Tensor:
+        return self._build_prefill_input_embeds_on(
+            requests, device=forward_batch.input_ids.device
+        )
+
+    def _build_prefill_input_embeds_on(
+        self,
+        requests: list,
+        *,
+        device: Any,
     ) -> torch.Tensor:
         pieces = []
         for sched_req in requests:
@@ -108,7 +128,7 @@ class FunCosyVoice3ModelRunner(ModelRunner):
                 )
             pieces.append(prompt_embeds[prefix_len : prefix_len + req_len])
         return torch.cat(pieces, dim=0).to(
-            device=forward_batch.input_ids.device,
+            device=device,
             dtype=next(self.model.parameters()).dtype,
         )
 

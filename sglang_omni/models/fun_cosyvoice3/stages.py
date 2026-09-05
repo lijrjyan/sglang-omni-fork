@@ -435,12 +435,29 @@ def create_sglang_tts_engine_executor(
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
     server_args_overrides: dict[str, Any] | None = None,
+    enable_speculative: bool = False,
+    speculative_algorithm: str = "EAGLE3",
+    speculative_draft_model_path: str | None = None,
+    speculative_num_steps: int = 3,
+    speculative_num_draft_tokens: int = 4,
+    speculative_cuda_graph: bool = False,
+    speculative_draft_cuda_graph: bool = False,
+    speculative_use_rejection_sampling: bool = True,
 ) -> Any:
     from sglang_omni.models.fun_cosyvoice3.engine_builder import (
         FunCosyVoice3EngineBuilder,
     )
 
-    return FunCosyVoice3EngineBuilder().build(
+    return FunCosyVoice3EngineBuilder(
+        enable_speculative=enable_speculative,
+        speculative_algorithm=speculative_algorithm,
+        speculative_draft_model_path=speculative_draft_model_path,
+        speculative_num_steps=speculative_num_steps,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        speculative_cuda_graph=speculative_cuda_graph,
+        speculative_draft_cuda_graph=speculative_draft_cuda_graph,
+        speculative_use_rejection_sampling=speculative_use_rejection_sampling,
+    ).build(
         model_path,
         device=device,
         gpu_id=gpu_id,

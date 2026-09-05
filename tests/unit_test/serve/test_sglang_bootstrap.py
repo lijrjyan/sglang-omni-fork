@@ -178,7 +178,11 @@ def test_speculative_bootstrap_shares_pools_before_initializing_backends(monkeyp
         return draft
 
     algorithm = SimpleNamespace(
-        is_none=lambda: False, create_worker=lambda args: create_draft
+        name="STANDALONE",
+        is_none=lambda: False,
+        is_standalone=lambda: True,
+        is_eagle3=lambda: False,
+        create_worker=lambda args: create_draft,
     )
     monkeypatch.setattr(
         bootstrap, "_parse_speculative_algorithm", lambda args: algorithm
@@ -607,3 +611,124 @@ def test_create_sglang_infrastructure_consumes_scoped_kv_budget(
     captured.clear()
     bootstrap.create_sglang_infrastructure(server_args, 0)
     assert captured["kv_cache_bytes"] is None
+
+
+def test_eagle3_bootstrap_keeps_stock_draft_layer_pricing(monkeypatch):
+    events = []
+    runner = SimpleNamespace(
+        ps="parallel-state",
+        dist_port=12345,
+        memory_pool_config="pool-config",
+        spec_aux_config=SimpleNamespace(eagle_draft_num_layers=1),
+        alloc_memory_pool=lambda: events.append("target-pools"),
+        init_attention_backends=lambda: events.append("target-attention"),
+    )
+    worker = SimpleNamespace(
+        model_runner=runner,
+        model_config="model-config",
+        get_memory_pool=lambda: ("req-pool", "kv-pool"),
+    )
+    draft = SimpleNamespace(
+        draft_worker=SimpleNamespace(
+            draft_runner=SimpleNamespace(
+                layer_info=SimpleNamespace(num_effective_layers=24)
+            )
+        ),
+        alloc_memory_pool=lambda **kwargs: events.append("draft-pools"),
+        init_attention_backends=lambda: events.append("draft-attention"),
+    )
+    algorithm = SimpleNamespace(
+        name="EAGLE3",
+        is_none=lambda: False,
+        is_standalone=lambda: False,
+        is_eagle3=lambda: True,
+        create_worker=lambda args: (lambda **kwargs: draft),
+    )
+    monkeypatch.setattr(
+        bootstrap, "_parse_speculative_algorithm", lambda args: algorithm
+    )
+    monkeypatch.setattr(
+        bootstrap, "_describe_sglang_runtime_configuration", lambda *args: "test"
+    )
+    monkeypatch.setattr(model_worker_module, "ModelWorker", lambda **kwargs: worker)
+    monkeypatch.setattr(
+        model_worker_module,
+        "SpeculativeTargetWorkerAdapter",
+        lambda *args, **kwargs: object(),
+    )
+    registered = []
+    monkeypatch.setattr(
+        model_worker_module,
+        "register_speculative_omni_models",
+        lambda arch: registered.append(arch),
+    )
+    monkeypatch.setattr(sglang_backend, "create_tree_cache", lambda *args: "tree")
+    monkeypatch.setattr(bootstrap, "init_sglang_cuda_graphs", lambda worker: None)
+    monkeypatch.setattr(
+        bootstrap, "init_speculative_draft_cuda_graphs", lambda worker, **kw: None
+    )
+    args = SimpleNamespace(
+        disable_overlap_schedule=True, page_size=1, speculative_draft_model_path="draft"
+    )
+
+    result = bootstrap.create_sglang_infrastructure(
+        args, 0, model_arch_override="FunCosyVoice3SGLangModel"
+    )
+
+    # The normalised EAGLE3 draft config already prices one layer; the
+    # STANDALONE encoder-decoder override must not touch it.
+    assert runner.spec_aux_config.eagle_draft_num_layers == 1
+    assert registered == ["FunCosyVoice3SGLangModel"]
+    assert result[-1] is draft
+    assert events == [
+        "target-pools",
+        "draft-pools",
+        "target-attention",
+        "draft-attention",
+    ]
+
+
+def test_parse_speculative_algorithm_accepts_native_family_only() -> None:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    for name in ("STANDALONE", "EAGLE3"):
+        parsed = bootstrap._parse_speculative_algorithm(
+            SimpleNamespace(speculative_algorithm=name)
+        )
+        assert parsed == SpeculativeAlgorithm.from_string(name)
+    assert bootstrap._parse_speculative_algorithm(
+        SimpleNamespace(speculative_algorithm=None)
+    ).is_none()
+    with pytest.raises(ValueError, match="STANDALONE or EAGLE3"):
+        bootstrap._parse_speculative_algorithm(
+            SimpleNamespace(speculative_algorithm="EAGLE")
+        )
+
+
+def test_draft_cuda_graph_init_dispatches_on_algorithm() -> None:
+    calls = []
+
+    class Draft:
+        def __init__(self, standalone: bool) -> None:
+            self.speculative_algorithm = SimpleNamespace(
+                is_standalone=lambda: standalone,
+                name="STANDALONE" if standalone else "EAGLE3",
+            )
+            self.draft_worker = SimpleNamespace(
+                cuda_graph_runner=None, cuda_graph_runner_for_draft_extend=None
+            )
+
+        def init_cuda_graphs(self, **kwargs):
+            calls.append(kwargs)
+
+    bootstrap.init_speculative_draft_cuda_graphs(
+        Draft(True), capture_draft_decode_graph=True
+    )
+    bootstrap.init_speculative_draft_cuda_graphs(
+        Draft(False), capture_draft_decode_graph=True
+    )
+
+    assert calls == [
+        {"capture_draft_decode_graph": True, "capture_draft_extend_graph": False},
+        {},
+    ]

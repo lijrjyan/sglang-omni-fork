@@ -14,6 +14,7 @@ inheriting from ``SGLangScheduler``.
 from __future__ import annotations
 
 import logging
+import os
 import queue as _queue_mod
 import threading
 import time
@@ -66,6 +67,9 @@ from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.types import DeferredAdmission
 
 logger = logging.getLogger(__name__)
+
+from sglang_omni.utils.spec_debug import SPEC_DEBUG as _SPEC_DEBUG
+from sglang_omni.utils.spec_debug import spec_trace as _spec_trace
 
 _FAILED_BATCH_RESULT = object()
 
@@ -299,22 +303,24 @@ class OmniScheduler:
             server_args.speculative_algorithm
         )
         if not self.spec_algorithm.is_none():
-            if not self.spec_algorithm.is_standalone():
+            if not (
+                self.spec_algorithm.is_standalone() or self.spec_algorithm.is_eagle3()
+            ):
                 raise ValueError(
-                    "sglang-omni only supports STANDALONE speculative decoding in "
-                    "the eager synchronous lane"
+                    "sglang-omni only supports STANDALONE or EAGLE3 speculative "
+                    "decoding in the eager synchronous lane"
                 )
             if self.enable_overlap:
                 raise ValueError(
-                    "STANDALONE speculative decoding requires enable_overlap=False"
+                    "native speculative decoding requires enable_overlap=False"
                 )
             if self.enable_async_decode:
                 raise ValueError(
-                    "STANDALONE speculative decoding requires enable_async_decode=False"
+                    "native speculative decoding requires enable_async_decode=False"
                 )
             if target_worker_adapter is None or draft_worker is None:
                 raise ValueError(
-                    "STANDALONE speculative decoding requires prebuilt target and "
+                    "native speculative decoding requires prebuilt target and "
                     "draft workers"
                 )
 
@@ -1416,6 +1422,10 @@ class OmniScheduler:
         return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
     def run_batch(self, batch, pp_proxy_tensors=None):
+        _spec_trace(
+            f"run_batch mode={getattr(batch, 'forward_mode', None)} "
+            f"spec={self.spec_algorithm} reqs={len(getattr(batch, 'reqs', ()) or ())}"
+        )
         try:
             return self._run_batch(batch, pp_proxy_tensors)
         except Exception as exc:
@@ -1462,8 +1472,14 @@ class OmniScheduler:
         self._emit_prefill_start_for_batch(batch)
         self._stamp_batch_launch(batch)
         resolve_forward_inputs(batch, self.future_map)
+        _spec_trace(
+            f"run_speculative_batch mode={getattr(batch, 'forward_mode', None)} "
+            f"reqs={len(getattr(batch, 'reqs', ()) or ())}"
+        )
+        self._prepare_speculative_batch(batch)
         with self._forward_isolation(batch, overlap=False):
             batch_result = self.draft_worker.forward_batch_generation(batch)
+        self._record_speculative_step(batch, batch_result)
         batch.spec_info = batch_result.next_draft_input
         if batch_result.new_seq_lens is not None:
             batch.seq_lens = batch_result.new_seq_lens
@@ -1492,6 +1508,125 @@ class OmniScheduler:
             batch_result.extend_logprob_start_len_per_req = None
         self._emit_prefill_end_for_batch(batch)
         return batch_result
+
+    def _prepare_speculative_batch(self, batch) -> None:
+        """Omni-side inputs a native speculative forward cannot derive itself."""
+        runner = getattr(self, "_model_runner", None)
+        forward_mode = getattr(batch, "forward_mode", None)
+        if (
+            runner is not None
+            and forward_mode is not None
+            and forward_mode.is_extend()
+            and not forward_mode.is_idle()
+        ):
+            sched_output = self._build_sched_output(batch)
+            input_embeds = runner.speculative_prefill_input_embeds(
+                batch, sched_output.requests
+            )
+            if input_embeds is not None:
+                batch.input_embeds = input_embeds
+        sampling_info = getattr(batch, "sampling_info", None)
+        orchestrator = getattr(sampling_info, "penalizer_orchestrator", None)
+        if orchestrator is not None and orchestrator.is_required:
+            # note (Junnan Li): the native verify reads the accumulated
+            # penalty buffers that upstream only fills on its overlap path
+            # (copy_for_forward); refresh them here so repetition /
+            # min_new_tokens masking apply to every verify row from the
+            # state before this step's draft block.
+            sampling_info.update_penalties()
+            if _SPEC_DEBUG:
+                scaling = sampling_info.acc_scaling_penalties
+                additive = sampling_info.acc_additive_penalties
+                _spec_trace(
+                    f"penalties mode={forward_mode} required={orchestrator.is_required} "
+                    f"scaling={None if scaling is None else (float(scaling.min()), float(scaling.max()))} "
+                    f"additive_min={None if additive is None else float(additive.min())} "
+                    f"prepared={ {type(p).__name__: p._is_prepared for p in orchestrator.penalizers.values()} }"
+                )
+        elif _SPEC_DEBUG:
+            _spec_trace(
+                f"penalties mode={forward_mode} orchestrator={orchestrator is not None} "
+                f"required={None if orchestrator is None else orchestrator.is_required}"
+            )
+
+    _spec_log_interval = int(os.environ.get("SGLANG_OMNI_SPEC_LOG_INTERVAL", "40"))
+
+    def _trace_draft_kv(self, batch) -> None:
+        """Bring-up probe: are the draft's KV rows for a request's prompt populated?"""
+        try:
+            draft_runner = self.draft_worker.draft_worker.draft_runner
+            pool = draft_runner.token_to_kv_pool
+            req_to_token = draft_runner.req_to_token_pool.req_to_token
+            target_pool = self.model_worker.model_runner.token_to_kv_pool
+            req = batch.reqs[0]
+            n = len(req.origin_input_ids) + len(req.output_ids)
+            locs = req_to_token[req.req_pool_idx][:n].long()
+            k = pool.get_key_buffer(0)[locs].float().flatten(1).norm(dim=-1)
+            kt = target_pool.get_key_buffer(0)[locs].float().flatten(1).norm(dim=-1)
+            _spec_trace(
+                f"draft kv probe mode={batch.forward_mode} rid={req.rid} n={n} "
+                f"draft_zero_rows={int((k == 0).sum())} draft_norm_mean={k.mean().item():.3f} "
+                f"draft_norm_head={[round(x, 2) for x in k[:4].tolist()]} "
+                f"draft_norm_tail={[round(x, 2) for x in k[-4:].tolist()]} "
+                f"target_zero_rows={int((kt == 0).sum())} target_norm_mean={kt.mean().item():.3f} "
+                f"draft_pool={type(pool).__name__} k_shape={tuple(pool.get_key_buffer(0).shape)}"
+            )
+        except Exception as exc:  # pragma: no cover - probe only
+            _spec_trace(f"draft kv probe failed: {exc!r}")
+
+    def _record_speculative_step(self, batch, batch_result) -> None:
+        """Accumulate accept statistics for the synchronous speculative lane."""
+        forward_mode = getattr(batch, "forward_mode", None)
+        if _SPEC_DEBUG and getattr(self, "_kv_probe_count", 0) < 6 and batch.reqs:
+            self._kv_probe_count = getattr(self, "_kv_probe_count", 0) + 1
+            self._trace_draft_kv(batch)
+        if forward_mode is None or forward_mode.is_extend():
+            return
+        accept_lens = getattr(batch_result, "accept_lens", None)
+        stats = getattr(self, "_omni_spec_stats", None)
+        if stats is None:
+            stats = self._omni_spec_stats = {
+                "steps": 0,
+                "rows": 0,
+                "accepted": 0,
+                "window_steps": 0,
+                "window_rows": 0,
+                "window_accepted": 0,
+            }
+        rows = len(getattr(batch, "reqs", ()) or ())
+        accepted = 0
+        if accept_lens is not None:
+            # accept_lens counts tokens emitted per request this step (bonus
+            # token included), i.e. the per-row "accept length".
+            accepted = int(accept_lens.sum().item())
+        stats["steps"] += 1
+        stats["rows"] += rows
+        stats["accepted"] += accepted
+        stats["window_steps"] += 1
+        stats["window_rows"] += rows
+        stats["window_accepted"] += accepted
+        if stats["window_steps"] >= self._spec_log_interval:
+            window_rows = max(stats["window_rows"], 1)
+            total_rows = max(stats["rows"], 1)
+            message = (
+                "spec decode stats: steps=%d bs=%.2f accept_len=%.3f "
+                "(lifetime steps=%d rows=%d accept_len=%.3f) draft_tokens=%d"
+                % (
+                    stats["window_steps"],
+                    stats["window_rows"] / stats["window_steps"],
+                    stats["window_accepted"] / window_rows,
+                    stats["steps"],
+                    stats["rows"],
+                    stats["accepted"] / total_rows,
+                    int(self.server_args.speculative_num_draft_tokens),
+                )
+            )
+            logger.info(message)
+            stats_path = os.environ.get("SGLANG_OMNI_SPEC_STATS")
+            if stats_path:
+                with open(stats_path, "a", encoding="utf-8") as handle:
+                    handle.write(f"{time.time():.3f} {message}\n")
+            stats["window_steps"] = stats["window_rows"] = stats["window_accepted"] = 0
 
     def _lookahead_eligible(self, batch: Any) -> bool:
         """Refuse Omni's one-token lookahead for native speculative batches."""

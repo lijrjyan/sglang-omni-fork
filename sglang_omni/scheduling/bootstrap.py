@@ -64,16 +64,22 @@ def init_sglang_cuda_graphs(model_worker: Any) -> None:
             model_config.is_multimodal = original_is_multimodal
 
     spec_algorithm = getattr(model_worker.model_runner, "spec_algorithm", None)
-    if spec_algorithm is not None and spec_algorithm.is_standalone():
+    if spec_algorithm is not None and _is_omni_native_spec(spec_algorithm):
         runner = model_worker.model_runner.decode_cuda_graph_runner
         logger.info(
-            "STANDALONE speculative graph startup: target_verify=%s",
+            "%s speculative graph startup: target_verify=%s",
+            spec_algorithm.name,
             "captured" if runner is not None else "eager",
         )
 
 
+def _is_omni_native_spec(spec_algorithm: Any) -> bool:
+    """Native SGLang speculative workers Omni drives synchronously."""
+    return spec_algorithm.is_standalone() or spec_algorithm.is_eagle3()
+
+
 def speculative_draft_model(draft_worker: Any) -> Any:
-    """Return the draft model owned by a native STANDALONE speculative worker."""
+    """Return the draft model owned by a native speculative worker."""
     return draft_worker.draft_worker.draft_runner.model
 
 
@@ -81,15 +87,26 @@ def init_speculative_draft_cuda_graphs(
     draft_worker: Any, *, capture_draft_decode_graph: bool
 ) -> None:
     """Install the draft runner, capturing decode only when explicitly enabled."""
-    draft_worker.init_cuda_graphs(
-        capture_draft_decode_graph=capture_draft_decode_graph,
-        capture_draft_extend_graph=False,
-    )
+    if draft_worker.speculative_algorithm.is_standalone():
+        # note (Junnan Li): the encoder-decoder STANDALONE patch exposes
+        # per-graph capture switches; stock EAGLE workers follow the global
+        # cuda-graph setting for both target verify and draft decode.
+        draft_worker.init_cuda_graphs(
+            capture_draft_decode_graph=capture_draft_decode_graph,
+            capture_draft_extend_graph=False,
+        )
+    else:
+        draft_worker.init_cuda_graphs()
     inner_draft_worker = getattr(draft_worker, "draft_worker", None)
     draft_decode_runner = getattr(inner_draft_worker, "cuda_graph_runner", None)
+    draft_extend_runner = getattr(
+        inner_draft_worker, "cuda_graph_runner_for_draft_extend", None
+    )
     logger.info(
-        "STANDALONE speculative graph startup: draft_decode=%s, " "draft_extend=eager",
+        "%s speculative graph startup: draft_decode=%s, draft_extend=%s",
+        draft_worker.speculative_algorithm.name,
         "captured" if draft_decode_runner is not None else "eager",
+        "captured" if draft_extend_runner is not None else "eager",
     )
 
 
@@ -128,10 +145,10 @@ def _parse_speculative_algorithm(server_args: Any) -> Any:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
-    if not algorithm.is_none() and not algorithm.is_standalone():
+    if not algorithm.is_none() and not _is_omni_native_spec(algorithm):
         raise ValueError(
-            "sglang-omni only supports STANDALONE speculative decoding in the "
-            "synchronous lane"
+            "sglang-omni only supports STANDALONE or EAGLE3 speculative decoding "
+            "in the synchronous lane"
         )
     return algorithm
 
@@ -180,7 +197,7 @@ def create_sglang_infrastructure(
         register_speculative_omni_models(model_arch_override)
         if not server_args.disable_overlap_schedule:
             raise ValueError(
-                "Whisper speculative decoding requires disable_overlap_schedule=True"
+                "Omni speculative decoding requires disable_overlap_schedule=True"
             )
 
     kv_cache_bytes = consume_stage_kv_cache_bytes()
@@ -234,8 +251,8 @@ def create_sglang_infrastructure(
             target_worker=target_worker_adapter,
         )
         logger.info(
-            "Initialized STANDALONE speculative workers: target_arch=%s "
-            "draft_model=%s",
+            "Initialized %s speculative workers: target_arch=%s draft_model=%s",
+            spec_algorithm.name,
             model_arch_override,
             server_args.speculative_draft_model_path,
         )
@@ -254,7 +271,7 @@ def create_sglang_infrastructure(
 
     # Phase order follows upstream Scheduler.init_model_worker().
     model_runner = model_worker.model_runner
-    if draft_worker is not None:
+    if draft_worker is not None and spec_algorithm.is_standalone():
         # Whisper's encoder has no persistent KV. Price the loaded draft's
         # actual self/cross KV layers, not HF encoder + decoder layer counts.
         model_runner.spec_aux_config.eagle_draft_num_layers = (
