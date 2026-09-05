@@ -34,6 +34,19 @@ def _orchestrator(prepared: bool, with_repetition: bool = True):
     return SimpleNamespace(penalizers=penalizers)
 
 
+def test_detects_forward_copy_with_accumulated_scaling_penalties() -> None:
+    # ``SamplingBatchInfo.copy_for_forward`` drops the orchestrator and keeps
+    # the prepared penalties as ``acc_scaling_penalties`` -- the real GPU path.
+    forward_batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(
+            penalizer_orchestrator=None, acc_scaling_penalties=torch.ones(1, 4)
+        )
+    )
+    assert ModelRunner._sglang_applies_repetition_penalty(forward_batch)
+    forward_batch.sampling_info.acc_scaling_penalties = None
+    assert not ModelRunner._sglang_applies_repetition_penalty(forward_batch)
+
+
 def test_detects_prepared_sglang_repetition_penalizer() -> None:
     assert ModelRunner._sglang_applies_repetition_penalty(
         _forward_batch(_orchestrator(prepared=True))

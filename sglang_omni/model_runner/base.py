@@ -944,6 +944,13 @@ class ModelRunner:
         output tokens into it from ``ScheduleBatch.prepare_for_decode``).
         """
         sampling_info = getattr(forward_batch, "sampling_info", None)
+        # The forward-time ``SamplingBatchInfo`` is ``copy_for_forward()`` of the
+        # scheduler's: ``penalizer_orchestrator`` is dropped and the prepared
+        # multiplicative penalties are pre-accumulated into
+        # ``acc_scaling_penalties`` (None when no request has rp != 1), which
+        # ``apply_logits_bias`` applies. That is the path every GPU decode takes.
+        if getattr(sampling_info, "acc_scaling_penalties", None) is not None:
+            return True
         orchestrator = getattr(sampling_info, "penalizer_orchestrator", None)
         if orchestrator is None:
             return False
