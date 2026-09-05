@@ -770,7 +770,15 @@ class ModelRunner:
         schedule_batch: Any,
         requests: list,
     ) -> Any:
-        self._apply_repetition_penalty(logits_output, requests)
+        # SGLang's ``model_runner.sample`` applies its own device-resident
+        # repetition penalizer (``SamplingBatchInfo.apply_logits_bias``) whenever
+        # the batch carries a prepared ``BatchedRepetitionPenalizer``. Applying
+        # Omni's host-side penalty on top of it scales the same logits twice
+        # (rp=1.1 acts as 1.21). Only fall back to Omni's implementation for
+        # batches whose sampling info has no active SGLang penalizer (e.g. a
+        # runner-built ``SamplingBatchInfo`` with ``penalizer_orchestrator=None``).
+        if not self._sglang_applies_repetition_penalty(forward_batch):
+            self._apply_repetition_penalty(logits_output, requests)
         self._apply_codec_suppress_tokens(logits_output, requests)
         self._install_sampling_seeds(forward_batch, requests)
         wants_rollout_logprob = any(sr.data.return_logprob for sr in requests)
@@ -912,6 +920,30 @@ class ModelRunner:
         data._rep_seen_tokens = seen
         data._rep_seen_len = len(output_ids)
         return seen
+
+    @staticmethod
+    def _sglang_applies_repetition_penalty(forward_batch: Any) -> bool:
+        """Whether ``model_runner.sample`` will apply the repetition penalty itself.
+
+        True when the batch's ``SamplingBatchInfo`` carries a prepared
+        ``BatchedRepetitionPenalizer`` (SGLang prepares it iff some request in
+        the batch has ``repetition_penalty != 1.0`` and cumulates committed
+        output tokens into it from ``ScheduleBatch.prepare_for_decode``).
+        """
+        sampling_info = getattr(forward_batch, "sampling_info", None)
+        orchestrator = getattr(sampling_info, "penalizer_orchestrator", None)
+        if orchestrator is None:
+            return False
+        from sglang.srt.sampling.penaltylib import BatchedRepetitionPenalizer
+
+        penalizers = getattr(orchestrator, "penalizers", None)
+        if not penalizers:
+            return False
+        penalizer = penalizers.get(BatchedRepetitionPenalizer)
+        if penalizer is None:
+            return False
+        is_prepared = getattr(penalizer, "is_prepared", None)
+        return bool(is_prepared()) if callable(is_prepared) else False
 
     def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
         logits = logits_output.next_token_logits
