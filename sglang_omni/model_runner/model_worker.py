@@ -36,6 +36,9 @@ _SPECULATIVE_TARGET_ARCHITECTURES: dict[str, str | None] = {
     # EAGLE3 / DFlash drafts (LlamaForCausalLMEagle3, DFlashDraftModel) are
     # stock SGLang models; the thinker itself resolves through SGLModelRunner.
     "Qwen3OmniThinkerForCausalLM": None,
+    "Qwen3ASRForConditionalGeneration": (
+        "sglang_omni.models.qwen3_asr.sglang_model:Qwen3ASRForConditionalGeneration"
+    ),
 }
 
 

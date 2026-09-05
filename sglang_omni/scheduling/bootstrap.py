@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Protocol
 
@@ -101,13 +102,9 @@ def init_speculative_draft_cuda_graphs(
 ) -> None:
     """Install the draft runner's graph state.
 
-    Stock SGLang 0.5.18 draft workers take no capture arguments: they record
-    their decode and draft-extend graphs whenever the decode graph backend is
-    enabled and stay eager otherwise. The Whisper encoder-decoder patch adds
-    explicit capture flags; both shapes are honoured here.
+    Preserve draft-extend initialization when draft decode capture is disabled.
+    The Whisper encoder-decoder patch exposes explicit capture selection.
     """
-    import inspect
-
     init_cuda_graphs = draft_worker.init_cuda_graphs
     parameters = inspect.signature(init_cuda_graphs).parameters
     if "capture_draft_decode_graph" in parameters:
@@ -115,8 +112,22 @@ def init_speculative_draft_cuda_graphs(
             capture_draft_decode_graph=capture_draft_decode_graph,
             capture_draft_extend_graph=False,
         )
-    else:
+    elif capture_draft_decode_graph:
         init_cuda_graphs()
+    elif draft_worker.server_args.speculative_algorithm == "DFLASH":
+        _inner_draft_worker(draft_worker).init_cuda_graphs(
+            capture_decode_cuda_graph=False
+        )
+    else:
+        # Stock EAGLE/STANDALONE captures decode only for multiple steps.
+        # Keep its extend initialization, then restore the eager loop length.
+        inner = _inner_draft_worker(draft_worker)
+        original_steps = inner.speculative_num_steps
+        inner.speculative_num_steps = 1
+        try:
+            init_cuda_graphs()
+        finally:
+            inner.speculative_num_steps = original_steps
     inner_draft_worker = _inner_draft_worker(draft_worker)
     draft_decode_runner = getattr(inner_draft_worker, "cuda_graph_runner", None)
     draft_extend_runner = getattr(
@@ -293,8 +304,7 @@ def create_sglang_infrastructure(
     # Phase order follows upstream Scheduler.init_model_worker().
     model_runner = model_worker.model_runner
     if draft_worker is not None:
-        # Whisper's encoder has no persistent KV. Price the loaded draft's
-        # actual self/cross KV layers, not HF encoder + decoder layer counts.
+        # Price the loaded draft's KV layers; encoder layers have no persistent KV.
         model_runner.spec_aux_config.eagle_draft_num_layers = _inner_draft_worker(
             draft_worker
         ).draft_runner.layer_info.num_effective_layers

@@ -127,3 +127,31 @@ def test_pure_text_qwen_mrope_is_ordinary_sequential_positions():
         positions,
         torch.arange(sequence_length, dtype=torch.long).repeat(3, 1),
     )
+
+
+@pytest.mark.parametrize(
+    "visual_key", ["image_embeds", "video_embeds", "image_grid_thw", "video_grid_thw"]
+)
+def test_speculative_admission_rejects_visual_before_request_construction(
+    monkeypatch, visual_key
+):
+    from sglang_omni.models.qwen3_omni import request_builders as builders
+
+    called = []
+
+    def build(state, **kwargs):
+        called.append(state)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(builders, "build_sglang_thinker_request", build)
+    request_builder, _ = builders.make_thinker_scheduler_adapters(
+        tokenizer=FakeQwenTokenizer(), vocab_size=256, enable_speculative=True
+    )
+    visual = make_qwen_payload(
+        make_qwen_state(thinker_inputs={"model_inputs": {visual_key: torch.ones(1)}})
+    )
+    with pytest.raises(ValueError, match="audio and text input"):
+        request_builder(visual)
+    assert not called
+    request_builder(make_qwen_payload(make_qwen_state()))
+    assert len(called) == 1

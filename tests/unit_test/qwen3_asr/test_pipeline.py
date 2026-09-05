@@ -766,3 +766,158 @@ def test_qwen3_asr_nested_prefill_override_supersedes_the_derived_ladder(
     _, attested = recorded.attest_calls[-1]
     assert list(attested.cuda_graph_config.prefill.bs) == [128, 256]
     assert attested.cuda_graph_config.prefill.max_bs == 256
+
+
+def _builder_kwargs(**overrides) -> dict:
+    params = {
+        "max_running_requests": 8,
+        "max_new_tokens": 128,
+        "enable_async_decode": True,
+        "async_decode_min_batch_size": 2,
+        "mem_fraction_static": None,
+        "mm_embedding_cache_size_bytes": 0,
+        "enable_torch_compile": False,
+        "torch_compile_max_bs": 1,
+        "mm_attention_backend": None,
+        "request_build_max_workers": 8,
+        "request_build_max_pending": 32,
+        "prefill_coalesce_requests": 16,
+        "prefill_coalesce_wait_ms": 24.0,
+        "prefill_coalesce_when_idle": True,
+        "prefill_coalesce_requires_pending_builds": True,
+        "prefill_coalesce_after_builds_during_decode": True,
+        "stream_emit_interval_s": 0.05,
+    }
+    params.update(overrides)
+    return params
+
+
+def test_qwen3_asr_stage_speculative_defaults_are_opt_in() -> None:
+    signature = inspect.signature(create_sglang_qwen3_asr_executor)
+
+    assert signature.parameters["enable_speculative"].default is False
+    assert signature.parameters["speculative_draft_model_path"].default is None
+    assert signature.parameters["speculative_num_steps"].default == 3
+    assert signature.parameters["speculative_num_draft_tokens"].default == 4
+    assert signature.parameters["speculative_cuda_graph"].default is False
+    assert signature.parameters["speculative_draft_cuda_graph"].default is False
+    assert signature.parameters["speculative_prefill_cuda_graph"].default is False
+
+
+def test_qwen3_asr_speculative_turns_off_async_decode_and_compile() -> None:
+    builder = qwen3_asr_builder.Qwen3ASREngineBuilder(
+        **_builder_kwargs(
+            enable_async_decode=True,
+            enable_torch_compile=True,
+            enable_speculative=True,
+            speculative_draft_model_path="/models/qwen3-asr-0.6b",
+        )
+    )
+
+    assert builder.enable_speculative is True
+    assert builder.enable_async_decode is False
+    assert builder.enable_torch_compile is False
+    assert builder.infra_kwargs() == {"target_tokenizer": None}
+
+
+def test_qwen3_asr_non_speculative_builder_passes_no_target_tokenizer() -> None:
+    builder = qwen3_asr_builder.Qwen3ASREngineBuilder(**_builder_kwargs())
+
+    assert builder.enable_speculative is False
+    assert builder.infra_kwargs() == {}
+
+
+def _spec_hf_config(
+    *,
+    architectures=("Qwen3ASRForConditionalGeneration",),
+    vocab_size: int = 151936,
+    audio_token_id: int = 151676,
+    max_position_embeddings: int = 65536,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        architectures=list(architectures),
+        thinker_config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                vocab_size=vocab_size,
+                max_position_embeddings=max_position_embeddings,
+                hidden_size=1024,
+            ),
+            audio_token_id=audio_token_id,
+            audio_start_token_id=151669,
+            audio_end_token_id=151670,
+        ),
+    )
+
+
+def test_qwen3_asr_speculative_config_accepts_narrower_draft() -> None:
+    qwen3_asr_builder._validate_qwen3_asr_speculative_configs(
+        _spec_hf_config(),
+        _spec_hf_config(),
+        context_length=27_672,
+    )
+
+
+@pytest.mark.parametrize(
+    ("draft_kwargs", "match"),
+    [
+        ({"architectures": ("Qwen3ForCausalLM",)}, "Qwen3-ASR architecture"),
+        ({"vocab_size": 151_669}, "vocab_size"),
+        ({"audio_token_id": 151_675}, "audio_token_id"),
+        ({"max_position_embeddings": 4096}, "max_position_embeddings"),
+    ],
+)
+def test_qwen3_asr_speculative_config_rejects_incompatible_draft(
+    draft_kwargs, match
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        qwen3_asr_builder._validate_qwen3_asr_speculative_configs(
+            _spec_hf_config(),
+            _spec_hf_config(**draft_kwargs),
+            context_length=27_672,
+        )
+
+
+def test_qwen3_asr_speculative_models_get_roles() -> None:
+    builder = qwen3_asr_builder.Qwen3ASREngineBuilder(
+        **_builder_kwargs(
+            enable_speculative=True,
+            speculative_draft_model_path="/models/qwen3-asr-0.6b",
+        )
+    )
+    target = SimpleNamespace(config=_spec_hf_config())
+    draft = SimpleNamespace(config=_spec_hf_config())
+
+    builder.setup_speculative_models(target, draft)
+
+    assert target.spec_role == "target"
+    assert draft.spec_role == "draft"
+
+
+def test_qwen3_asr_speculative_adjust_overrides_validates_draft(monkeypatch) -> None:
+    seen: list[str] = []
+
+    class _AutoConfig:
+        @staticmethod
+        def from_pretrained(path, trust_remote_code=False):
+            seen.append(path)
+            return _spec_hf_config()
+
+    import transformers
+
+    monkeypatch.setattr(transformers, "AutoConfig", _AutoConfig)
+    builder = qwen3_asr_builder.Qwen3ASREngineBuilder(**_builder_kwargs())
+    builder.model_path = "/models/qwen3-asr-1.7b"
+    builder.context_length = 27_672
+    overrides = {
+        "speculative_algorithm": "STANDALONE",
+        "speculative_draft_model_path": "/models/qwen3-asr-0.6b",
+        "speculative_num_draft_tokens": 4,
+        "enable_torch_compile": True,
+    }
+
+    builder.adjust_overrides(overrides)
+
+    assert seen == ["/models/qwen3-asr-1.7b", "/models/qwen3-asr-0.6b"]
+    assert builder.enable_speculative is True
+    assert builder.enable_async_decode is False
+    assert overrides["enable_torch_compile"] is False

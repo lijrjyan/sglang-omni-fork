@@ -847,17 +847,23 @@ def test_qwen_encoder_mem_reserve_routes_as_scheduler_group_value() -> None:
 @pytest.mark.parametrize(
     (
         "speech_enabled",
+        "speculative",
+        "draft_graph",
         "expected_capture_hidden_layers",
         "expected_graph_helper_calls",
     ),
     [
-        (False, None, 0),
-        (True, [0, 24], 1),
+        (False, False, False, None, 0),
+        (False, True, False, None, 1),
+        (False, True, True, None, 1),
+        (True, False, False, [0, 24], 1),
     ],
 )
 def test_qwen_thinker_cuda_graph_capture_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
     speech_enabled: bool,
+    speculative: bool,
+    draft_graph: bool,
     expected_capture_hidden_layers: list[int] | None,
     expected_graph_helper_calls: int,
 ) -> None:
@@ -874,6 +880,8 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
 
     server_args = SimpleNamespace(
         disable_cuda_graph=False,
+        speculative_algorithm="EAGLE3" if speculative else None,
+        model_path="model",
         enable_return_hidden_states=False,
         cuda_graph_config=SimpleNamespace(
             prefill=SimpleNamespace(backend=CudaGraphBackend.DISABLED)
@@ -886,6 +894,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     generic_runner_calls: list[tuple[object, object]] = []
     qwen_runner_calls: list[tuple[object, object]] = []
     output_proc = object()
+    draft = object()
+    adapter = SimpleNamespace(bind_omni_model_runner=lambda runner: None)
+    draft_captures = []
 
     class FakeModelRunner:
         model = object()
@@ -918,12 +929,19 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
             object(),
             object(),
             model_config,
+            *((adapter, draft) if speculative else ()),
         )
 
     monkeypatch.setattr(
         scheduling_bootstrap,
         "create_sglang_infrastructure",
         fake_create_infrastructure,
+    )
+
+    monkeypatch.setattr(
+        scheduling_bootstrap,
+        "init_speculative_draft_cuda_graphs",
+        lambda worker, **kwargs: draft_captures.append((worker, kwargs)),
     )
 
     def fake_init_sglang_cuda_graphs(worker: object) -> None:
@@ -972,7 +990,10 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     )
 
     scheduler = bootstrap.create_thinker_scheduler(
-        server_args, speech_enabled=speech_enabled
+        server_args,
+        speech_enabled=speech_enabled,
+        enable_async_decode=False,
+        speculative_draft_cuda_graph=draft_graph,
     )
 
     assert infrastructure_saw_graph_disabled == [False]
@@ -988,6 +1009,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
         [] if speech_enabled else [(model_worker, output_proc)]
     )
     assert scheduler.server_args is server_args
+    assert draft_captures == (
+        [(draft, {"capture_draft_decode_graph": draft_graph})] if speculative else []
+    )
 
 
 @pytest.mark.parametrize("speech_enabled", [False, True])

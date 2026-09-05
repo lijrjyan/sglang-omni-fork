@@ -511,11 +511,25 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
     ]
 
 
+@pytest.mark.parametrize("standalone", [False, True])
 def test_omni_scheduler_spec_run_batch_preserves_native_result_identity(
     monkeypatch,
+    standalone,
 ) -> None:
     calls: list[object] = []
-    next_draft_input = object()
+    import torch
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+    def draft_input(hidden_states):
+        return EagleDraftInput(
+            topk_p=torch.ones((1, 1)),
+            topk_index=torch.zeros((1, 1), dtype=torch.int64),
+            bonus_tokens=torch.zeros(1, dtype=torch.int32),
+            hidden_states=hidden_states,
+        )
+
+    hidden = torch.ones((1, 2))
+    next_draft_input = draft_input(hidden)
 
     class NativeResult:
         def __init__(self) -> None:
@@ -534,7 +548,9 @@ def test_omni_scheduler_spec_run_batch_preserves_native_result_identity(
             return native_result
 
     scheduler = object.__new__(OmniScheduler)
-    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+    scheduler.spec_algorithm = SimpleNamespace(
+        is_none=lambda: False, is_standalone=lambda: standalone
+    )
     scheduler.draft_worker = DraftWorker()
     scheduler.future_map = object()
     scheduler.device_module = SimpleNamespace(Event=lambda: "copy-event")
@@ -574,6 +590,13 @@ def test_omni_scheduler_spec_run_batch_preserves_native_result_identity(
     assert batch.input_ids is None
     assert native_result.copy_done == "copy-event"
     assert ("update_cache", batch, native_result) in calls
+
+    # A newly admitted prefill has no recurrent state under STANDALONE.
+    batch.spec_info.merge_batch(draft_input(None if standalone else hidden))
+    batch.spec_info.filter_batch(torch.tensor([1]))
+    assert batch.spec_info.topk_index.shape[0] == 1
+    if not standalone:
+        assert torch.equal(batch.spec_info.hidden_states, hidden)
 
 
 def test_omni_scheduler_non_spec_run_batch_keeps_custom_runner_path() -> None:
@@ -629,6 +652,22 @@ def test_omni_scheduler_spec_result_processor_uses_native_draft_worker() -> None
 
     scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: True)
     assert scheduler._batch_result_model_worker() is target_worker
+
+
+def test_finished_output_ids_trims_tokens_accepted_past_the_stop() -> None:
+    from sglang_omni.scheduling.omni_scheduler import _finished_output_ids
+
+    # Native spec verify can accept "<eos> \\n" in one step; SGLang keeps the
+    # tail in output_ids and records the stop position.
+    req = SimpleNamespace(output_ids=[5, 6, 2, 198], finished_len=3)
+    req.output_ids_through_stop = req.output_ids[: req.finished_len]
+    assert _finished_output_ids(req) == [5, 6, 2]
+
+    legacy = SimpleNamespace(output_ids=[5, 6, 2, 198], finished_len=3)
+    assert _finished_output_ids(legacy) == [5, 6, 2]
+
+    unfinished = SimpleNamespace(output_ids=[5, 6], finished_len=None)
+    assert _finished_output_ids(unfinished) == [5, 6]
 
 
 def test_upstream_queue_limit_abort_is_translated_to_omni_output() -> None:

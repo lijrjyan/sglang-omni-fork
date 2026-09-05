@@ -995,11 +995,27 @@ def make_thinker_scheduler_adapters(
     vocab_size: int,
     thinker_config: Any = None,
     stage_name: str = "thinker",
+    enable_speculative: bool = False,
 ):
     """Build model-specific StagePayload <-> scheduler adapters for thinker."""
 
     def request_builder(payload: StagePayload) -> SGLangARRequestData:
         state = Qwen3OmniPipelineState.from_dict(payload.data)
+        if enable_speculative:
+            model_inputs = _extract_thinker_model_inputs(state.thinker_inputs or {})
+            visual_keys = (
+                "image_embeds",
+                "video_embeds",
+                "image_grid_thw",
+                "video_grid_thw",
+                "deepstack_visual_embeds",
+                "image_deepstack_visual_embeds",
+                "video_deepstack_visual_embeds",
+            )
+            if any(model_inputs.get(key) is not None for key in visual_keys):
+                raise ValueError(
+                    "Qwen3-Omni speculative decoding supports only audio and text input"
+                )
         params = payload.request.params or {}
         req_data = build_sglang_thinker_request(
             state,

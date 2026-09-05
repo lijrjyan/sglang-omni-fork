@@ -64,7 +64,9 @@ def create_thinker_scheduler(
     prefill_graph_backend = get_prefill_cuda_graph_backend(server_args)
     enable_prefill_input_embeds = prefill_graph_backend == CudaGraphBackend.BREAKABLE
     want_cuda_graph = not bool(server_args.disable_cuda_graph)
-    defer_cuda_graph_capture = want_cuda_graph and capture_hidden
+    defer_cuda_graph_capture = want_cuda_graph and (
+        capture_hidden or speculative_enabled
+    )
 
     # The native draft worker needs the target tokenizer at bootstrap.
     tokenizer = (
@@ -145,6 +147,7 @@ def create_thinker_scheduler(
         tokenizer=tokenizer,
         vocab_size=model_config.vocab_size,
         thinker_config=thinker_config,
+        enable_speculative=speculative_enabled,
     )
     stream_output_builder = make_thinker_stream_output_builder()
 

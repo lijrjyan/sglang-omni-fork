@@ -126,10 +126,8 @@ def test_speculative_nested_prefill_graph_is_disabled_without_mutating_input(ena
     assert result["cuda_graph_backend_decode"] == expected
 
 
-@pytest.mark.parametrize(
-    "architecture", [None, "Qwen3ASRForConditionalGeneration", "Qwen3ForCausalLM"]
-)
-def test_speculative_registry_rejects_non_whisper(architecture):
+@pytest.mark.parametrize("architecture", [None, "Qwen3ForCausalLM"])
+def test_speculative_registry_rejects_unsupported_target(architecture):
     from sglang_omni.model_runner.model_worker import register_speculative_omni_models
 
     with pytest.raises(ValueError, match="supports target architectures"):
@@ -989,4 +987,68 @@ def test_speculative_overrides_eagle3_keeps_chain_length_rule() -> None:
             speculative_draft_model_path="draft",
             speculative_num_steps=3,
             speculative_num_draft_tokens=6,
+        )
+
+
+@pytest.mark.parametrize(
+    ("architecture", "module_name"),
+    [
+        ("WhisperForConditionalGeneration", "sglang_omni.models.whisper_asr"),
+        ("Qwen3ASRForConditionalGeneration", "sglang_omni.models.qwen3_asr"),
+    ],
+)
+def test_speculative_registry_installs_omni_model_classes(architecture, module_name):
+    from sglang.srt.models.registry import ModelRegistry
+
+    from sglang_omni.model_runner.model_worker import register_speculative_omni_models
+
+    previous = ModelRegistry.models.get(architecture)
+    try:
+        register_speculative_omni_models(architecture)
+        registered = ModelRegistry.models[architecture]
+    finally:
+        if previous is None:
+            ModelRegistry.models.pop(architecture, None)
+        else:
+            ModelRegistry.models[architecture] = previous
+
+    assert registered.__name__ == architecture
+    assert registered.__module__.startswith(module_name)
+
+
+@pytest.mark.parametrize("keep_prefill", [False, True])
+def test_speculative_prefill_graph_opt_in_keeps_stage_prefill_policy(keep_prefill):
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    overrides = configure_speculative_overrides(
+        {
+            "cuda_graph_backend_prefill": "breakable",
+            "cuda_graph_bs_prefill": [1, 2],
+            "cuda_graph_config": {"prefill": {"backend": "breakable"}},
+        },
+        enable_speculative=True,
+        speculative_draft_model_path="/models/qwen3-asr-0.6b",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        speculative_cuda_graph=True,
+        speculative_prefill_cuda_graph=keep_prefill,
+    )
+
+    expected = "breakable" if keep_prefill else "disabled"
+    assert overrides["cuda_graph_backend_prefill"] == expected
+    assert overrides["cuda_graph_config"]["prefill"]["backend"] == expected
+    assert ("cuda_graph_bs_prefill" in overrides) is keep_prefill
+
+
+def test_speculative_prefill_graph_requires_target_graphs() -> None:
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    with pytest.raises(ValueError, match="requires speculative_cuda_graph=True"):
+        configure_speculative_overrides(
+            {},
+            enable_speculative=True,
+            speculative_draft_model_path="/models/qwen3-asr-0.6b",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_prefill_cuda_graph=True,
         )

@@ -159,6 +159,23 @@ class _NoOpGrammarManager:
         return 0
 
 
+def _finished_output_ids(req: Any) -> list[int]:
+    """Output ids up to the request's finish point.
+
+    Native speculative verification can accept tokens past the stop token in
+    the same step; SGLang keeps them in ``req.output_ids`` and records the
+    finish position in ``req.finished_len``. Emit only the finished prefix so
+    the terminal payload matches the one-token-per-step path.
+    """
+    output_ids = getattr(req, "output_ids_through_stop", None)
+    if output_ids is None:
+        output_ids = req.output_ids
+        finished_len = getattr(req, "finished_len", None)
+        if finished_len is not None:
+            output_ids = output_ids[:finished_len]
+    return list(output_ids)
+
+
 class OmniScheduler:
     """Stage-facing scheduler for AR stages.
 
@@ -1470,6 +1487,11 @@ class OmniScheduler:
         with self._forward_isolation(batch, overlap=False):
             batch_result = self.draft_worker.forward_batch_generation(batch)
         batch.spec_info = batch_result.next_draft_input
+        if self.spec_algorithm.is_standalone():
+            # STANDALONE has no recurrent state. Native extend graphs can
+            # materialize it, but merging with state-free prefills cannot
+            # maintain its batch dimension.
+            batch.spec_info.hidden_states = None
         if batch_result.new_seq_lens is not None:
             batch.seq_lens = batch_result.new_seq_lens
             if batch.seq_lens_cpu is not None:
@@ -1732,12 +1754,7 @@ class OmniScheduler:
                 model_runner = self._model_runner
                 if model_runner is not None:
                     model_runner.on_request_finished(rid, data)
-                # note (Junnan Li): native speculative verify appends the whole
-                # accepted run to req.output_ids; upstream trims tokens after
-                # the stop position only through this view.
-                data.output_ids = list(
-                    getattr(req, "output_ids_through_stop", req.output_ids)
-                )
+                data.output_ids = _finished_output_ids(req)
                 data.weight_version = get_serving().weight_version
                 finished_reason = req.finished_reason
                 data.finish_reason = (

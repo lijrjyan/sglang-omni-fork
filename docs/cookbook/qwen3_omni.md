@@ -152,12 +152,23 @@ Constraints:
   non-speculative.
 - The thinker runs the synchronous lane: async decode, prefill admission
   coalescing, mixed prefill/decode chunks, and prefill CUDA graphs are turned
-  off. `speculative_cuda_graph: true` captures the target verify graph and the
-  draft decode / draft-extend graphs (stock SGLang captures both draft graphs
-  whenever the decode graph backend is enabled).
+  off. `speculative_cuda_graph: true` captures the target verify graph.
+  `speculative_draft_cuda_graph: true` additionally captures draft decode;
+  false keeps draft decode eager. EAGLE3 draft-extend capture follows the
+  attention backend's support independently.
 - `speculative_eagle_topk` is fixed at 1; EAGLE3 requires
   `speculative_num_draft_tokens == speculative_num_steps + 1`.
 - Visual deepstack prefills (image/video input) are not supported in the
-  speculative lane; audio and text input are.
+  speculative lane and are rejected before thinker request construction;
+  audio and text input are.
 - ASR drafts are prompt- and domain-sensitive: accept length is measured with
   the draft's training prompt (`Transcribe the English audio into text.`).
+
+For greedy comparisons, you can test
+`thinker.engine.enable_deterministic_inference: true` in both the speculative
+and non-speculative configurations. This uses SGLang's batch-invariant kernels
+and can increase latency. Compare exact outputs with matching settings; enabling
+this only for the draft-assisted run does not make an ordinary baseline a
+bit-identical oracle.
+This setting does not guarantee exact speculative/non-speculative parity for
+the complete multimodal pipeline: concurrent audio requests can still differ.

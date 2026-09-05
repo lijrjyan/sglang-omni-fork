@@ -660,3 +660,46 @@ def test_draft_graph_init_dispatches_on_worker_signature() -> None:
         )
         == "m"
     )
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_stock_eagle_draft_disable_preserves_extend_and_restores_steps(raises):
+    inner = SimpleNamespace(speculative_num_steps=3)
+
+    def capture():
+        inner.cuda_graph_runner = object() if inner.speculative_num_steps > 1 else None
+        inner.cuda_graph_runner_for_draft_extend = object()
+        if raises:
+            raise RuntimeError("capture failed")
+
+    worker = SimpleNamespace(
+        draft_worker=inner,
+        server_args=SimpleNamespace(speculative_algorithm="EAGLE3"),
+        init_cuda_graphs=capture,
+    )
+    if raises:
+        with pytest.raises(RuntimeError, match="capture failed"):
+            bootstrap.init_speculative_draft_cuda_graphs(
+                worker, capture_draft_decode_graph=False
+            )
+    else:
+        bootstrap.init_speculative_draft_cuda_graphs(
+            worker, capture_draft_decode_graph=False
+        )
+    assert inner.cuda_graph_runner is None
+    assert inner.cuda_graph_runner_for_draft_extend is not None
+    assert inner.speculative_num_steps == 3
+
+
+def test_stock_dflash_draft_disable_initializes_eager_runner():
+    calls = []
+    inner = SimpleNamespace(init_cuda_graphs=lambda **kw: calls.append(kw))
+    worker = SimpleNamespace(
+        _draft_worker=inner,
+        server_args=SimpleNamespace(speculative_algorithm="DFLASH"),
+        init_cuda_graphs=lambda: pytest.fail("outer stock initializer captures graphs"),
+    )
+    bootstrap.init_speculative_draft_cuda_graphs(
+        worker, capture_draft_decode_graph=False
+    )
+    assert calls == [{"capture_decode_cuda_graph": False}]
