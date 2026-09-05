@@ -25,20 +25,38 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_SPECULATIVE_OMNI_MODELS: dict[str, tuple[str, str]] = {
+    "WhisperForConditionalGeneration": (
+        "sglang_omni.models.whisper_asr.sglang_model",
+        "WhisperForConditionalGeneration",
+    ),
+    "Qwen3ASRForConditionalGeneration": (
+        "sglang_omni.models.qwen3_asr.sglang_model",
+        "Qwen3ASRForConditionalGeneration",
+    ),
+}
+
+
 def register_speculative_omni_models(model_architecture: str) -> None:
-    """Register Whisper for native speculative draft loading."""
+    """Register the Omni model class for native speculative draft loading.
+
+    The native draft worker resolves the draft architecture through SGLang's
+    ``ModelRegistry``; Omni's implementation must win over the stock entry.
+    """
+    import importlib
+
     from sglang.srt.models.registry import ModelRegistry
 
-    if model_architecture != "WhisperForConditionalGeneration":
+    entry = _SPECULATIVE_OMNI_MODELS.get(model_architecture)
+    if entry is None:
         raise ValueError(
-            "Omni speculative decoding is only supported for Whisper; "
-            f"got {model_architecture!r}"
+            "Omni speculative decoding is only supported for "
+            f"{sorted(_SPECULATIVE_OMNI_MODELS)}; got {model_architecture!r}"
         )
-    from sglang_omni.models.whisper_asr.sglang_model import (
-        WhisperForConditionalGeneration,
+    module_name, class_name = entry
+    ModelRegistry.models[model_architecture] = getattr(
+        importlib.import_module(module_name), class_name
     )
-
-    ModelRegistry.models[model_architecture] = WhisperForConditionalGeneration
 
 
 class SpeculativeTargetWorkerAdapter:

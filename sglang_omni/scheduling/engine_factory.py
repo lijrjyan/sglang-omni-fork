@@ -61,12 +61,17 @@ def configure_speculative_overrides(
     speculative_num_draft_tokens: int,
     speculative_cuda_graph: bool = False,
     speculative_draft_cuda_graph: bool = False,
+    speculative_prefill_cuda_graph: bool = False,
 ) -> dict[str, Any]:
     """Validate Omni's STANDALONE speculative decoding configuration."""
     configured = dict(overrides)
     if speculative_draft_cuda_graph and not speculative_cuda_graph:
         raise ValueError(
             "speculative_draft_cuda_graph=True requires speculative_cuda_graph=True"
+        )
+    if speculative_prefill_cuda_graph and not speculative_cuda_graph:
+        raise ValueError(
+            "speculative_prefill_cuda_graph=True requires speculative_cuda_graph=True"
         )
     if enable_speculative:
         requested = {
@@ -142,7 +147,8 @@ def configure_speculative_overrides(
     configured["disable_overlap_schedule"] = True
     configured["disable_cuda_graph"] = not speculative_cuda_graph
     # SGLang 0.5.18 gives nested graph settings precedence over flat flags.
-    # The speculative path uses target verify graphs, never prefill graphs.
+    # The speculative path uses target verify graphs; the stage's prefill graph
+    # policy is kept only when a decoder-only builder opts in explicitly.
     if "cuda_graph_config" in configured:
         from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
 
@@ -152,7 +158,8 @@ def configure_speculative_overrides(
             if isinstance(graph_config, CudaGraphConfig)
             else dict(graph_config)
         )
-        graph_config["prefill"] = {"backend": "disabled"}
+        if not speculative_prefill_cuda_graph:
+            graph_config["prefill"] = {"backend": "disabled"}
         graph_config["decode"] = {
             **graph_config.get("decode", {}),
             "backend": "full" if speculative_cuda_graph else "disabled",
@@ -162,7 +169,10 @@ def configure_speculative_overrides(
         configured["cuda_graph_backend_decode"] = (
             "full" if speculative_cuda_graph else "disabled"
         )
-    if "cuda_graph_backend_prefill" in configured:
+    if (
+        "cuda_graph_backend_prefill" in configured
+        and not speculative_prefill_cuda_graph
+    ):
         configured["cuda_graph_backend_prefill"] = "disabled"
         configured.pop("cuda_graph_bs_prefill", None)
         configured.pop("cuda_graph_max_bs_prefill", None)
@@ -191,6 +201,7 @@ class SGLangGenerationEngineBuilder(ABC):
     speculative_num_draft_tokens: int = 4
     speculative_cuda_graph: bool = False
     speculative_draft_cuda_graph: bool = False
+    speculative_prefill_cuda_graph: bool = False
 
     def build(
         self,
@@ -263,6 +274,7 @@ class SGLangGenerationEngineBuilder(ABC):
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             speculative_cuda_graph=self.speculative_cuda_graph,
             speculative_draft_cuda_graph=self.speculative_draft_cuda_graph,
+            speculative_prefill_cuda_graph=self.speculative_prefill_cuda_graph,
         )
         self.adjust_overrides(overrides)
         if "context_length" in overrides:

@@ -631,6 +631,22 @@ def test_omni_scheduler_spec_result_processor_uses_native_draft_worker() -> None
     assert scheduler._batch_result_model_worker() is target_worker
 
 
+def test_finished_output_ids_trims_tokens_accepted_past_the_stop() -> None:
+    from sglang_omni.scheduling.omni_scheduler import _finished_output_ids
+
+    # Native spec verify can accept "<eos> \\n" in one step; SGLang keeps the
+    # tail in output_ids and records the stop position.
+    req = SimpleNamespace(output_ids=[5, 6, 2, 198], finished_len=3)
+    req.output_ids_through_stop = req.output_ids[: req.finished_len]
+    assert _finished_output_ids(req) == [5, 6, 2]
+
+    legacy = SimpleNamespace(output_ids=[5, 6, 2, 198], finished_len=3)
+    assert _finished_output_ids(legacy) == [5, 6, 2]
+
+    unfinished = SimpleNamespace(output_ids=[5, 6], finished_len=None)
+    assert _finished_output_ids(unfinished) == [5, 6]
+
+
 def test_upstream_queue_limit_abort_is_translated_to_omni_output() -> None:
     from sglang.srt.disaggregation.utils import DisaggregationMode
 

@@ -1,5 +1,6 @@
 """Qwen3-ASR model compatible with HuggingFace weights"""
 
+import copy
 import logging
 from types import MethodType
 from typing import Any, Iterable, List, Optional, Tuple
@@ -15,6 +16,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
+    MultimodalInputFormat,
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -37,6 +39,60 @@ logger = logging.getLogger(__name__)
 fused_qk_norm_rope = current_platform.get_fused_qk_norm_rope()
 
 _MROPE_ONLY_KEYS = frozenset({"interleaved", "mrope_interleaved", "mrope_section"})
+
+# Keys written by request_builders when a speculative draft must re-encode.
+DRAFT_AUDIO_FEATURE_KEY = "draft_audio_feature"
+DRAFT_FEATURE_MASK_KEY = "draft_feature_attention_mask"
+# Keeps the draft's embedding-cache entries apart from the target's, which
+# share SGLang's process-wide cache keyed by item hash.
+_DRAFT_MM_HASH_SALT = 0x5D2A_F7C3_9E1B_4A65
+
+
+def draft_view_mm_inputs(mm_inputs: list[Any] | None) -> list[Any] | None:
+    """Return per-request MultimodalInputs copies the draft can embed itself.
+
+    The target's items carry the target tower's ``precomputed_embeddings`` and
+    no mel; the draft tower has a different width, so each audio item is
+    replaced by a copy holding the retained mel, no precomputed embeddings and
+    a salted hash (``pad_value`` is kept so placeholder matching is unchanged).
+    """
+    if mm_inputs is None:
+        return None
+    views: list[Any] = []
+    for mm_input in mm_inputs:
+        if mm_input is None:
+            views.append(None)
+            continue
+        items: list[Any] = []
+        for item in mm_input.mm_items:
+            if item is None or not item.is_modality(Modality.AUDIO):
+                items.append(item)
+                continue
+            data = item.model_specific_data or {}
+            mel = data.get(DRAFT_AUDIO_FEATURE_KEY)
+            if mel is None:
+                raise RuntimeError(
+                    "Qwen3-ASR speculative draft needs the request's mel features; "
+                    "the request builder must keep_draft_audio_features"
+                )
+            view = copy.copy(item)
+            view.model_specific_data = {
+                key: value
+                for key, value in data.items()
+                if key not in (DRAFT_AUDIO_FEATURE_KEY, DRAFT_FEATURE_MASK_KEY)
+            }
+            view.model_specific_data["feature_attention_mask"] = data.get(
+                DRAFT_FEATURE_MASK_KEY
+            )
+            view.feature = mel
+            view.precomputed_embeddings = None
+            view.format = MultimodalInputFormat.NORMAL
+            view.hash = int(item.hash) ^ _DRAFT_MM_HASH_SALT
+            items.append(view)
+        view_input = copy.copy(mm_input)
+        view_input.mm_items = items
+        views.append(view_input)
+    return views
 
 
 def _normalize_asr_text_rope(text_config: Any) -> None:
@@ -156,6 +212,8 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         _enable_fused_asr_qk_norm_rope(self.language_model)
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         self._encoder_graph_runner: Qwen3ASREncoderLayerStackGraphRunner | None = None
+        # "target" / "draft" under STANDALONE speculative decoding, else None.
+        self.spec_role: str | None = None
 
     def init_encoder_graphs(
         self, *, max_batch_size: int, max_tokens_per_clip: int
@@ -263,8 +321,21 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> torch.Tensor:
-        if forward_batch.mrope_positions is not None:
+        spec_role = getattr(self, "spec_role", None)
+        if forward_batch.mrope_positions is not None and spec_role != "draft":
             positions = forward_batch.mrope_positions[0]
+        # note (Junnan Li): the speculative draft keeps the plain 1-D positions.
+        # ASR MRoPE is degenerate (all rows == positions), and SGLang's draft
+        # decode CUDA graph replays refresh ``positions`` but not
+        # ``mrope_positions``; reading the stale row degrades draft proposals
+        # (accept length ~2.6 vs ~3.9 of 4 measured on Qwen3-ASR-0.6B).
+        if (
+            spec_role == "draft"
+            and forward_batch.mm_inputs is not None
+            and not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            forward_batch.mm_inputs = draft_view_mm_inputs(forward_batch.mm_inputs)
         positions = positions.to(
             dtype=(torch.int32 if fused_qk_norm_rope is not None else torch.long),
             device=input_ids.device,

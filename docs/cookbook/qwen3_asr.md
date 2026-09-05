@@ -155,6 +155,37 @@ sgl-omni serve \
   --port 8000
 ```
 
+## Speculative Decoding (Experimental)
+
+This opt-in path runs SGLang's native synchronous STANDALONE speculative
+decoding with `Qwen/Qwen3-ASR-0.6B` drafting for `Qwen/Qwen3-ASR-1.7B`. It needs
+no SGLang patch: the target is decoder-only, and stock SGLang 0.5.18 provides
+the draft/verify workers.
+
+```bash
+sgl-omni serve --model-path Qwen/Qwen3-ASR-1.7B \
+  --asr.factory.enable_speculative true \
+  --asr.factory.speculative_draft_model_path Qwen/Qwen3-ASR-0.6B \
+  --asr.factory.speculative_cuda_graph true \
+  --asr.factory.speculative_draft_cuda_graph true \
+  --port 8000
+```
+
+Defaults are three draft steps and four verification tokens
+(`speculative_num_draft_tokens` must equal `speculative_num_steps + 1`; top-k is
+fixed to one). `speculative_cuda_graph` captures the target verify graph and
+`speculative_draft_cuda_graph` the draft decode graph; draft extension follows
+the attention backend's own graph support. Async decode, prefill coalescing,
+torch compile and the breakable prefill CUDA graph are turned off in this path.
+
+The draft checkpoint must share the target's vocabulary and audio placeholder
+ids; hidden sizes may differ. The draft has its own audio tower, so requests keep
+their mel features and the draft re-encodes them during draft prefill instead
+of reusing the target's pre-LM embeddings. Streaming responses carry the final
+transcript only. Greedy decoding is verified exactly up to floating-point
+batching effects; validation covers the 1.7B/0.6B pair on LibriSpeech
+test-clean and AISHELL-1 and does not establish a throughput improvement.
+
 ## Transcribe Audio
 
 ```bash

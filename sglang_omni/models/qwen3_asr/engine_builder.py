@@ -30,6 +30,65 @@ from sglang_omni.utils.gpu_memory import format_bytes_gib, get_process_gpu_memor
 
 logger = logging.getLogger(__name__)
 
+_QWEN3_ASR_ARCHITECTURES = {"Qwen3ASRForConditionalGeneration"}
+
+
+def _thinker_config(config: Any) -> Any:
+    return getattr(config, "thinker_config", config)
+
+
+def _validate_qwen3_asr_speculative_configs(
+    target_config: Any,
+    draft_config: Any,
+    *,
+    context_length: int,
+) -> None:
+    """Reject drafts that cannot share the target's token stream.
+
+    The STANDALONE draft runs at absolute target positions with its own audio
+    tower, so hidden sizes may differ but the vocabulary, the audio
+    placeholder ids and the positional capacity must agree.
+    """
+    draft_architectures = set(draft_config.architectures or [])
+    if not draft_architectures.intersection(_QWEN3_ASR_ARCHITECTURES):
+        raise ValueError(
+            "Qwen3-ASR speculative decoding requires a Qwen3-ASR architecture "
+            f"for the draft checkpoint; got {sorted(draft_architectures)!r}"
+        )
+    target_thinker = _thinker_config(target_config)
+    draft_thinker = _thinker_config(draft_config)
+    compatibility_values = (
+        (
+            "vocab_size",
+            target_thinker.text_config.vocab_size,
+            draft_thinker.text_config.vocab_size,
+        ),
+        ("audio_token_id", target_thinker.audio_token_id, draft_thinker.audio_token_id),
+        (
+            "audio_start_token_id",
+            target_thinker.audio_start_token_id,
+            draft_thinker.audio_start_token_id,
+        ),
+        (
+            "audio_end_token_id",
+            target_thinker.audio_end_token_id,
+            draft_thinker.audio_end_token_id,
+        ),
+    )
+    for field, target_value, draft_value in compatibility_values:
+        if draft_value != target_value:
+            raise ValueError(
+                "Qwen3-ASR target and draft configs must match for speculative "
+                f"decoding: {field} target={target_value!r}, draft={draft_value!r}"
+            )
+    draft_positions = int(draft_thinker.text_config.max_position_embeddings)
+    if draft_positions < context_length:
+        raise ValueError(
+            "Qwen3-ASR draft max_position_embeddings "
+            f"{draft_positions} is smaller than the stage context_length "
+            f"{context_length}"
+        )
+
 
 class Qwen3ASREngineBuilder(AsrEngineBuilder):
     model_name = "Qwen3-ASR"
@@ -56,6 +115,13 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         prefill_coalesce_requires_pending_builds: bool,
         prefill_coalesce_after_builds_during_decode: bool,
         stream_emit_interval_s: float,
+        enable_speculative: bool = False,
+        speculative_draft_model_path: str | None = None,
+        speculative_num_steps: int = 3,
+        speculative_num_draft_tokens: int = 4,
+        speculative_cuda_graph: bool = False,
+        speculative_draft_cuda_graph: bool = False,
+        speculative_prefill_cuda_graph: bool = False,
         enable_pre_lm_encoder: bool = True,
         pre_lm_cache_max_entries: int = 4096,
         pre_lm_cache_size_bytes: int = 2 * 1024**3,
@@ -74,6 +140,16 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             raise ValueError(
                 f"pre_lm_max_batch_wait_ms must be >= 0, got {pre_lm_max_batch_wait_ms}"
             )
+        if enable_speculative and enable_async_decode:
+            # note (Junnan Li): the STANDALONE lane is synchronous by design, so
+            # the async-decode default is turned off instead of failing startup.
+            logger.info("Qwen3-ASR speculative decoding disables enable_async_decode")
+            enable_async_decode = False
+        if enable_speculative and enable_torch_compile:
+            # note (Junnan Li): torch compile is not qualified against target
+            # verify graphs; keep the speculative lane on plain graphs.
+            logger.info("Qwen3-ASR speculative decoding disables enable_torch_compile")
+            enable_torch_compile = False
         self.max_running_requests = max_running_requests
         self.max_new_tokens = max_new_tokens
         self.enable_async_decode = enable_async_decode
@@ -95,6 +171,13 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             prefill_coalesce_after_builds_during_decode
         )
         self.stream_emit_interval_s = stream_emit_interval_s
+        self.enable_speculative = bool(enable_speculative)
+        self.speculative_draft_model_path = speculative_draft_model_path
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        self.speculative_cuda_graph = bool(speculative_cuda_graph)
+        self.speculative_draft_cuda_graph = bool(speculative_draft_cuda_graph)
+        self.speculative_prefill_cuda_graph = bool(speculative_prefill_cuda_graph)
         self.enable_pre_lm_encoder = enable_pre_lm_encoder
         self.pre_lm_cache_max_entries = pre_lm_cache_max_entries
         self.pre_lm_cache_size_bytes = pre_lm_cache_size_bytes
@@ -108,11 +191,18 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         self.device: str | None = None
         self.model_path: str | None = None
         self.audio_encoder_service: Any = None
+        self._target_hf_config: Any = None
         self._torch_mps_model_runner: Any = None
         self._should_wait_for_encode: Callable[[], bool] | None = None
 
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         self.model_path = checkpoint_dir
+        if self.enable_speculative:
+            from transformers import AutoConfig
+
+            self._target_hf_config = AutoConfig.from_pretrained(
+                checkpoint_dir, trust_remote_code=True
+            )
         self.tokenizer = AutoTokenizer.from_pretrained(
             checkpoint_dir, trust_remote_code=True
         )
@@ -303,6 +393,32 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
 
         if "context_length" in overrides:
             self.context_length = int(overrides.pop("context_length"))
+        if overrides.get("speculative_algorithm") is not None:
+            if use_mlx() or self._uses_torch_mps():
+                raise ValueError(
+                    "Qwen3-ASR speculative decoding requires the CUDA/ROCm path"
+                )
+            self.enable_speculative = True
+            self.enable_async_decode = False
+            self.speculative_num_draft_tokens = overrides[
+                "speculative_num_draft_tokens"
+            ]
+            # Not qualified together with target verify graphs.
+            overrides["enable_torch_compile"] = False
+            from transformers import AutoConfig
+
+            if self._target_hf_config is None:
+                self._target_hf_config = AutoConfig.from_pretrained(
+                    self.model_path, trust_remote_code=True
+                )
+            draft_config = AutoConfig.from_pretrained(
+                overrides["speculative_draft_model_path"], trust_remote_code=True
+            )
+            _validate_qwen3_asr_speculative_configs(
+                self._target_hf_config,
+                draft_config,
+                context_length=self.context_length,
+            )
         if use_mlx() or self._uses_torch_mps():
             # note (yexiaodong): Typed pipeline engine defaults are merged after
             # the backend profile and otherwise re-enable Torch compilation.
@@ -310,6 +426,25 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
 
     def customize_server_args(self, server_args: Any) -> None:
         self.context_length = int(server_args.context_length)
+
+    def infra_kwargs(self) -> dict[str, Any]:
+        if not self.enable_speculative:
+            return {}
+        return {"target_tokenizer": self.tokenizer}
+
+    def setup_speculative_models(self, model: Any, draft_model: Any) -> None:
+        # note (Junnan Li): the draft has its own audio tower with a different
+        # width, so it cannot consume the target's pre-LM embeddings; the draft
+        # role re-encodes from the mel kept on the request
+        # (request_builders keep_draft_audio_features).
+        model.spec_role = "target"
+        draft_model.spec_role = "draft"
+        draft_text_config = _thinker_config(draft_model.config).text_config
+        logger.info(
+            "Qwen3-ASR speculative draft encodes audio with its own tower "
+            "(draft hidden_size=%s)",
+            getattr(draft_text_config, "hidden_size", None),
+        )
 
     def setup_model_resources(
         self,
@@ -389,6 +524,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             audio_encoder_service=self.audio_encoder_service,
             should_wait_for_encode=self.should_wait_for_encode,
             greedy_only=use_mlx() or self._uses_torch_mps(),
+            keep_draft_audio_features=self.enable_speculative,
         )
 
     def make_abort_callback(self) -> Any | None:

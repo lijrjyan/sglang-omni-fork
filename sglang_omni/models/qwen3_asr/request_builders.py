@@ -55,6 +55,10 @@ _SAMPLE_RATE = 16000
 
 _AUDIO_START = "<|audio_start|>"
 _AUDIO_PAD = "<|audio_pad|>"
+
+# Mel features retained for a speculative draft's own audio tower.
+DRAFT_AUDIO_FEATURE_KEY = "draft_audio_feature"
+DRAFT_FEATURE_MASK_KEY = "draft_feature_attention_mask"
 _AUDIO_END = "<|audio_end|>"
 _ASR_TEXT = "<asr_text>"
 # Note(Audrey): the checkpoint's chat template emits this system turn even when
@@ -121,6 +125,7 @@ def make_qwen3_asr_scheduler_adapters(
     audio_encoder_service: Any = None,
     should_wait_for_encode: Callable[[], bool] | None = None,
     greedy_only: bool = False,
+    keep_draft_audio_features: bool = False,
 ) -> tuple[
     Callable[[StagePayload], Qwen3ASRRequestData | DeferredAdmission],
     Callable[[Any], StagePayload],
@@ -266,7 +271,7 @@ def make_qwen3_asr_scheduler_adapters(
 
             _validate_context_budget(estimated_input_ids, request_max_new_tokens)
 
-        if cached_embedding is None:
+        if cached_embedding is None or keep_draft_audio_features:
             # note (Jeffro Qu): unlike Whisper's default 30s window, here we pad the mel to the clip's true length.
             # WhisperFeatureExtractor defaults to padding="max_length", padding every clip to nb_max_frames=3000 (~30s),
             # so a short clip pays the full 30s of mel FFT on silence.
@@ -331,6 +336,14 @@ def make_qwen3_asr_scheduler_adapters(
         # pad_input_ids for us, so compute the pad_value, replace the
         # <|audio_pad|> placeholders with it, and record the placeholder span as
         # item.offsets. SGLang treats offsets as inclusive.
+        if keep_draft_audio_features:
+            # note (Junnan Li): the speculative draft runs its own audio tower
+            # during draft prefill; the pre-LM service clears item.feature once
+            # the target embedding is attached, so keep the mel aside for it.
+            audio_item.model_specific_data[DRAFT_AUDIO_FEATURE_KEY] = features
+            audio_item.model_specific_data[DRAFT_FEATURE_MASK_KEY] = (
+                feature_attention_mask
+            )
         audio_item.set_pad_value()
         audio_start = input_ids.index(audio_pad_token_id)
         input_ids = [
@@ -351,7 +364,10 @@ def make_qwen3_asr_scheduler_adapters(
         seq_len = len(input_ids)
         positions = torch.arange(seq_len, dtype=torch.long)
         mm_inputs.mrope_positions = positions.unsqueeze(0).expand(3, -1).clone()
-        mm_inputs.mrope_position_delta = torch.tensor([0], dtype=torch.long)
+        # Shape (1, 1): native speculative verify stacks one delta per request
+        # into (batch, 1) and broadcasts it over (batch, num_draft_tokens); a
+        # (1,) delta stacks to (batch,) and fails for batch != draft tokens.
+        mm_inputs.mrope_position_delta = torch.zeros((1, 1), dtype=torch.long)
         # Mark the input as degenerate-mrope so the vectorized decode fast path
         # (mrope_fast_path.py) can skip the per-request position loop for it.
         setattr(mm_inputs, mrope_fast_path.DEGENERATE_MROPE_FLAG, True)

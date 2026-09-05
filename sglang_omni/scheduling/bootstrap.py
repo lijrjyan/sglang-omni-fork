@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import inspect
 import logging
 from typing import Any, Protocol
 
@@ -77,19 +79,56 @@ def speculative_draft_model(draft_worker: Any) -> Any:
     return draft_worker.draft_worker.draft_runner.model
 
 
+@contextlib.contextmanager
+def _stock_draft_decode_capture(draft_worker: Any, *, enabled: bool):
+    """Gate stock SGLang's draft decode capture without a patched capture API.
+
+    Stock ``EagleDraftWorker._capture_cuda_graphs`` captures the draft decode
+    graph only when ``speculative_num_steps > 1``; lowering that count for the
+    capture call alone leaves the eager draft loop (which reads the value from
+    the outer speculative worker) untouched.
+    """
+    inner = getattr(draft_worker, "draft_worker", None)
+    if enabled or inner is None:
+        yield
+        return
+    original = inner.speculative_num_steps
+    inner.speculative_num_steps = 1
+    try:
+        yield
+    finally:
+        inner.speculative_num_steps = original
+
+
 def init_speculative_draft_cuda_graphs(
     draft_worker: Any, *, capture_draft_decode_graph: bool
 ) -> None:
     """Install the draft runner, capturing decode only when explicitly enabled."""
-    draft_worker.init_cuda_graphs(
-        capture_draft_decode_graph=capture_draft_decode_graph,
-        capture_draft_extend_graph=False,
-    )
+    init_cuda_graphs = draft_worker.init_cuda_graphs
+    parameters = inspect.signature(init_cuda_graphs).parameters
+    if "capture_draft_decode_graph" in parameters:
+        # Patched SGLang (encoder-decoder speculative patch) exposes the
+        # capture selection; draft extension stays eager there.
+        init_cuda_graphs(
+            capture_draft_decode_graph=capture_draft_decode_graph,
+            capture_draft_extend_graph=False,
+        )
+    else:
+        # Stock SGLang: decode capture follows the draft step count and the
+        # draft-extend graph follows the attention backend's own support.
+        with _stock_draft_decode_capture(
+            draft_worker, enabled=capture_draft_decode_graph
+        ):
+            init_cuda_graphs()
     inner_draft_worker = getattr(draft_worker, "draft_worker", None)
     draft_decode_runner = getattr(inner_draft_worker, "cuda_graph_runner", None)
+    draft_extend_runner = getattr(
+        inner_draft_worker, "cuda_graph_runner_for_draft_extend", None
+    )
     logger.info(
-        "STANDALONE speculative graph startup: draft_decode=%s, " "draft_extend=eager",
+        "STANDALONE speculative graph startup: draft_decode=%s, draft_extend=%s",
         "captured" if draft_decode_runner is not None else "eager",
+        "captured" if draft_extend_runner is not None else "eager",
     )
 
 
@@ -180,7 +219,7 @@ def create_sglang_infrastructure(
         register_speculative_omni_models(model_arch_override)
         if not server_args.disable_overlap_schedule:
             raise ValueError(
-                "Whisper speculative decoding requires disable_overlap_schedule=True"
+                "Omni speculative decoding requires disable_overlap_schedule=True"
             )
 
     kv_cache_bytes = consume_stage_kv_cache_bytes()
@@ -255,8 +294,8 @@ def create_sglang_infrastructure(
     # Phase order follows upstream Scheduler.init_model_worker().
     model_runner = model_worker.model_runner
     if draft_worker is not None:
-        # Whisper's encoder has no persistent KV. Price the loaded draft's
-        # actual self/cross KV layers, not HF encoder + decoder layer counts.
+        # Price the loaded draft's actual KV layers (Whisper: self/cross
+        # decoder layers, no encoder KV; decoder-only drafts: their LM layers).
         model_runner.spec_aux_config.eagle_draft_num_layers = (
             draft_worker.draft_worker.draft_runner.layer_info.num_effective_layers
         )

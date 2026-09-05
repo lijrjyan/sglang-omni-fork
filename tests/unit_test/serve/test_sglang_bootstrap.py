@@ -607,3 +607,55 @@ def test_create_sglang_infrastructure_consumes_scoped_kv_budget(
     captured.clear()
     bootstrap.create_sglang_infrastructure(server_args, 0)
     assert captured["kv_cache_bytes"] is None
+
+
+class _StockDraftWorker:
+    """Stock EAGLEWorkerV2 shape: init_cuda_graphs() takes no capture kwargs."""
+
+    def __init__(self, num_steps: int = 3) -> None:
+        self.draft_worker = SimpleNamespace(
+            speculative_num_steps=num_steps,
+            cuda_graph_runner=None,
+            cuda_graph_runner_for_draft_extend=None,
+        )
+        self.seen_steps: list[int] = []
+
+    def init_cuda_graphs(self):
+        self.seen_steps.append(self.draft_worker.speculative_num_steps)
+        if self.draft_worker.speculative_num_steps > 1:
+            self.draft_worker.cuda_graph_runner = "draft-decode-graph"
+
+
+class _PatchedDraftWorker(_StockDraftWorker):
+    def init_cuda_graphs(
+        self, *, capture_draft_decode_graph=True, capture_draft_extend_graph=True
+    ):
+        self.seen_kwargs = (capture_draft_decode_graph, capture_draft_extend_graph)
+
+
+@pytest.mark.parametrize("capture", [True, False])
+def test_stock_draft_graph_init_gates_decode_capture_by_step_count(capture):
+    from sglang_omni.scheduling import bootstrap
+
+    draft_worker = _StockDraftWorker(num_steps=3)
+
+    bootstrap.init_speculative_draft_cuda_graphs(
+        draft_worker, capture_draft_decode_graph=capture
+    )
+
+    assert draft_worker.seen_steps == [3 if capture else 1]
+    assert draft_worker.draft_worker.speculative_num_steps == 3
+    assert (draft_worker.draft_worker.cuda_graph_runner is not None) is capture
+
+
+def test_patched_draft_graph_init_uses_capture_selection_api():
+    from sglang_omni.scheduling import bootstrap
+
+    draft_worker = _PatchedDraftWorker()
+
+    bootstrap.init_speculative_draft_cuda_graphs(
+        draft_worker, capture_draft_decode_graph=False
+    )
+
+    assert draft_worker.seen_kwargs == (False, False)
+    assert draft_worker.seen_steps == []

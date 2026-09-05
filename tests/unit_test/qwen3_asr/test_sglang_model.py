@@ -251,3 +251,120 @@ def test_get_audio_feature_normalizes_cpu_masks_for_cuda_features() -> None:
         tower.seen_features.cpu(),
         torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
     )
+
+
+def test_draft_view_mm_inputs_reencodes_from_retained_mel() -> None:
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputFormat,
+        MultimodalInputs,
+    )
+
+    mel = torch.zeros((1, 128, 300))
+    mask = torch.ones((1, 300), dtype=torch.long)
+    item = MultimodalDataItem(
+        modality=Modality.AUDIO,
+        hash=1234,
+        pad_value=99,
+        feature=None,
+        precomputed_embeddings=torch.zeros((3, 2048)),
+        model_specific_data={
+            "num_audio_tokens": 3,
+            "feature_attention_mask": None,
+            sglang_model.DRAFT_AUDIO_FEATURE_KEY: mel,
+            sglang_model.DRAFT_FEATURE_MASK_KEY: mask,
+        },
+    )
+    item.format = MultimodalInputFormat.PRECOMPUTED_EMBEDDING
+    item.offsets = [(5, 7)]
+    mm_input = MultimodalInputs(mm_items=[item], num_image_tokens=3)
+
+    views = sglang_model.draft_view_mm_inputs([None, mm_input])
+
+    assert views[0] is None
+    view_item = views[1].mm_items[0]
+    assert view_item is not item
+    assert view_item.feature is mel
+    assert view_item.precomputed_embeddings is None
+    assert view_item.format is MultimodalInputFormat.NORMAL
+    assert view_item.feature_attention_mask is mask
+    assert view_item.hash != item.hash
+    assert view_item.pad_value == item.pad_value
+    assert view_item.offsets == item.offsets
+    assert view_item.num_audio_tokens == 3
+    # The target's item is untouched for the target's own forward.
+    assert item.precomputed_embeddings is not None
+    assert item.format is MultimodalInputFormat.PRECOMPUTED_EMBEDDING
+
+
+def test_draft_view_mm_inputs_requires_retained_mel() -> None:
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+    )
+
+    item = MultimodalDataItem(modality=Modality.AUDIO, hash=1, pad_value=2)
+    with pytest.raises(RuntimeError, match="keep_draft_audio_features"):
+        sglang_model.draft_view_mm_inputs([MultimodalInputs(mm_items=[item])])
+
+
+def test_forward_swaps_mm_inputs_only_for_the_draft_role(monkeypatch) -> None:
+    monkeypatch.setattr(sglang_model, "fused_qk_norm_rope", None)
+    seen = {}
+
+    def fake_general_mm_embed_routine(**kwargs):
+        seen["mm_inputs"] = kwargs["forward_batch"].mm_inputs
+        return torch.tensor([1.0])
+
+    monkeypatch.setattr(
+        sglang_model, "general_mm_embed_routine", fake_general_mm_embed_routine
+    )
+    swapped = ["view"]
+    monkeypatch.setattr(sglang_model, "draft_view_mm_inputs", lambda inputs: swapped)
+    forward_mode = SimpleNamespace(
+        is_decode=lambda: False, is_target_verify=lambda: False
+    )
+    original = ["original"]
+
+    for role, expected in (("draft", swapped), ("target", original), (None, original)):
+        model = SimpleNamespace(
+            spec_role=role, language_model=object(), get_audio_feature=None
+        )
+        forward_batch = SimpleNamespace(
+            mrope_positions=None, mm_inputs=list(original), forward_mode=forward_mode
+        )
+        Qwen3ASRForConditionalGeneration.forward(
+            model, torch.tensor([1]), torch.tensor([0]), forward_batch
+        )
+        assert seen["mm_inputs"] == expected, role
+
+
+def test_draft_role_forward_ignores_mrope_positions(monkeypatch) -> None:
+    monkeypatch.setattr(sglang_model, "fused_qk_norm_rope", None)
+    seen = {}
+
+    def fake_general_mm_embed_routine(**kwargs):
+        seen["positions"] = kwargs["positions"]
+        return torch.tensor([1.0])
+
+    monkeypatch.setattr(
+        sglang_model, "general_mm_embed_routine", fake_general_mm_embed_routine
+    )
+    positions = torch.tensor([7, 8])
+    stale_mrope = torch.tensor([[3, 4], [3, 4], [3, 4]])
+    forward_mode = SimpleNamespace(
+        is_decode=lambda: True, is_target_verify=lambda: False
+    )
+    for role, expected in (("draft", positions), ("target", stale_mrope[0])):
+        model = SimpleNamespace(
+            spec_role=role, language_model=object(), get_audio_feature=None
+        )
+        forward_batch = SimpleNamespace(
+            mrope_positions=stale_mrope, mm_inputs=None, forward_mode=forward_mode
+        )
+        sglang_model.Qwen3ASRForConditionalGeneration.forward(
+            model, torch.tensor([1, 2]), positions, forward_batch
+        )
+        assert torch.equal(seen["positions"], expected), role

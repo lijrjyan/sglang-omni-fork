@@ -21,6 +21,8 @@ from sglang_omni.models.qwen3_asr.languages import (
     resolve_language,
 )
 from sglang_omni.models.qwen3_asr.request_builders import (
+    DRAFT_AUDIO_FEATURE_KEY,
+    DRAFT_FEATURE_MASK_KEY,
     Qwen3ASRRequestData,
     make_qwen3_asr_scheduler_adapters,
 )
@@ -998,3 +1000,90 @@ def test_qwen3_asr_request_builder_encodes_after_offsets_are_final(
     assert observed["audio_fingerprint"] == data.req.extra_key
     assert item.feature is None
     assert item.precomputed_embeddings.shape[0] == num_audio_tokens
+
+
+def test_qwen3_asr_request_builder_emits_broadcastable_mrope_delta(monkeypatch) -> None:
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(1600, dtype=np.float32),
+    )
+    request_builder, _ = make_qwen3_asr_scheduler_adapters(
+        tokenizer=_FakeTokenizer(),
+        max_new_tokens=32,
+        feature_extractor=lambda *args, **kwargs: SimpleNamespace(
+            input_features=torch.zeros((1, 128, 3000)),
+            attention_mask=torch.ones((1, 101), dtype=torch.long),
+        ),
+    )
+    payload = StagePayload(
+        request_id="req-asr-mrope",
+        request=OmniRequest(inputs={"audio_bytes": b"wav"}),
+        data={},
+    )
+
+    data = request_builder(payload)
+
+    # Native speculative verify stacks one delta per request into (batch, 1);
+    # a (1,) delta would stack to (batch,) and fail to broadcast.
+    delta = data.req.multimodal_inputs.mrope_position_delta
+    assert delta.shape == (1, 1)
+    assert int(delta.item()) == 0
+
+
+def test_qwen3_asr_request_builder_keeps_mel_for_speculative_draft(monkeypatch) -> None:
+    num_mel_frames = 101
+
+    class _EncoderService:
+        def __init__(self) -> None:
+            self.embedding = torch.zeros((13, 4))
+
+        def lookup_cached_embedding(self, audio_fingerprint, expected_tokens):
+            return self.embedding
+
+        def attach_embedding(self, item, embedding: torch.Tensor) -> None:
+            item.precomputed_embeddings = embedding
+            item.feature = None
+
+    calls = []
+
+    def feature_extractor(*args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            input_features=torch.zeros((1, 128, 3000)),
+            attention_mask=torch.ones((1, num_mel_frames), dtype=torch.long),
+        )
+
+    feature_extractor.hop_length = 160
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(16000, dtype=np.float32),
+    )
+    encoder_service = _EncoderService()
+    request_builder, _ = make_qwen3_asr_scheduler_adapters(
+        tokenizer=_FakeTokenizer(),
+        max_new_tokens=32,
+        feature_extractor=feature_extractor,
+        audio_encoder_service=encoder_service,
+        keep_draft_audio_features=True,
+    )
+    payload = StagePayload(
+        request_id="req-asr-draft-mel",
+        request=OmniRequest(inputs={"audio_bytes": b"wav"}),
+        data={},
+    )
+
+    data = request_builder(payload)
+
+    assert isinstance(data, Qwen3ASRRequestData)
+    item = data.req.multimodal_inputs.mm_items[0]
+    # The cache hit still attaches the target embedding and drops the feature...
+    assert len(calls) == 1
+    assert item.feature is None
+    assert item.precomputed_embeddings is encoder_service.embedding
+    # ...while the mel is retained for the draft's own tower.
+    mel = item.model_specific_data[DRAFT_AUDIO_FEATURE_KEY]
+    mask = item.model_specific_data[DRAFT_FEATURE_MASK_KEY]
+    assert mel.shape == (1, 128, 3000)
+    assert mask.shape == (1, num_mel_frames)
