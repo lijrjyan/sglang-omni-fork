@@ -46,6 +46,42 @@ DSPARK_MASK_TOKEN_ID = TOTAL_VOCAB_SIZE
 DSPARK_EMBED_ROWS = TOTAL_VOCAB_SIZE + 1
 
 
+_VERIFYPROBE_DIR = os.environ.get("SGLANG_OMNI_VERIFYPROBE_DIR")
+
+
+def _verifyprobe_dump(pre, logits_output, input_ids, positions) -> None:
+    """Diagnostic only: per verify row, top-5 logits before/after the block
+    repetition penalty (env ``SGLANG_OMNI_VERIFYPROBE_DIR``)."""
+    import json as _json
+
+    post = logits_output.next_token_logits.float().topk(5, dim=-1)
+    os.makedirs(_VERIFYPROBE_DIR, exist_ok=True)
+    with open(os.path.join(_VERIFYPROBE_DIR, "verifyprobe.jsonl"), "a") as f:
+        for r in range(input_ids.shape[0]):
+            f.write(
+                _json.dumps(
+                    {
+                        "pos": int(positions[r]),
+                        "row": r,
+                        "input_id": int(input_ids[r]),
+                        "pre": [
+                            [int(i), round(float(v), 4)]
+                            for v, i in zip(
+                                pre.values[r].tolist(), pre.indices[r].tolist()
+                            )
+                        ],
+                        "post": [
+                            [int(i), round(float(v), 4)]
+                            for v, i in zip(
+                                post.values[r].tolist(), post.indices[r].tolist()
+                            )
+                        ],
+                    }
+                )
+                + "\n"
+            )
+
+
 class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
 
     def __init__(
@@ -185,6 +221,11 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
             self._trace_verify_rows(
                 input_ids, positions, hidden_states, forward_batch, logits_output
             )
+        _vp_pre = (
+            logits_output.next_token_logits.float().topk(5, dim=-1)
+            if _VERIFYPROBE_DIR and is_verify
+            else None
+        )
         if is_verify and _is_dspark_forward(forward_batch):
             if False:
                 self._verify_trace = getattr(self, "_verify_trace", 0) + 1
@@ -213,6 +254,8 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
             spec_trace(
                 f"verify penalty skipped: spec_algorithm={getattr(forward_batch, 'spec_algorithm', None)}"
             )
+        if _vp_pre is not None:  # diagnostic only, env-gated
+            _verifyprobe_dump(_vp_pre, logits_output, input_ids, positions)
         return logits_output
 
     def _trace_verify_rows(
