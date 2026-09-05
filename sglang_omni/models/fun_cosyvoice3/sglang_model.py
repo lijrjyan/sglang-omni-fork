@@ -158,6 +158,86 @@ def _shift_prompt_embeds_default() -> bool:
     return os.environ.get("SGLANG_OMNI_COSYVOICE3_EAGLE3_UNSHIFTED_PROMPT", "0") != "1"
 
 
+_DRAFT_SAMPLING_INFO: dict = {"info": None}
+
+
+def _mirror_draft_logits(logits: torch.Tensor, sampling_info: Any) -> torch.Tensor:
+    """Apply the target's (relaxed) repetition penalty to the draft logits."""
+    if (
+        sampling_info is None
+        or os.environ.get("SGLANG_OMNI_COSYVOICE3_EAGLE3_DRAFT_REP") != "1"
+    ):
+        return logits
+    penalties = getattr(sampling_info, "acc_scaling_penalties", None)
+    if penalties is None or penalties.shape[0] != logits.shape[0]:
+        return logits
+    width = min(penalties.shape[1], logits.shape[1])
+    pen = penalties[:, :width].to(logits.dtype)
+    head = logits[:, :width]
+    head = torch.where(head > 0, head / pen, head * pen)
+    if width == logits.shape[1]:
+        return head
+    return torch.cat([head, logits[:, width:]], dim=1)
+
+
+def _mirror_draft_probs(probs: torch.Tensor, sampling_info: Any) -> torch.Tensor:
+    """Renormalise the draft proposal with the target's top-k / top-p."""
+    if (
+        sampling_info is None
+        or os.environ.get("SGLANG_OMNI_COSYVOICE3_EAGLE3_DRAFT_TOPKP") != "1"
+    ):
+        return probs
+    top_ks = getattr(sampling_info, "top_ks", None)
+    if top_ks is None or top_ks.shape[0] != probs.shape[0]:
+        return probs
+    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+
+    if sampling_info.need_top_k_sampling:
+        probs = top_k_renorm_prob(probs, top_ks)
+    if sampling_info.need_top_p_sampling:
+        probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+    return probs
+
+
+def _install_draft_sampling_mirror() -> None:
+    """Env-gated experiment: make the draft proposal q track the target's
+    top-k / top-p / repetition-penalty filtering (any q is unbiased; a closer
+    q raises acceptance). Patches the names bound in eagle_worker_v2."""
+    if os.environ.get("SGLANG_OMNI_COSYVOICE3_EAGLE3_DRAFT_TOPKP") != "1" and (
+        os.environ.get("SGLANG_OMNI_COSYVOICE3_EAGLE3_DRAFT_REP") != "1"
+    ):
+        return
+    import sglang.srt.speculative.eagle_worker_v2 as eagle_worker_v2
+    from sglang.srt.speculative.spec_utils import fast_sample
+
+    if getattr(eagle_worker_v2, "_omni_cosyvoice3_mirror", False):
+        return
+
+    def sample_draft_proposal(next_token_logits, temperatures):
+        info = _DRAFT_SAMPLING_INFO["info"]
+        logits = _mirror_draft_logits(next_token_logits, info)
+        probs = torch.softmax(logits / temperatures, dim=-1)
+        probs = _mirror_draft_probs(probs, info)
+        topk_p, topk_index = fast_sample(probs, num_samples=1)
+        return probs, topk_p, topk_index
+
+    def renorm_draft_probs(next_token_logits, sampling_info, use_rejection_sampling):
+        if not use_rejection_sampling or not next_token_logits.size(0):
+            return torch.softmax(next_token_logits, dim=-1)
+        logits = _mirror_draft_logits(next_token_logits, sampling_info)
+        probs = torch.softmax(logits / sampling_info.temperatures, dim=-1)
+        return _mirror_draft_probs(probs, sampling_info)
+
+    eagle_worker_v2.sample_draft_proposal = sample_draft_proposal
+    eagle_worker_v2.renorm_draft_probs = renorm_draft_probs
+    eagle_worker_v2._omni_cosyvoice3_mirror = True
+    spec_trace(
+        "draft sampling mirror installed: "
+        f"topkp={os.environ.get('SGLANG_OMNI_COSYVOICE3_EAGLE3_DRAFT_TOPKP')} "
+        f"rep={os.environ.get('SGLANG_OMNI_COSYVOICE3_EAGLE3_DRAFT_REP')}"
+    )
+
+
 class CosyVoice3Eagle3LlamaForCausalLM(LlamaForCausalLMEagle3):
     """AngelSlim EAGLE3 draft for the CosyVoice3 speech-token LLM.
 
@@ -177,6 +257,7 @@ class CosyVoice3Eagle3LlamaForCausalLM(LlamaForCausalLMEagle3):
         normalize_cosyvoice3_eagle3_config(config)
         super().__init__(config, quant_config, prefix)
         self.shift_prompt_embeds = _shift_prompt_embeds_default()
+        _install_draft_sampling_mirror()
         self.model.forward = self._model_forward  # type: ignore[method-assign]
         self._stock_model_forward = type(self.model).forward
 
@@ -189,15 +270,19 @@ class CosyVoice3Eagle3LlamaForCausalLM(LlamaForCausalLMEagle3):
         pp_proxy_tensors: Optional[Any] = None,
     ) -> torch.Tensor:
         mm_input_embeds = forward_batch.mm_input_embeds
+        _DRAFT_SAMPLING_INFO["info"] = forward_batch.sampling_info
         if (
-            input_embeds is None
-            and mm_input_embeds is not None
-            and forward_batch.forward_mode.is_extend()
+            forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
+            and (input_embeds is not None or mm_input_embeds is not None)
         ):
-            input_embeds = self.prompt_input_embeds(
-                mm_input_embeds, input_ids, forward_batch
-            )
+            # note (Junnan Li): the draft prefill reuses the target's
+            # ScheduleBatch, whose ``input_embeds`` (Omni's projected prompt
+            # rows) the runner forwards verbatim. Those rows are the TARGET's
+            # inputs; the EAGLE draft needs them rolled by one with the sampled
+            # first token in the last row, so always rebuild them here.
+            source = input_embeds if input_embeds is not None else mm_input_embeds
+            input_embeds = self.prompt_input_embeds(source, input_ids, forward_batch)
         trace_key = "_traced_draft_" + str(forward_batch.forward_mode)
         if (
             SPEC_DEBUG
@@ -231,14 +316,24 @@ class CosyVoice3Eagle3LlamaForCausalLM(LlamaForCausalLMEagle3):
                 f"fc={tuple(self.model.fc.weight.shape)}:{_h(self.model.fc.weight)} "
                 f"layers={len(self.model.layers)} hot={None if self.hot_token_id is None else int((self.hot_token_id != torch.arange(self.hot_token_id.shape[0], device=self.hot_token_id.device)).sum())}"
             )
-        out = self._stock_model_forward(
-            self.model,
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        if (
+            os.environ.get("SGLANG_OMNI_COSYVOICE3_EAGLE3_ATTN_PROBE") == "1"
+            and getattr(self, "_attn_probe_count", 0) < 6
+        ):
+            # round-2 R1 bring-up probe: draft attention metadata + KV ablation
+            self._attn_probe_count = getattr(self, "_attn_probe_count", 0) + 1
+            out = self._attn_probe(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
+        else:
+            out = self._stock_model_forward(
+                self.model,
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         if (
             SPEC_DEBUG
             and mm_input_embeds is not None
@@ -251,6 +346,126 @@ class CosyVoice3Eagle3LlamaForCausalLM(LlamaForCausalLMEagle3):
             self._kv_trace_count = getattr(self, "_kv_trace_count", 0) + 1
             self._trace_kv(forward_batch)
         return out
+
+    @torch.no_grad()
+    def _attn_probe(self, input_ids, positions, forward_batch, input_embeds, pp):
+        """R1: print the draft attention metadata for this forward and, for
+        decode steps, compare the layer-0 attention output with the history
+        KV rows intact vs zeroed (rows restored afterwards)."""
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        def _t(x, n=8):
+            if x is None:
+                return None
+            if torch.is_tensor(x):
+                return x.flatten()[:n].tolist()
+            return x
+
+        def run():
+            return self._stock_model_forward(
+                self.model,
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp,
+            )
+
+        try:
+            backend = get_attn_backend()
+            md = getattr(backend, "forward_metadata", None)
+            attn = self.model.layers[0].self_attn.attn
+            pool = backend.token_to_kv_pool
+            rtt = backend.req_to_token_pool.req_to_token
+            runner_rtt = backend.req_to_token  # captured at backend init
+            runner_pool = getattr(forward_batch, "token_to_kv_pool", None) or pool
+            req = forward_batch.req_pool_indices[0].long()
+            n_hist = int(forward_batch.seq_lens[0].item())
+            spec_trace(
+                f"attn-probe mode={forward_batch.forward_mode} bs={forward_batch.batch_size} "
+                f"backend={type(backend).__name__} step_id={getattr(backend, 'speculative_step_id', None)} "
+                f"topk={getattr(backend, 'topk', None)} seq_lens={_t(forward_batch.seq_lens)} "
+                f"seq_lens_cpu={_t(forward_batch.seq_lens_cpu)} req_pool_indices={_t(forward_batch.req_pool_indices)} "
+                f"positions={_t(positions)} out_cache_loc={_t(forward_batch.out_cache_loc)} "
+                f"extend_seq_lens={_t(forward_batch.extend_seq_lens)} extend_prefix_lens={_t(forward_batch.extend_prefix_lens)} "
+                f"input_ids={_t(input_ids)} spec_info={type(forward_batch.spec_info).__name__} "
+                f"md.cache_seqlens={_t(getattr(md, 'cache_seqlens_int32', None))} "
+                f"md.max_seq_len_k={getattr(md, 'max_seq_len_k', None)} md.max_seq_len_q={getattr(md, 'max_seq_len_q', None)} "
+                f"md.cu_seqlens_q={_t(getattr(md, 'cu_seqlens_q', None))} md.cu_seqlens_k={_t(getattr(md, 'cu_seqlens_k', None))} "
+                f"md.page_table_shape={None if getattr(md, 'page_table', None) is None else tuple(md.page_table.shape)} "
+                f"md.page_table_row0={_t(getattr(md, 'page_table', None))} "
+                f"rtt_row={_t(rtt[req])} rtt_row_tail={rtt[req, max(n_hist - 3, 0): n_hist + 3].tolist()} "
+                f"rtt_live_same_as_init={rtt.data_ptr() == runner_rtt.data_ptr()} "
+                f"pool_same_as_fb={pool is runner_pool} pool={type(pool).__name__} "
+                f"k_shape={tuple(pool.get_key_buffer(attn.layer_id).shape)} layer_id={attn.layer_id} "
+                f"attn_heads={attn.tp_q_head_num}/{attn.tp_k_head_num} head_dim={attn.head_dim} "
+                f"max_context_len={getattr(backend, 'max_context_len', None)}"
+            )
+            if not forward_batch.forward_mode.is_decode():
+                if (
+                    input_embeds is None
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                ):
+                    return run()
+                # extend probe: do the prompt rows influence the written KV?
+                k = pool.get_key_buffer(attn.layer_id)
+                locs = forward_batch.out_cache_loc.long()
+                real_embeds = input_embeds
+                input_embeds = torch.randn_like(real_embeds)
+                out_b = run()
+                k_b = k[locs].float().clone()
+                input_embeds = real_embeds
+                out_a = run()
+                k_a = k[locs].float().clone()
+                spec_trace(
+                    f"attn-probe extend-ablation mode={forward_batch.forward_mode} rows={int(locs.numel())} "
+                    f"probe_env={os.environ.get('SGLANG_OMNI_COSYVOICE3_EAGLE3_PROMPT_PROBE')} "
+                    f"embeds_row0_norm={real_embeds[0].float().norm().item():.3f} "
+                    f"embeds_rowlast_norm={real_embeds[-1].float().norm().item():.3f} "
+                    f"k_real_norm_mean={k_a.flatten(1).norm(dim=-1).mean().item():.3f} "
+                    f"k_noise_norm_mean={k_b.flatten(1).norm(dim=-1).mean().item():.3f} "
+                    f"k_maxabsdiff={(k_a - k_b).abs().max().item():.4f} "
+                    f"hidden_maxabsdiff={(out_a[0].float() - out_b[0].float()).abs().max().item():.4f} "
+                    f"hidden_last_maxabsdiff={(out_a[0][-1].float() - out_b[0][-1].float()).abs().max().item():.4f}"
+                )
+                return out_a
+            k = pool.get_key_buffer(attn.layer_id)
+            v = pool.get_value_buffer(attn.layer_id)
+            locs = rtt[req, :n_hist].long()
+            captured = {}
+            hook = attn.register_forward_hook(
+                lambda m, i, o: captured.__setitem__("o", o.detach().float().clone())
+            )
+            try:
+                out_a = run()
+                attn_a = captured["o"]
+                hist_norm = k[locs].float().flatten(1).norm(dim=-1)
+                k_save, v_save = k[locs].clone(), v[locs].clone()
+                k[locs] = 0
+                v[locs] = 0
+                out_b = run()
+                attn_b = captured["o"]
+                k[locs] = k_save
+                v[locs] = v_save
+            finally:
+                hook.remove()
+            ha, hb = out_a[0].float(), out_b[0].float()
+            spec_trace(
+                f"attn-probe ablation mode={forward_batch.forward_mode} step_id={getattr(backend, 'speculative_step_id', None)} "
+                f"n_hist={n_hist} locs_head={locs[:4].tolist()} hist_k_norm_mean={hist_norm.mean().item():.3f} "
+                f"hist_k_zero_rows={int((hist_norm == 0).sum())} "
+                f"attn_out_shape={tuple(attn_a.shape)} attn_out_norm={attn_a.norm().item():.4f} "
+                f"attn_maxabsdiff={(attn_a - attn_b).abs().max().item():.6f} "
+                f"hidden_maxabsdiff={(ha - hb).abs().max().item():.6f} "
+                f"identical={bool(torch.equal(attn_a, attn_b))}"
+            )
+            return out_a
+        except Exception as exc:  # pragma: no cover - probe only
+            spec_trace(f"attn-probe failed: {exc!r}")
+            import traceback
+
+            spec_trace(traceback.format_exc()[-1500:])
+            return run()
 
     @torch.no_grad()
     def _trace_kv(self, forward_batch):
@@ -337,7 +552,20 @@ class CosyVoice3Eagle3LlamaForCausalLM(LlamaForCausalLMEagle3):
             embeds = torch.randn_like(embeds)
         elif probe == "zeros":
             embeds = torch.zeros_like(embeds)
-        embeds[last_indices] = self.model.embed_tokens(input_ids[last_indices])
+        last_rows = self.model.embed_tokens(input_ids[last_indices])
+        embeds[last_indices] = last_rows
+        if SPEC_DEBUG and getattr(self, "_last_row_trace", 0) < 3:
+            self._last_row_trace = getattr(self, "_last_row_trace", 0) + 1
+            emb = self.model.embed_tokens
+            ids = input_ids[last_indices]
+            spec_trace(
+                f"draft prompt last rows: ids={ids.tolist()} "
+                f"row_norms={last_rows.float().norm(dim=-1).tolist()} "
+                f"weight_row_norms={emb.weight[ids.clamp(max=emb.weight.shape[0] - 1)].float().norm(dim=-1).tolist()} "
+                f"weight_shape={tuple(emb.weight.shape)} num_embeddings={getattr(emb, 'num_embeddings', None)} "
+                f"vocab_range={getattr(emb, 'shard_indices', None)} "
+                f"prompt_row_norms_tail={embeds[-3:].float().norm(dim=-1).tolist()}"
+            )
         return embeds
 
     def load_weights(self, weights):
