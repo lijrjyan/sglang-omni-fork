@@ -142,13 +142,11 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         _DRAFT_SAMPLING_INFO["rep_values"] = values
 
     def set_dspark_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
-        """DSpark aux capture: HF-style "after layer k" ids, like EAGLE3."""
+        """Capture normalized SGLang block-output ids from the draft config."""
         if layer_ids is None:
             raise ValueError("DSpark requires explicit target layer ids to capture")
         layer_ids = list(layer_ids)
-        # Bring-up probe: the checkpoint's aux ids are read as "output of
-        # layer k" (SGLang's DFlash/EAGLE3 convention, captured before layer
-        # k+1); set 0 to capture the input of layer k instead.
+        # Diagnostic override relative to the normalized capture contract.
         if os.environ.get("SGLANG_OMNI_COSYVOICE3_DSPARK_CAPTURE_AFTER", "1") == "0":
             layer_ids = [max(i - 1, 0) for i in layer_ids]
         self.set_eagle3_layers_to_capture(layer_ids)
@@ -222,7 +220,9 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
                         for a in aux_hidden_states
                     ]
                 elif _AUX_PROBE == "final":
-                    aux_hidden_states = [hidden_states.clone() for _ in aux_hidden_states]
+                    aux_hidden_states = [
+                        hidden_states.clone() for _ in aux_hidden_states
+                    ]
         if SPEC_DEBUG and not getattr(self, "_traced_capture", False):
             self._traced_capture = True
             spec_trace(
@@ -285,7 +285,13 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
                 logits_output.next_token_logits, input_ids, forward_batch.sampling_info
             )
             if _A3_TRACE:
-                _a3_trace("dspark-post-penalty", input_ids, positions, forward_batch, logits_output.next_token_logits)
+                _a3_trace(
+                    "dspark-post-penalty",
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    logits_output.next_token_logits,
+                )
             if SPEC_DEBUG and getattr(self, "_verify_trace", 0) <= 4:
                 lg = logits_output.next_token_logits[0].float()
                 top = lg.topk(4)
@@ -299,7 +305,13 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
                 f"verify penalty skipped: spec_algorithm={getattr(forward_batch, 'spec_algorithm', None)}"
             )
             if _A3_TRACE:
-                _a3_trace("eagle3-pre-penalty", input_ids, positions, forward_batch, logits_output.next_token_logits)
+                _a3_trace(
+                    "eagle3-pre-penalty",
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    logits_output.next_token_logits,
+                )
         if _vp_pre is not None:  # diagnostic only, env-gated
             _verifyprobe_dump(_vp_pre, logits_output, input_ids, positions)
         return logits_output
@@ -919,7 +931,9 @@ class CosyVoice3MarkovHead(VanillaMarkov):
         self._valid_draft_ids = None
         self._valid_target_ids = None
 
-    def _trace_remap(self, next_tokens: torch.Tensor, step_logits: torch.Tensor) -> None:
+    def _trace_remap(
+        self, next_tokens: torch.Tensor, step_logits: torch.Tensor
+    ) -> None:
         """Round-8 H2: per proposal, the draft id j, the HF unified id d2t[j]+j
         and the served 6761-space id; also the draft-space argmax for comparison."""
         d2t_raw = getattr(self, "_d2t_raw", None)
@@ -1156,7 +1170,9 @@ def normalize_cosyvoice3_dspark_config(config: dict) -> dict:
     normalized.setdefault("model_type", layer_config.get("model_type", "qwen3"))
     aux_ids = normalized.get("aux_hidden_state_layer_ids")
     if aux_ids is not None:
-        normalized["target_layer_ids"] = [int(i) for i in aux_ids]
+        # The checkpoint indexes HF hidden_states (input of block i).
+        # SGLang's explicit capture ids select output of block i instead.
+        normalized["target_layer_ids"] = [int(i) - 1 for i in aux_ids]
     normalized["vocab_size"] = DSPARK_EMBED_ROWS
     normalized["mask_token_id"] = DSPARK_MASK_TOKEN_ID
     normalized["tie_word_embeddings"] = False

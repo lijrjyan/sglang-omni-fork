@@ -416,7 +416,8 @@ def test_normalize_dspark_config_flattens_and_remaps_ids() -> None:
     assert "transformer_layer_config" not in normalized
     assert normalized["model_type"] == "qwen3"
     assert normalized["num_hidden_layers"] == 3
-    assert normalized["target_layer_ids"] == [2, 12, 21]
+    assert normalized["target_layer_ids"] == [1, 11, 20]
+    assert normalized["aux_hidden_state_layer_ids"] == [2, 12, 21]
     assert normalized["vocab_size"] == DSPARK_EMBED_ROWS
     assert normalized["mask_token_id"] == DSPARK_MASK_TOKEN_ID
     assert normalized["draft_vocab_size"] == 8192
@@ -497,7 +498,9 @@ def test_engine_builder_dspark_overrides_follow_the_checkpoint_block_size(
 
 
 def _markov_head() -> CosyVoice3MarkovHead:
-    head = CosyVoice3MarkovHead(vocab_size=TOTAL_VOCAB_SIZE, draft_vocab_size=6, markov_rank=4)
+    head = CosyVoice3MarkovHead(
+        vocab_size=TOTAL_VOCAB_SIZE, draft_vocab_size=6, markov_rank=4
+    )
     d2t = torch.tensor(
         [
             DSPARK_UNIFIED_SPEECH_OFFSET + 0,
@@ -549,14 +552,19 @@ def test_markov_head_sample_block_runs_in_the_speech_space() -> None:
     assert torch.isinf(corrected[..., 100]).all()
 
 
-def test_target_exposes_dspark_capture_hook_as_eagle3_layers() -> None:
-    captured = []
+def test_dspark_capture_matches_checkpoint_hidden_state_indices(monkeypatch) -> None:
+    monkeypatch.delenv("SGLANG_OMNI_COSYVOICE3_CAPTURE_SHIFT", raising=False)
+    monkeypatch.delenv("SGLANG_OMNI_COSYVOICE3_DSPARK_CAPTURE_AFTER", raising=False)
     target = FunCosyVoice3SGLangModel.__new__(FunCosyVoice3SGLangModel)
-    target.set_eagle3_layers_to_capture = lambda ids: captured.append(ids)
+    torch.nn.Module.__init__(target)
+    target.model = SimpleNamespace(layers_to_capture=[])
+    target.config = SimpleNamespace(num_hidden_layers=24)
+    target.pp_group = SimpleNamespace(world_size=1, is_last_rank=True)
+    config = normalize_cosyvoice3_dspark_config(_dspark_config())
 
-    target.set_dspark_layers_to_capture([2, 12, 21])
+    target.set_dspark_layers_to_capture(config["target_layer_ids"])
 
-    assert captured == [[2, 12, 21]]
+    assert target.model.layers_to_capture == [2, 12, 21]
     with pytest.raises(ValueError, match="explicit"):
         target.set_dspark_layers_to_capture(None)
 
@@ -580,13 +588,13 @@ def test_verify_block_penalty_matches_token_by_token_semantics() -> None:
     # The scheduler hook path (forward-time sampling info carries no values).
     target = FunCosyVoice3SGLangModel.__new__(FunCosyVoice3SGLangModel)
     target.set_speculative_repetition_penalties(torch.tensor([[1.5]]))
-    assert repetition_penalty_values(SimpleNamespace(penalizer_orchestrator=None)).tolist() == [[1.5]]
+    assert repetition_penalty_values(
+        SimpleNamespace(penalizer_orchestrator=None)
+    ).tolist() == [[1.5]]
     target.set_speculative_repetition_penalties(None)
 
     # row 0: history {3} + block[0]=5
-    assert logits[0].tolist() == pytest.approx(
-        [1, -1, 1, 1 / 1.5, 1, 1 / 1.5, 1, 1]
-    )
+    assert logits[0].tolist() == pytest.approx([1, -1, 1, 1 / 1.5, 1, 1 / 1.5, 1, 1])
     # row 1: + block[1]=1 (negative logits are multiplied)
     assert logits[1, 1] == pytest.approx(-1.5)
     assert logits[1, 5] == pytest.approx(1 / 1.5)
@@ -602,7 +610,9 @@ def test_verify_block_penalty_is_a_no_op_without_penalties() -> None:
         logits, torch.tensor([1, 2]), SimpleNamespace(acc_scaling_penalties=None)
     )
     assert logits.tolist() == torch.ones(2, 4).tolist()
-    assert repetition_penalty_values(SimpleNamespace(penalizer_orchestrator=None)) is None
+    assert (
+        repetition_penalty_values(SimpleNamespace(penalizer_orchestrator=None)) is None
+    )
 
 
 def test_markov_head_mirror_penalises_block_prefix_tokens(
