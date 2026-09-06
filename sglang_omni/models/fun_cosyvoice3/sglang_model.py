@@ -49,6 +49,10 @@ DSPARK_EMBED_ROWS = TOTAL_VOCAB_SIZE + 1
 _VERIFYPROBE_DIR = os.environ.get("SGLANG_OMNI_VERIFYPROBE_DIR")
 # Round-7 A3 diagnostic: per-verify-step draft block vs target argmax (env-gated).
 _A3_TRACE = os.environ.get("SGLANG_OMNI_COSYVOICE3_A3_TRACE") == "1"
+# Round-8 H1 sensitivity probe: zeros | noise | final (replace the aux features).
+_AUX_PROBE = os.environ.get("SGLANG_OMNI_COSYVOICE3_AUX_PROBE", "")
+# Round-8 H2: log draft id -> HF unified id -> served speech id for the first proposals.
+_REMAP_TRACE = os.environ.get("SGLANG_OMNI_COSYVOICE3_REMAP_TRACE") == "1"
 
 
 def _a3_trace(tag, input_ids, positions, forward_batch, logits):
@@ -149,6 +153,22 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
             layer_ids = [max(i - 1, 0) for i in layer_ids]
         self.set_eagle3_layers_to_capture(layer_ids)
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        """Stock capture points (EAGLE3 default / explicit ids + 1), plus a
+        round-8 bring-up probe: ``SGLANG_OMNI_COSYVOICE3_CAPTURE_SHIFT=<int>``
+        shifts every capture point (capture before layer i + shift)."""
+        super().set_eagle3_layers_to_capture(layer_ids)
+        shift = int(os.environ.get("SGLANG_OMNI_COSYVOICE3_CAPTURE_SHIFT", "0") or 0)
+        if shift and getattr(self, "capture_aux_hidden_states", False):
+            num_layers = int(self.config.num_hidden_layers)
+            self.model.layers_to_capture = [
+                min(max(i + shift, 0), num_layers - 1)
+                for i in self.model.layers_to_capture
+            ]
+            spec_trace(
+                f"capture shift {shift:+d}: layers_to_capture={self.model.layers_to_capture}"
+            )
+
     @torch.no_grad()
     def forward(
         self,
@@ -191,6 +211,18 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+            if _AUX_PROBE and aux_hidden_states is not None:
+                # Round-8 bring-up probe: destroy the target features handed to
+                # the draft to test whether the draft uses them at all.
+                if _AUX_PROBE == "zeros":
+                    aux_hidden_states = [torch.zeros_like(a) for a in aux_hidden_states]
+                elif _AUX_PROBE == "noise":
+                    aux_hidden_states = [
+                        torch.randn_like(a) * a.float().std().to(a.dtype)
+                        for a in aux_hidden_states
+                    ]
+                elif _AUX_PROBE == "final":
+                    aux_hidden_states = [hidden_states.clone() for _ in aux_hidden_states]
         if SPEC_DEBUG and not getattr(self, "_traced_capture", False):
             self._traced_capture = True
             spec_trace(
@@ -879,12 +911,38 @@ class CosyVoice3MarkovHead(VanillaMarkov):
     def set_d2t(self, d2t: torch.Tensor) -> None:
         """``d2t`` is an EAGLE3-style offset table: target id = d2t[j] + j."""
         d2t = d2t.to(torch.long)
+        self._d2t_raw = d2t.clone()  # round-8 H2 remap trace only
         absolute = d2t + torch.arange(d2t.numel(), device=d2t.device)
         mapped = absolute - DSPARK_UNIFIED_SPEECH_OFFSET
         valid = (mapped >= 0) & (mapped < self.vocab_size)
         self.d2t_omni.copy_(torch.where(valid, mapped, torch.full_like(mapped, -1)))
         self._valid_draft_ids = None
         self._valid_target_ids = None
+
+    def _trace_remap(self, next_tokens: torch.Tensor, step_logits: torch.Tensor) -> None:
+        """Round-8 H2: per proposal, the draft id j, the HF unified id d2t[j]+j
+        and the served 6761-space id; also the draft-space argmax for comparison."""
+        d2t_raw = getattr(self, "_d2t_raw", None)
+        if d2t_raw is None:
+            return
+        out = []
+        for r in range(int(next_tokens.shape[0])):
+            tid = int(next_tokens[r])
+            js = (self.d2t_omni == tid).nonzero(as_tuple=False).flatten()
+            j = int(js[0]) if js.numel() else -1
+            hf = int(d2t_raw[j]) + j if j >= 0 else -1
+            out.append(
+                dict(
+                    served_id=tid,
+                    draft_id=j,
+                    hf_id=hf,
+                    hf_minus_offset=hf - DSPARK_UNIFIED_SPEECH_OFFSET,
+                    ok=(hf - DSPARK_UNIFIED_SPEECH_OFFSET) == tid,
+                    n_draft_ids_for_served=int(js.numel()),
+                    served_argmax=int(step_logits[r].argmax()),
+                )
+            )
+        spec_trace(f"h2 remap: {out}")
 
     def _valid_ids(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         if self._valid_draft_ids is None or self._valid_draft_ids.device != device:
@@ -964,6 +1022,9 @@ class CosyVoice3MarkovHead(VanillaMarkov):
             if mirror_topkp:
                 step_logits = _mask_draft_logits_top_kp(step_logits, sampling_info)
             next_tokens = sampler(step_logits, step_idx)
+            if _REMAP_TRACE and getattr(self, "_remap_traced", 0) < 64:
+                self._remap_traced = getattr(self, "_remap_traced", 0) + 1
+                self._trace_remap(next_tokens, step_logits)
             sampled.append(next_tokens)
             corrected.append(step_logits.unsqueeze(1))
             prev_tokens = next_tokens
