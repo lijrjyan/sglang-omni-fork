@@ -20,7 +20,7 @@ import threading
 import time
 import types
 from array import array
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import islice
 from typing import Any, Callable
@@ -1568,11 +1568,8 @@ class OmniScheduler:
                 )
                 if publish is not None:
                     publish(rep_values)
-            # note (Junnan Li): the native verify reads the accumulated
-            # penalty buffers that upstream only fills on its overlap path
-            # (copy_for_forward); refresh them here so repetition /
-            # min_new_tokens masking apply to every verify row from the
-            # state before this step's draft block.
+            # Refresh after history restoration; forward isolation also copies
+            # these penalties for synchronous and overlap native workers.
             sampling_info.update_penalties()
             if _SPEC_DEBUG:
                 scaling = sampling_info.acc_scaling_penalties
@@ -1590,45 +1587,77 @@ class OmniScheduler:
             )
 
     def _cumulate_speculative_output_tokens(self, batch) -> None:
-        """Cumulate all tokens accepted since the previous step into the penalizers.
+        """Restore prepared DSpark penalizers from committed output histories.
 
-        ``cumulate_output_tokens`` takes one token per request; requests with
-        fewer new tokens repeat their last (already cumulated) one, which is a
-        no-op for the membership-style penalizers CosyVoice3 uses (repetition,
-        min_new_tokens) but would over-count a frequency penalizer. A step where
-        some request has no generated token yet is deferred to the next step.
+        Native accumulation accepts one token per row; padding ragged histories
+        changes frequency and min-length semantics. Absolute state also survives
+        re-prefill, filtering and merging without a request-local cursor.
         """
-        reqs = list(getattr(batch, "reqs", ()) or ())
+        from sglang.srt.sampling.penaltylib import (
+            BatchedFrequencyPenalizer,
+            BatchedMinNewTokensPenalizer,
+            BatchedPresencePenalizer,
+            BatchedRepetitionPenalizer,
+        )
+
+        reqs = batch.reqs
         if not reqs:
             return
         orchestrator = batch.sampling_info.penalizer_orchestrator
-        vocab_size = int(getattr(orchestrator, "vocab_size", 0) or 0)
-        columns: list[list[int]] = []
-        for req in reqs:
-            done = int(getattr(req, "_omni_penalized_len", 0))
-            output_ids = list(req.output_ids)
-            if not output_ids:
-                return
-            new_ids = [
-                int(t) for t in output_ids[done:] if 0 <= int(t) < vocab_size
-            ] or [int(output_ids[-1])]
-            columns.append(new_ids)
-        for req in reqs:
-            req._omni_penalized_len = len(req.output_ids)
-        max_new = max(len(column) for column in columns)
-        device = batch.device
-        if _SPEC_DEBUG and getattr(self, "_cumulate_trace", 0) < 3:
-            self._cumulate_trace = getattr(self, "_cumulate_trace", 0) + 1
-            _spec_trace(
-                f"cumulate spec output tokens: bs={len(reqs)} max_new={max_new} "
-                f"vocab={vocab_size} head={columns[0][:9]}"
+        minimum = orchestrator.penalizers.get(BatchedMinNewTokensPenalizer)
+        if minimum is not None and minimum.is_prepared():
+            minimum.len_output_tokens.copy_(
+                torch.tensor(
+                    [len(req.output_ids) for req in reqs],
+                    dtype=minimum.len_output_tokens.dtype,
+                    device=batch.device,
+                ).view(-1, 1)
             )
-        for k in range(max_new):
-            step_ids = [
-                column[k] if k < len(column) else column[-1] for column in columns
+
+        rows, tokens, counts = [], [], []
+        for row, req in enumerate(reqs):
+            history = Counter(
+                token
+                for value in req.output_ids
+                if 0 <= (token := int(value)) < orchestrator.vocab_size
+            )
+            rows.extend([row] * len(history))
+            tokens.extend(history)
+            counts.extend(history.values())
+        row_indices = torch.tensor(rows, dtype=torch.long, device=batch.device)
+        token_indices = torch.tensor(tokens, dtype=torch.long, device=batch.device)
+        for cls, state_name, param_name, initial in (
+            (
+                BatchedRepetitionPenalizer,
+                "cumulated_repetition_penalties",
+                "repetition_penalty",
+                1,
+            ),
+            (
+                BatchedFrequencyPenalizer,
+                "cumulated_frequency_penalties",
+                "frequency_penalty",
+                0,
+            ),
+            (
+                BatchedPresencePenalizer,
+                "cumulated_presence_penalties",
+                "presence_penalty",
+                0,
+            ),
+        ):
+            penalizer = orchestrator.penalizers.get(cls)
+            if penalizer is None or not penalizer.is_prepared():
+                continue
+            state = getattr(penalizer, state_name)
+            state.fill_(initial)
+            values = [
+                float(getattr(reqs[row].sampling_params, param_name))
+                * (count if cls is BatchedFrequencyPenalizer else 1)
+                for row, count in zip(rows, counts)
             ]
-            orchestrator.cumulate_output_tokens(
-                torch.tensor(step_ids, dtype=torch.int64, device=device)
+            state[row_indices, token_indices] = torch.tensor(
+                values, dtype=state.dtype, device=batch.device
             )
 
     _spec_log_interval = int(os.environ.get("SGLANG_OMNI_SPEC_LOG_INTERVAL", "40"))
