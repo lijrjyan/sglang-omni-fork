@@ -47,6 +47,16 @@ DSPARK_EMBED_ROWS = TOTAL_VOCAB_SIZE + 1
 
 
 _VERIFYPROBE_DIR = os.environ.get("SGLANG_OMNI_VERIFYPROBE_DIR")
+# Round-7 A3 diagnostic: per-verify-step draft block vs target argmax (env-gated).
+_A3_TRACE = os.environ.get("SGLANG_OMNI_COSYVOICE3_A3_TRACE") == "1"
+
+
+def _a3_trace(tag, input_ids, positions, forward_batch, logits):
+    n = min(int(logits.shape[0]), 16)
+    spec_trace(
+        f"a3 verify {tag}: ids={input_ids[:n].tolist()} argmax={logits[:n].argmax(dim=-1).tolist()} "
+        f"positions={positions[:n].tolist()} seq_len={int(forward_batch.seq_lens[0])}"
+    )
 
 
 def _verifyprobe_dump(pre, logits_output, input_ids, positions) -> None:
@@ -242,6 +252,8 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
             apply_block_repetition_penalty(
                 logits_output.next_token_logits, input_ids, forward_batch.sampling_info
             )
+            if _A3_TRACE:
+                _a3_trace("dspark-post-penalty", input_ids, positions, forward_batch, logits_output.next_token_logits)
             if SPEC_DEBUG and getattr(self, "_verify_trace", 0) <= 4:
                 lg = logits_output.next_token_logits[0].float()
                 top = lg.topk(4)
@@ -254,6 +266,8 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
             spec_trace(
                 f"verify penalty skipped: spec_algorithm={getattr(forward_batch, 'spec_algorithm', None)}"
             )
+            if _A3_TRACE:
+                _a3_trace("eagle3-pre-penalty", input_ids, positions, forward_batch, logits_output.next_token_logits)
         if _vp_pre is not None:  # diagnostic only, env-gated
             _verifyprobe_dump(_vp_pre, logits_output, input_ids, positions)
         return logits_output
