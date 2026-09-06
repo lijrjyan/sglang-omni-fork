@@ -309,7 +309,7 @@ def test_generation_kwargs_omit_implicit_sampling_defaults_but_keep_explicit_val
         "temperature": 0.7,
         "top_p": 0.8,
         "top_k": 20,
-        "repetition_penalty": 1.1,
+        "repetition_penalty": 1.3,
         "do_sample": False,
         "max_new_tokens": 12,
     }
