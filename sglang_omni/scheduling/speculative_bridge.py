@@ -78,7 +78,9 @@ def finished_output_ids(req: Any) -> list[int]:
     return list(output_ids)
 
 
-def handoff_speculative_result(batch: Any, batch_result: Any, *, algorithm: Any) -> None:
+def handoff_speculative_result(
+    batch: Any, batch_result: Any, *, algorithm: Any
+) -> None:
     """Carry the native worker's draft state and sequence lengths onto the batch."""
     batch.spec_info = batch_result.next_draft_input
     if not eager_prefill_has_hidden(algorithm):
@@ -95,14 +97,11 @@ def handoff_speculative_result(batch: Any, batch_result: Any, *, algorithm: Any)
 
 
 def cumulate_accepted_tokens(batch: Any, batch_result: Any) -> None:
-    """Hook point for the stochastic sampling contract.
+    """Reserved for lanes with exact per-prefix sampling processors.
 
-    SGLang's native V2 workers do not replay the accepted tokens into Omni's
-    penalizer orchestrator between synchronous steps. Greedy lanes (every
-    family admitted today) need nothing here; a stochastic contract (the
-    CosyVoice3 DSpark/EAGLE3 lane) plugs its per-request
-    ``cumulate_output_tokens`` replay in at this call site, keyed by the
-    batch's ``sampling_info.penalizer_orchestrator``.
+    Family admission owns the sampling restrictions; this hook restores no
+    history. Greedy sampling alone does not make history penalties safe to omit.
+    Replaying between steps also cannot repair native block-broadcast penalties.
     """
     del batch, batch_result
 

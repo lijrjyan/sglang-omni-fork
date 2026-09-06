@@ -155,3 +155,51 @@ def test_speculative_admission_rejects_visual_before_request_construction(
     assert not called
     request_builder(make_qwen_payload(make_qwen_state()))
     assert len(called) == 1
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"temperature": 0.7},
+        {"repetition_penalty": 1.3},
+        {"frequency_penalty": 0.5},
+        {"presence_penalty": 0.5},
+        {"min_new_tokens": 2},
+    ],
+)
+def test_speculative_sampling_contract_rejects_before_construction(monkeypatch, params):
+    from sglang_omni.models.qwen3_omni import request_builders as builders
+
+    monkeypatch.setattr(
+        builders,
+        "build_sglang_thinker_request",
+        lambda *args, **kwargs: pytest.fail(
+            "unsupported sampling reached construction"
+        ),
+    )
+    request_builder, _ = builders.make_thinker_scheduler_adapters(
+        tokenizer=FakeQwenTokenizer(), vocab_size=256, enable_speculative=True
+    )
+    payload = make_qwen_payload(make_qwen_state())
+    payload.request.params.update(params)
+    with pytest.raises(ValueError, match="speculative decoding requires"):
+        request_builder(payload)
+
+
+def test_non_speculative_sampling_keeps_request_parameters(monkeypatch):
+    from sglang_omni.models.qwen3_omni import request_builders as builders
+
+    seen = []
+
+    def build(state, **kwargs):
+        seen.append(kwargs["params"])
+        return SimpleNamespace()
+
+    monkeypatch.setattr(builders, "build_sglang_thinker_request", build)
+    request_builder, _ = builders.make_thinker_scheduler_adapters(
+        tokenizer=FakeQwenTokenizer(), vocab_size=256
+    )
+    payload = make_qwen_payload(make_qwen_state())
+    payload.request.params.update(temperature=0.7, repetition_penalty=1.3)
+    request_builder(payload)
+    assert seen == [payload.request.params]

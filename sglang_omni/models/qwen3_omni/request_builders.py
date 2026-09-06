@@ -1024,11 +1024,24 @@ def make_thinker_scheduler_adapters(
 
     def request_builder(payload: StagePayload) -> SGLangARRequestData:
         state = Qwen3OmniPipelineState.from_dict(payload.data)
+        params = payload.request.params or {}
         if enable_speculative:
             refusal = reject_speculative_request(state)
             if refusal is not None:
                 raise ValueError(refusal)
-        params = payload.request.params or {}
+            # Native verification broadcasts one history penalty row across
+            # the block; this lane has no exact per-prefix processor contract.
+            for name, required in (
+                ("temperature", 0.0),
+                ("repetition_penalty", 1.0),
+                ("frequency_penalty", 0.0),
+                ("presence_penalty", 0.0),
+                ("min_new_tokens", 0),
+            ):
+                if params.get(name, required) != required:
+                    raise ValueError(
+                        f"Qwen3-Omni speculative decoding requires {name}={required}"
+                    )
         req_data = build_sglang_thinker_request(
             state,
             params=params,
