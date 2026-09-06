@@ -271,7 +271,7 @@ will use `response_format="pcm"` and emit audio before speech-token generation c
 | `temperature` | `0.7` | Sampling temperature |
 | `top_p` | `0.8` | Top-p sampling |
 | `top_k` | `20` | Top-k sampling |
-| `repetition_penalty` | `1.1` | Repetition penalty |
+| `repetition_penalty` | `1.3` | Repetition penalty, applied once over the whole generated history. At the default temperature values <= 1.15 let the 25 Hz code stream lock onto a single token (5/40 collapses measured at 1.1, 17/40 at 1.05); 1.2-1.3 is the safe range and quality drifts down above 1.4 |
 | `max_new_tokens` | `min(2048, 20x target text tokens)` | Maximum number of generated speech tokens. If omitted, derived from the target text length (capped at 2048); stop tokens are also suppressed until at least `2x` that length has been generated |
 | `seed` | `null` | Random seed for reproducibility |
 | `stream` | `false` | Reserved for the planned incremental decoder; current decode is buffered |
