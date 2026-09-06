@@ -5,6 +5,21 @@ from __future__ import annotations
 
 from typing import Any
 
+THINKER_ARCHITECTURE = "Qwen3OmniThinkerForCausalLM"
+
+
+def register_thinker_speculative_target() -> None:
+    """Admit the thinker to the speculative lane (stock EAGLE3/DFlash drafts).
+
+    EAGLE3 / DFlash drafts (LlamaForCausalLMEagle3, DFlashDraftModel) are stock
+    SGLang models; the thinker itself resolves through SGLModelRunner, so
+    nothing is written to SGLang's model registry. Kept lazy so importing the
+    stages module does not load the platform layer.
+    """
+    from sglang_omni.model_runner.model_worker import register_speculative_target
+
+    register_speculative_target(THINKER_ARCHITECTURE)
+
 
 def create_thinker_scheduler(
     server_args: Any,
@@ -75,12 +90,13 @@ def create_thinker_scheduler(
         else None
     )
 
+    register_thinker_speculative_target()
     infrastructure = create_sglang_infrastructure(
         server_args,
         gpu_id,
         tp_rank=tp_rank,
         nccl_port=nccl_port,
-        model_arch_override="Qwen3OmniThinkerForCausalLM",
+        model_arch_override=THINKER_ARCHITECTURE,
         capture_hidden_layers=capture_hidden_layers,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
         defer_cuda_graph_capture=defer_cuda_graph_capture,

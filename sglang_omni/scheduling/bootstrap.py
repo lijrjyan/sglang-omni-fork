@@ -8,6 +8,8 @@ import logging
 from typing import Any, Protocol
 
 from sglang_omni.scheduling.speculative_support import (
+    DraftGraphKind,
+    draft_graph_kind,
     is_omni_supported_speculative_algorithm,
     unsupported_speculative_algorithm_message,
 )
@@ -100,10 +102,16 @@ def speculative_draft_model(draft_worker: Any) -> Any:
 def init_speculative_draft_cuda_graphs(
     draft_worker: Any, *, capture_draft_decode_graph: bool
 ) -> None:
-    """Install the draft runner's graph state.
+    """Install the draft runner's graph state (one helper for every algorithm).
 
-    Preserve draft-extend initialization when draft decode capture is disabled.
-    The Whisper encoder-decoder patch exposes explicit capture selection.
+    Dispatch on the worker's ``init_cuda_graphs`` signature first: the Whisper
+    encoder-decoder patch exposes explicit capture selection. A stock worker
+    takes no keywords, so when draft decode capture is disabled the algorithm's
+    draft graph kind decides how to keep the eager runner initialised without
+    capturing: block drafts (DFLASH) initialise the inner worker with capture
+    off; chain drafts (STANDALONE/EAGLE3) only capture decode for multiple
+    steps, so the step count is lowered to 1 around the call and restored in
+    ``finally``. Draft-extend initialisation is preserved in every branch.
     """
     init_cuda_graphs = draft_worker.init_cuda_graphs
     parameters = inspect.signature(init_cuda_graphs).parameters
@@ -114,13 +122,14 @@ def init_speculative_draft_cuda_graphs(
         )
     elif capture_draft_decode_graph:
         init_cuda_graphs()
-    elif draft_worker.server_args.speculative_algorithm == "DFLASH":
+    elif (
+        draft_graph_kind(draft_worker.server_args.speculative_algorithm)
+        is DraftGraphKind.VERIFY
+    ):
         _inner_draft_worker(draft_worker).init_cuda_graphs(
             capture_decode_cuda_graph=False
         )
     else:
-        # Stock EAGLE/STANDALONE captures decode only for multiple steps.
-        # Keep its extend initialization, then restore the eager loop length.
         inner = _inner_draft_worker(draft_worker)
         original_steps = inner.speculative_num_steps
         inner.speculative_num_steps = 1

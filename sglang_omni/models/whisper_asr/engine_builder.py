@@ -7,13 +7,24 @@ import logging
 from importlib.util import find_spec
 from typing import Any
 
+from sglang_omni.model_runner.model_worker import register_speculative_target
 from sglang_omni.models.whisper_asr.encoder_service import (
     WhisperPreLMEncoderService,
     build_cache_namespace,
 )
 from sglang_omni.scheduling.engine_factory import AsrEngineBuilder
+from sglang_omni.scheduling.speculative_model_support import SpeculativeModelSupport
 
 logger = logging.getLogger(__name__)
+
+# STANDALONE drafts share the target architecture, so the draft loader must
+# resolve Omni's Whisper class through SGLang's registry.
+register_speculative_target(
+    "WhisperForConditionalGeneration",
+    omni_model_cls=(
+        "sglang_omni.models.whisper_asr.sglang_model:WhisperForConditionalGeneration"
+    ),
+)
 
 _DEFAULT_ENCODER_GRAPH_BATCH_BUCKETS = (1, 2, 4, 8, 12, 16)
 _WHISPER_GENERATION_ARCHITECTURES = {"WhisperForConditionalGeneration"}
@@ -102,6 +113,55 @@ def _validate_whisper_speculative_configs(
             f"two {num_draft_tokens}-token windows plus the task prefix "
             f"must fit {decoder_context_len} positions"
         )
+
+
+class WhisperSpeculativeSupport(SpeculativeModelSupport):
+    """Whisper: encoder-decoder target with a STANDALONE Whisper draft."""
+
+    def __init__(self, *, share_encoder: bool, decoder_context_len: int) -> None:
+        self.share_encoder = bool(share_encoder)
+        self.decoder_context_len = int(decoder_context_len)
+
+    def validate_speculative_draft(
+        self,
+        target_cfg: Any,
+        draft_cfg: Any,
+        algorithm: str,
+        num_draft_tokens: int,
+    ) -> None:
+        del algorithm  # STANDALONE only; the lane admits nothing else for Whisper
+        _validate_whisper_speculative_configs(
+            target_cfg,
+            draft_cfg,
+            num_draft_tokens=num_draft_tokens,
+            decoder_context_len=self.decoder_context_len,
+        )
+
+    def reject_speculative_request(self, request: Any) -> str | None:
+        from sglang_omni.models.whisper_asr.request_builders import (
+            reject_speculative_request,
+        )
+
+        return reject_speculative_request(request)
+
+    def position_reserve(self, num_draft_tokens: int) -> int:
+        # Reserve full verify and draft-repair windows: both can evaluate
+        # positions beyond the request's final accepted output token.
+        return 2 * int(num_draft_tokens)
+
+    def link_models(self, target_model: Any, draft_model: Any) -> None:
+        super().link_models(target_model, draft_model)
+        if not self.share_encoder:
+            return
+        from sglang_omni.models.whisper_asr.encoder_share import EncoderStateShare
+
+        # note (Junnan Li): distil-whisper drafts ship the target's encoder
+        # weights verbatim, so the draft reads the target's states instead of
+        # re-running a 1500-position encoder per request.
+        share = EncoderStateShare()
+        target_model.encoder_share = share
+        draft_model.encoder_share = share
+        logger.info("Whisper speculative draft shares the target encoder output")
 
 
 class WhisperASREngineBuilder(AsrEngineBuilder):
@@ -219,20 +279,11 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             self._target_hf_config.max_target_positions or 448
         )
 
-    def setup_speculative_models(self, model: Any, draft_model: Any) -> None:
-        if not self.speculative_share_encoder:
-            return
-        from sglang_omni.models.whisper_asr.encoder_share import EncoderStateShare
-
-        # note (Junnan Li): distil-whisper drafts ship the target's encoder
-        # weights verbatim, so the draft reads the target's states instead of
-        # re-running a 1500-position encoder per request.
-        share = EncoderStateShare()
-        model.encoder_share = share
-        model.encoder_share_role = "target"
-        draft_model.encoder_share = share
-        draft_model.encoder_share_role = "draft"
-        logger.info("Whisper speculative draft shares the target encoder output")
+    def speculative_model_support(self) -> WhisperSpeculativeSupport:
+        return WhisperSpeculativeSupport(
+            share_encoder=self.speculative_share_encoder,
+            decoder_context_len=self.decoder_context_len,
+        )
 
     def setup_model_resources(
         self,
@@ -331,11 +382,11 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             draft_config = AutoConfig.from_pretrained(
                 overrides["speculative_draft_model_path"]
             )
-            _validate_whisper_speculative_configs(
+            self.speculative_model_support().validate_speculative_draft(
                 self._target_hf_config,
                 draft_config,
-                num_draft_tokens=overrides["speculative_num_draft_tokens"],
-                decoder_context_len=self.decoder_context_len,
+                overrides["speculative_algorithm"],
+                overrides["speculative_num_draft_tokens"],
             )
         if int(overrides.get("chunked_prefill_size") or 0) > 0:
             raise ValueError(
@@ -375,10 +426,11 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             generation_config=self.generation_config,
             encoder_token_count=self.encoder_token_count,
             max_new_tokens=self.max_new_tokens,
-            # Reserve full verify and draft-repair windows: both can evaluate
-            # positions beyond the request's final accepted output token.
             decoder_context_len=(
-                self.decoder_context_len - 2 * self.speculative_num_draft_tokens
+                self.decoder_context_len
+                - self.speculative_model_support().position_reserve(
+                    self.speculative_num_draft_tokens
+                )
                 if self.enable_speculative
                 else self.decoder_context_len
             ),

@@ -381,6 +381,10 @@ class WhisperForConditionalGeneration(nn.Module):
         self.end_layer = int(config.decoder_layers) * 2
         self._encoder_graph_runner: WhisperEncoderCudaGraphRunner | None = None
         self.encoder_share: EncoderStateShare | None = None
+        # "target" / "draft" under STANDALONE speculative decoding, else None;
+        # ``encoder_share_role`` is the pre-unification alias kept in sync by
+        # ``speculative_model_support.assign_spec_role``.
+        self.spec_role: str | None = None
         self.encoder_share_role: str | None = None
 
     def init_encoder_graphs(
@@ -522,7 +526,7 @@ class WhisperForConditionalGeneration(nn.Module):
                 forward_batch
             )
             if audio_features is not None and encoder_lens is not None:
-                if self.encoder_share_role == "draft":
+                if self.spec_role == "draft" and self.encoder_share is not None:
                     cross_attention_states = self.encoder_share.take(req_pool_indices)
                 if cross_attention_states is None:
                     encoder_states = self._run_encoder(audio_features)
@@ -530,7 +534,7 @@ class WhisperForConditionalGeneration(nn.Module):
                         encoder_states,
                         encoder_lens,
                     )
-                    if self.encoder_share_role == "target":
+                    if self.spec_role == "target" and self.encoder_share is not None:
                         self.encoder_share.publish(
                             req_pool_indices, cross_attention_states, encoder_lens
                         )

@@ -10,6 +10,7 @@ from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.utils import get_hip_version, is_gfx95_supported
 from transformers import AutoFeatureExtractor, AutoTokenizer
 
+from sglang_omni.model_runner.model_worker import register_speculative_target
 from sglang_omni.models.qwen3_asr import mrope_fast_path, request_builders
 from sglang_omni.models.qwen3_asr.audio_lengths import (
     qwen3_asr_max_audio_tokens,
@@ -25,12 +26,22 @@ from sglang_omni.scheduling.generation_batch_policy import (
     CudaGraphBackend,
     get_decode_cuda_graph_bs,
 )
+from sglang_omni.scheduling.speculative_model_support import SpeculativeModelSupport
 from sglang_omni.utils.gpu_compat import get_visible_gpu_sm_version
 from sglang_omni.utils.gpu_memory import format_bytes_gib, get_process_gpu_memory_bytes
 
 logger = logging.getLogger(__name__)
 
 _QWEN3_ASR_ARCHITECTURES = {"Qwen3ASRForConditionalGeneration"}
+
+# STANDALONE drafts share the target architecture, so the draft loader must
+# resolve Omni's Qwen3-ASR class through SGLang's registry.
+register_speculative_target(
+    "Qwen3ASRForConditionalGeneration",
+    omni_model_cls=(
+        "sglang_omni.models.qwen3_asr.sglang_model:Qwen3ASRForConditionalGeneration"
+    ),
+)
 
 
 def _thinker_config(config: Any) -> Any:
@@ -87,6 +98,45 @@ def _validate_qwen3_asr_speculative_configs(
             "Qwen3-ASR draft max_position_embeddings "
             f"{draft_positions} is smaller than the stage context_length "
             f"{context_length}"
+        )
+
+
+class Qwen3ASRSpeculativeSupport(SpeculativeModelSupport):
+    """Qwen3-ASR: STANDALONE draft with its own (narrower) audio tower."""
+
+    def __init__(self, *, context_length: int) -> None:
+        self.context_length = int(context_length)
+
+    def validate_speculative_draft(
+        self,
+        target_cfg: Any,
+        draft_cfg: Any,
+        algorithm: str,
+        num_draft_tokens: int,
+    ) -> None:
+        del algorithm, num_draft_tokens  # STANDALONE chain; window checked by L1
+        _validate_qwen3_asr_speculative_configs(
+            target_cfg, draft_cfg, context_length=self.context_length
+        )
+
+    def draft_view_of_request(self, mm_inputs: Any) -> Any:
+        # Applied inside the draft model's forward (target and draft share the
+        # batch); the retained mel + salted hash live in sglang_model.
+        from sglang_omni.models.qwen3_asr.sglang_model import draft_view_mm_inputs
+
+        return draft_view_mm_inputs(mm_inputs)
+
+    def link_models(self, target_model: Any, draft_model: Any) -> None:
+        # note (Junnan Li): the draft has its own audio tower with a different
+        # width, so it cannot consume the target's pre-LM embeddings; the draft
+        # role re-encodes from the mel kept on the request
+        # (request_builders keep_draft_audio_features).
+        super().link_models(target_model, draft_model)
+        draft_text_config = _thinker_config(draft_model.config).text_config
+        logger.info(
+            "Qwen3-ASR speculative draft encodes audio with its own tower "
+            "(draft hidden_size=%s)",
+            getattr(draft_text_config, "hidden_size", None),
         )
 
 
@@ -414,10 +464,11 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             draft_config = AutoConfig.from_pretrained(
                 overrides["speculative_draft_model_path"], trust_remote_code=True
             )
-            _validate_qwen3_asr_speculative_configs(
+            self.speculative_model_support().validate_speculative_draft(
                 self._target_hf_config,
                 draft_config,
-                context_length=self.context_length,
+                overrides["speculative_algorithm"],
+                overrides["speculative_num_draft_tokens"],
             )
         if use_mlx() or self._uses_torch_mps():
             # note (yexiaodong): Typed pipeline engine defaults are merged after
@@ -432,19 +483,8 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             return {}
         return {"target_tokenizer": self.tokenizer}
 
-    def setup_speculative_models(self, model: Any, draft_model: Any) -> None:
-        # note (Junnan Li): the draft has its own audio tower with a different
-        # width, so it cannot consume the target's pre-LM embeddings; the draft
-        # role re-encodes from the mel kept on the request
-        # (request_builders keep_draft_audio_features).
-        model.spec_role = "target"
-        draft_model.spec_role = "draft"
-        draft_text_config = _thinker_config(draft_model.config).text_config
-        logger.info(
-            "Qwen3-ASR speculative draft encodes audio with its own tower "
-            "(draft hidden_size=%s)",
-            getattr(draft_text_config, "hidden_size", None),
-        )
+    def speculative_model_support(self) -> Qwen3ASRSpeculativeSupport:
+        return Qwen3ASRSpeculativeSupport(context_length=self.context_length)
 
     def setup_model_resources(
         self,

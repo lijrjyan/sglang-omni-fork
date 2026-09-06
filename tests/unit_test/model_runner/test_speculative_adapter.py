@@ -23,6 +23,11 @@ from sglang_omni.model_runner.prefill_inputs import (
 def test_register_accepts_qwen3_thinker_without_registry_write(monkeypatch) -> None:
     import sglang.srt.models.registry as registry_module
 
+    from sglang_omni.models.qwen3_omni.bootstrap import (
+        register_thinker_speculative_target,
+    )
+
+    register_thinker_speculative_target()
     before = dict(registry_module.ModelRegistry.models)
     register_speculative_omni_models("Qwen3OmniThinkerForCausalLM")
     assert dict(registry_module.ModelRegistry.models) == before

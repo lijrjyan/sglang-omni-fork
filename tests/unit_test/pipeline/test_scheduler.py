@@ -567,7 +567,7 @@ def test_omni_scheduler_spec_run_batch_preserves_native_result_identity(
     )
     scheduler._forward_isolation = lambda _batch, *, overlap: nullcontext()
     monkeypatch.setattr(
-        omni_scheduler_module,
+        omni_scheduler_module.speculative_bridge,
         "resolve_forward_inputs",
         lambda batch, future_map: calls.append(("resolve", batch, future_map)),
     )
@@ -655,19 +655,19 @@ def test_omni_scheduler_spec_result_processor_uses_native_draft_worker() -> None
 
 
 def test_finished_output_ids_trims_tokens_accepted_past_the_stop() -> None:
-    from sglang_omni.scheduling.omni_scheduler import _finished_output_ids
+    from sglang_omni.scheduling.speculative_bridge import finished_output_ids
 
     # Native spec verify can accept "<eos> \\n" in one step; SGLang keeps the
     # tail in output_ids and records the stop position.
     req = SimpleNamespace(output_ids=[5, 6, 2, 198], finished_len=3)
     req.output_ids_through_stop = req.output_ids[: req.finished_len]
-    assert _finished_output_ids(req) == [5, 6, 2]
+    assert finished_output_ids(req) == [5, 6, 2]
 
     legacy = SimpleNamespace(output_ids=[5, 6, 2, 198], finished_len=3)
-    assert _finished_output_ids(legacy) == [5, 6, 2]
+    assert finished_output_ids(legacy) == [5, 6, 2]
 
     unfinished = SimpleNamespace(output_ids=[5, 6], finished_len=None)
-    assert _finished_output_ids(unfinished) == [5, 6]
+    assert finished_output_ids(unfinished) == [5, 6]
 
 
 def test_upstream_queue_limit_abort_is_translated_to_omni_output() -> None:

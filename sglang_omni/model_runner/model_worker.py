@@ -25,42 +25,74 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Target architectures admitted to Omni's native speculative lane. A value
-# names the Omni model class the *draft* loader must resolve through SGLang's
-# registry (STANDALONE drafts share the target architecture); ``None`` means
-# the draft is a native SGLang architecture and nothing needs registering.
-_SPECULATIVE_TARGET_ARCHITECTURES: dict[str, str | None] = {
-    "WhisperForConditionalGeneration": (
-        "sglang_omni.models.whisper_asr.sglang_model:WhisperForConditionalGeneration"
-    ),
-    # EAGLE3 / DFlash drafts (LlamaForCausalLMEagle3, DFlashDraftModel) are
-    # stock SGLang models; the thinker itself resolves through SGLModelRunner.
-    "Qwen3OmniThinkerForCausalLM": None,
-    "Qwen3ASRForConditionalGeneration": (
-        "sglang_omni.models.qwen3_asr.sglang_model:Qwen3ASRForConditionalGeneration"
-    ),
-}
+@dataclass(frozen=True)
+class SpeculativeTargetRegistration:
+    """One target family admitted to Omni's native speculative lane.
+
+    ``omni_model_cls`` names the Omni model class the *draft* loader must
+    resolve through SGLang's registry (STANDALONE drafts share the target
+    architecture), either as a class or a lazy ``"module:Class"`` path;
+    ``None`` means the draft is a native SGLang architecture and nothing needs
+    registering. ``draft_archs`` lists Omni-owned draft architectures to
+    register alongside (empty for every family on this branch).
+    """
+
+    target_arch: str
+    omni_model_cls: Any | str | None = None
+    draft_archs: tuple[tuple[str, Any | str], ...] = ()
+
+
+# Populated by each family's engine builder / bootstrap module at import time
+# through ``register_speculative_target``; model_worker holds no arch list.
+_SPECULATIVE_TARGETS: dict[str, SpeculativeTargetRegistration] = {}
+
+
+def register_speculative_target(
+    target_arch: str,
+    omni_model_cls: Any | str | None = None,
+    draft_archs: Any = (),
+) -> SpeculativeTargetRegistration:
+    """Admit ``target_arch`` to the speculative lane (idempotent)."""
+    registration = SpeculativeTargetRegistration(
+        target_arch=target_arch,
+        omni_model_cls=omni_model_cls,
+        draft_archs=tuple(tuple(item) for item in draft_archs),
+    )
+    _SPECULATIVE_TARGETS[target_arch] = registration
+    return registration
+
+
+def speculative_target_architectures() -> tuple[str, ...]:
+    return tuple(sorted(_SPECULATIVE_TARGETS))
+
+
+def _resolve_model_class(model_cls: Any | str) -> Any:
+    if not isinstance(model_cls, str):
+        return model_cls
+    from importlib import import_module
+
+    module_name, class_name = model_cls.split(":")
+    return getattr(import_module(module_name), class_name)
 
 
 def register_speculative_omni_models(model_architecture: str) -> None:
     """Admit a target architecture and register its Omni draft class if any."""
-    if model_architecture not in _SPECULATIVE_TARGET_ARCHITECTURES:
+    registration = _SPECULATIVE_TARGETS.get(model_architecture)
+    if registration is None:
         raise ValueError(
             "Omni speculative decoding supports target architectures "
-            f"{sorted(_SPECULATIVE_TARGET_ARCHITECTURES)}; "
+            f"{list(speculative_target_architectures())}; "
             f"got {model_architecture!r}"
         )
-    class_path = _SPECULATIVE_TARGET_ARCHITECTURES[model_architecture]
-    if class_path is None:
+    entries = list(registration.draft_archs)
+    if registration.omni_model_cls is not None:
+        entries.insert(0, (model_architecture, registration.omni_model_cls))
+    if not entries:
         return
-    from importlib import import_module
-
     from sglang.srt.models.registry import ModelRegistry
 
-    module_name, class_name = class_path.split(":")
-    ModelRegistry.models[model_architecture] = getattr(
-        import_module(module_name), class_name
-    )
+    for arch, model_cls in entries:
+        ModelRegistry.models[arch] = _resolve_model_class(model_cls)
 
 
 class SpeculativeTargetWorkerAdapter:

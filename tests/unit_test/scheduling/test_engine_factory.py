@@ -998,9 +998,14 @@ def test_speculative_overrides_eagle3_keeps_chain_length_rule() -> None:
     ],
 )
 def test_speculative_registry_installs_omni_model_classes(architecture, module_name):
+    from importlib import import_module
+
     from sglang.srt.models.registry import ModelRegistry
 
     from sglang_omni.model_runner.model_worker import register_speculative_omni_models
+
+    # Families register their target when their engine builder is imported.
+    import_module(f"{module_name}.engine_builder")
 
     previous = ModelRegistry.models.get(architecture)
     try:

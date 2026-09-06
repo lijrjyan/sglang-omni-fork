@@ -146,6 +146,20 @@ def _build_prev_context_tokens(
     return [sot_prev_id] + text_ids[-(max_prev_tokens - 1) :]
 
 
+def reject_speculative_request(params: Any) -> str | None:
+    """Admission check for the speculative Whisper stage (``None`` admits).
+
+    Native speculative verification bypasses the per-request timestamp logit
+    processor, so timestamped transcription must go to a non-speculative stage.
+    """
+    if params.get("segment_timestamps"):
+        return (
+            "Whisper speculative decoding does not support segment_timestamps; "
+            "use a non-speculative Whisper stage for timestamped transcription"
+        )
+    return None
+
+
 def make_whisper_scheduler_adapters(
     *,
     processor: Any,
@@ -194,11 +208,10 @@ def make_whisper_scheduler_adapters(
 
     def request_builder(payload: StagePayload) -> WhisperASRRequestData:
         params = payload.request.params or {}
-        if enable_speculative and params.get("segment_timestamps"):
-            raise ValueError(
-                "Whisper speculative decoding does not support segment_timestamps; "
-                "use a non-speculative Whisper stage for timestamped transcription"
-            )
+        if enable_speculative:
+            refusal = reject_speculative_request(params)
+            if refusal is not None:
+                raise ValueError(refusal)
         prepared = prepare_audio(
             payload,
             source_name="Whisper ASR",

@@ -989,6 +989,29 @@ def make_thinker_stream_output_builder():
     return _build_stream_output
 
 
+_SPECULATIVE_VISUAL_KEYS = (
+    "image_embeds",
+    "video_embeds",
+    "image_grid_thw",
+    "video_grid_thw",
+    "deepstack_visual_embeds",
+    "image_deepstack_visual_embeds",
+    "video_deepstack_visual_embeds",
+)
+
+
+def reject_speculative_request(state: Any) -> str | None:
+    """Admission check for the speculative thinker (``None`` admits).
+
+    Visual inputs need the runner-owned deepstack prefill, which the native
+    draft worker cannot replay; only audio and text are admitted.
+    """
+    model_inputs = _extract_thinker_model_inputs(state.thinker_inputs or {})
+    if any(model_inputs.get(key) is not None for key in _SPECULATIVE_VISUAL_KEYS):
+        return "Qwen3-Omni speculative decoding supports only audio and text input"
+    return None
+
+
 def make_thinker_scheduler_adapters(
     *,
     tokenizer: Any,
@@ -1002,20 +1025,9 @@ def make_thinker_scheduler_adapters(
     def request_builder(payload: StagePayload) -> SGLangARRequestData:
         state = Qwen3OmniPipelineState.from_dict(payload.data)
         if enable_speculative:
-            model_inputs = _extract_thinker_model_inputs(state.thinker_inputs or {})
-            visual_keys = (
-                "image_embeds",
-                "video_embeds",
-                "image_grid_thw",
-                "video_grid_thw",
-                "deepstack_visual_embeds",
-                "image_deepstack_visual_embeds",
-                "video_deepstack_visual_embeds",
-            )
-            if any(model_inputs.get(key) is not None for key in visual_keys):
-                raise ValueError(
-                    "Qwen3-Omni speculative decoding supports only audio and text input"
-                )
+            refusal = reject_speculative_request(state)
+            if refusal is not None:
+                raise ValueError(refusal)
         params = payload.request.params or {}
         req_data = build_sglang_thinker_request(
             state,
