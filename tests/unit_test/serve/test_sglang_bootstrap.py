@@ -710,10 +710,13 @@ def test_stock_dflash_draft_disable_initializes_eager_runner():
 
 
 @pytest.mark.parametrize("capture", [False, True])
-def test_dspark_graph_initialization_and_runner_ownership(capture):
+def test_dspark_graph_initialization_and_runner_ownership(capture, caplog):
+    caplog.set_level("INFO")
     calls = []
     runner = SimpleNamespace(
-        model="draft", layer_info=SimpleNamespace(num_effective_layers=3)
+        model="draft",
+        layer_info=SimpleNamespace(num_effective_layers=3),
+        decode_cuda_graph_runner=object() if capture else None,
     )
     inner = SimpleNamespace(init_cuda_graphs=lambda **kw: calls.append(("inner", kw)))
     worker = SimpleNamespace(
@@ -731,3 +734,4 @@ def test_dspark_graph_initialization_and_runner_ownership(capture):
         if capture
         else calls == [("inner", {"capture_decode_cuda_graph": False})]
     )
+    assert f"draft_decode={'captured' if capture else 'eager'}" in caplog.text

@@ -146,6 +146,9 @@ def init_speculative_draft_cuda_graphs(
             inner.speculative_num_steps = original_steps
     inner_draft_worker = _inner_draft_worker(draft_worker)
     draft_decode_runner = getattr(inner_draft_worker, "cuda_graph_runner", None)
+    draft_runner = getattr(draft_worker, "draft_model_runner", None)
+    if draft_decode_runner is None and draft_runner is not None:
+        draft_decode_runner = draft_runner.decode_cuda_graph_runner
     draft_extend_runner = getattr(
         inner_draft_worker, "cuda_graph_runner_for_draft_extend", None
     )
