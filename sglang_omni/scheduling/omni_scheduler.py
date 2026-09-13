@@ -1465,9 +1465,17 @@ class OmniScheduler:
         own that state, so feed it in and write the (possibly rebuilt) running
         batch back before handing the runnable batch to the caller.
         """
-        plan = _Upstream.get_next_batch_to_run(
-            self, self.running_batch, self.last_batch
-        )
+        running = self.running_batch
+        # Note (Junnan Li): Upstream can latch full onto an empty mixed-chunk batch.
+        if (
+            running.is_empty()
+            and running.batch_is_full
+            and self.waiting_queue
+            and self.chunked_req is None
+            and self.get_num_allocatable_reqs(0, running_batch=running) > 0
+        ):
+            running.batch_is_full = False
+        plan = _Upstream.get_next_batch_to_run(self, running, self.last_batch)
         self.running_batch = plan.running_batch
         return plan.batch_to_run
 
