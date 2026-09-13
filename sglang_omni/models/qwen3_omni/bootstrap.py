@@ -20,6 +20,7 @@ def create_thinker_scheduler(
     prefill_coalesce_wait_ms: float = 60.0,
     prefill_coalesce_when_idle: bool = False,
     speculative_draft_cuda_graph: bool = False,
+    speculative_overlap: bool = False,
 ):
     """Create the Qwen thinker scheduler."""
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -58,6 +59,27 @@ def create_thinker_scheduler(
         raise ValueError(
             "Qwen3-Omni speculative decoding requires enable_async_decode=False"
         )
+    if (
+        speculative_enabled
+        and server_args.speculative_algorithm == "DFLASH"
+        and server_args.enable_torch_compile
+    ):
+        raise ValueError(
+            "Qwen3-Omni DFLASH with torch.compile is currently unsupported: "
+            "generated output can be incorrect. "
+            "Set enable_torch_compile=False; CUDA graphs can remain enabled."
+        )
+
+    if speculative_overlap and (
+        not speculative_enabled
+        or server_args.speculative_algorithm != "DFLASH"
+        or server_args.tp_size != 1
+        or server_args.disable_overlap_schedule
+        or server_args.enable_mixed_chunk
+    ):
+        raise ValueError(
+            "speculative_overlap requires DFLASH, TP1, native overlap and no mixed chunk"
+        )
 
     capture_hidden_layers = [0, 24] if speech_enabled else None
     capture_hidden = speech_enabled
@@ -86,6 +108,7 @@ def create_thinker_scheduler(
         defer_cuda_graph_capture=defer_cuda_graph_capture,
         enable_prefill_input_embeds=enable_prefill_input_embeds,
         target_tokenizer=tokenizer if speculative_enabled else None,
+        speculative_overlap=speculative_overlap,
     )
 
     (
@@ -162,6 +185,7 @@ def create_thinker_scheduler(
         request_builder=request_builder,
         result_adapter=result_adapter,
         stream_output_builder=stream_output_builder,
+        enable_overlap=speculative_overlap,
         enable_async_decode=enable_async_decode,
         async_decode_min_batch_size=async_decode_min_batch_size,
         prefill_coalesce_requests=prefill_coalesce_requests,

@@ -198,6 +198,7 @@ def create_sglang_infrastructure(
     defer_cuda_graph_capture: bool = False,
     enable_prefill_input_embeds: bool = False,
     target_tokenizer: Any = None,
+    speculative_overlap: bool = False,
 ):
     """Create SGLang worker, memory pools, and tree cache."""
     # ModelRunner.__init__ publishes server_args as the process-wide runtime
@@ -227,10 +228,22 @@ def create_sglang_infrastructure(
     spec_algorithm = _parse_speculative_algorithm(server_args)
     if not spec_algorithm.is_none():
         register_speculative_omni_models(model_arch_override)
-        if not server_args.disable_overlap_schedule:
+        if not server_args.disable_overlap_schedule and not speculative_overlap:
             raise ValueError(
                 "Omni speculative decoding requires disable_overlap_schedule=True"
             )
+
+    if speculative_overlap and (
+        not spec_algorithm.is_dflash()
+        or server_args.disable_overlap_schedule
+        or server_args.tp_size != 1
+        or server_args.enable_mixed_chunk
+        or model_arch_override != "Qwen3OmniThinkerForCausalLM"
+        or capture_hidden_layers
+    ):
+        raise ValueError(
+            "speculative_overlap requires text-only Qwen3-Omni DFLASH, TP1 and no mixed chunk"
+        )
 
     kv_cache_bytes = consume_stage_kv_cache_bytes()
     worker_config = ModelWorkerConfig(

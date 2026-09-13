@@ -28,7 +28,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.managers.overlap_utils import (
+    decide_needs_cpu_seq_lens,
+    resolve_forward_inputs,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -191,6 +194,8 @@ class OmniScheduler:
         are defined directly on this class and take precedence.
     """
 
+    _speculative_overlap = None
+    _failed_batch_result = _FAILED_BATCH_RESULT
     spec_algorithm = SpeculativeAlgorithm.NONE
     draft_worker = None
     target_worker_adapter = None
@@ -326,9 +331,16 @@ class OmniScheduler:
                         server_args.speculative_algorithm
                     )
                 )
-            if self.enable_overlap:
+            if self.enable_overlap and (
+                not self.spec_algorithm.is_dflash()
+                or server_args.tp_size != 1
+                or server_args.disable_overlap_schedule
+                or server_args.enable_mixed_chunk
+                or str(tp_worker.device).split(":")[0] != "cuda"
+            ):
                 raise ValueError(
-                    "Omni speculative decoding requires enable_overlap=False"
+                    "Omni speculative overlap requires CUDA DFLASH, TP1, "
+                    "disable_overlap_schedule=False and no mixed chunk"
                 )
             if self.enable_async_decode:
                 raise ValueError(
@@ -485,11 +497,7 @@ class OmniScheduler:
         self.dllm_config = None
         self._execution_bridge = None
         if not self.spec_algorithm.is_none():
-            self.future_map = self.spec_algorithm.create_future_map(
-                torch.device(self.device),
-                self.req_to_token_pool,
-                needs_cpu_seq_lens=True,
-            )
+            self._init_speculative_future_map()
         if model_runner is not None:
             self.bind_model_runner(model_runner)
 
@@ -592,6 +600,26 @@ class OmniScheduler:
         self._model_runner = model_runner
         self._execution_bridge = bridge
         self.future_map = bridge.future_map
+
+    def _init_speculative_future_map(self) -> None:
+        attn_backends = getattr(
+            self.draft_worker,
+            "spec_v2_attn_backends",
+            (self.tp_worker.model_runner.attn_backend,),
+        )
+        needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
+        self.future_map = self.spec_algorithm.create_future_map(
+            torch.device(self.device),
+            self.req_to_token_pool,
+            needs_cpu_seq_lens=needs_cpu_seq_lens,
+        )
+        logger.info(
+            "Native speculative execution: algorithm=%s schedule=%s "
+            "needs_cpu_seq_lens=%s",
+            self.spec_algorithm.name,
+            "overlap" if self.enable_overlap else "synchronous",
+            needs_cpu_seq_lens,
+        )
 
     def _init_upstream_compat_flags(self, server_args: Any) -> None:
         self.enable_hisparse = bool(server_args.enable_hisparse)
@@ -1483,6 +1511,10 @@ class OmniScheduler:
         """Run one native synchronous speculative batch without reconstruction."""
         self._emit_prefill_start_for_batch(batch)
         self._stamp_batch_launch(batch)
+        if self._speculative_overlap is not None:
+            result = self._speculative_overlap.forward(batch)
+            self._emit_prefill_end_for_batch(batch)
+            return result
         resolve_forward_inputs(batch, self.future_map)
         with self._forward_isolation(batch, overlap=False):
             batch_result = self.draft_worker.forward_batch_generation(batch)
@@ -1494,9 +1526,15 @@ class OmniScheduler:
             batch.spec_info.hidden_states = None
         if batch_result.new_seq_lens is not None:
             batch.seq_lens = batch_result.new_seq_lens
-            if batch.seq_lens_cpu is not None:
+            if self.future_map.needs_cpu_seq_lens:
                 batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            else:
+                # Forward isolation restores the pre-verify CPU mirror. It is
+                # stale after variable acceptance; GPU-only backends must not
+                # let it survive into batch filtering/merging or the next step.
+                batch.seq_lens_cpu = None
+                batch.seq_lens_sum = None
         batch.input_ids = None
         self.update_cache_from_scheduler(batch, batch_result)
         batch_result.copy_done = self.device_module.Event()
@@ -1631,6 +1669,12 @@ class OmniScheduler:
         )
 
     def _handle_batch_failure(self, batch: Any, error: Exception) -> None:
+        if self._speculative_overlap is not None:
+            self._speculative_overlap.synchronize()
+            self._speculative_overlap.drain()
+            # A failed native forward can leave partially advanced draft/KV
+            # state. Fail closed instead of scheduling another forward.
+            self._running = False
         reqs = list(batch.reqs)
         request_ids = [req.rid for req in reqs]
         logger.exception("OmniScheduler batch failed for requests=%s", request_ids)
@@ -1875,6 +1919,13 @@ class OmniScheduler:
             self._pending_request_admissions.clear()
 
     def _shutdown_resources(self) -> None:
+        if (
+            self._speculative_overlap is not None
+            and self._scheduler_thread_id is not None
+            and self._scheduler_thread_id != threading.get_ident()
+        ):
+            # The scheduler loop fences/drains before its finally closes workers.
+            return
         with self._shutdown_lock:
             callback = self._shutdown_callback
             self._shutdown_callback = None
@@ -1889,6 +1940,10 @@ class OmniScheduler:
         self._request_build_executor = None
 
     def abort(self, request_id: str, *, defer_running_cleanup: bool = True) -> None:
+        if self._speculative_overlap is not None and (
+            self._scheduler_thread_id != threading.get_ident()
+        ):
+            defer_running_cleanup = True
         with self._request_admission_lock:
             if request_id not in self._aborted_request_ids:
                 if len(self._aborted_request_ids) >= _ABORTED_REQUEST_ID_LIMIT:
@@ -2262,6 +2317,11 @@ class OmniScheduler:
         request_ids = self._active_request_ids()
         for request_id in request_ids:
             self.abort(request_id, defer_running_cleanup=False)
+            # Administrative aborts originate inside the engine, so the
+            # coordinator still has a client waiting for a terminal result.
+            self._emit_request_error(
+                request_id, RuntimeError("Request aborted by engine administration")
+            )
         return len(request_ids)
 
     def _active_request_ids(self) -> list[str]:
@@ -2430,22 +2490,16 @@ class OmniScheduler:
                 self.self_check_during_busy()
 
     def _event_loop_overlap(self) -> None:
-        # Model runners read Req.inflight_middle_chunks at forward time under
-        # a same-iteration process_batch_result contract. On this loop the
-        # decrement lags one iteration, so a final prefill chunk still reads
-        # as a middle chunk at forward time and the TTS model runners emit
-        # wrong chunk boundaries — silently. No construction site enables
-        # overlap today; refuse to run rather than corrupt chunked prefill if
-        # one ever does.
-        # The pre-guard loop body lives in git history ("Refuse the
-        # OmniScheduler overlap event loop"); reviving it needs that drain,
-        # not just deleting this raise.
-        raise NotImplementedError(
-            "OmniScheduler's overlap event loop is unsupported: "
-            "Req.inflight_middle_chunks lags one iteration on this loop. "
-            "Drain the result queue before the forward, then remove this "
-            "guard."
-        )
+        if self.spec_algorithm.is_none():
+            raise NotImplementedError(
+                "OmniScheduler overlap is only implemented for native DFLASH; "
+                "ordinary model runners require same-iteration prefill results"
+            )
+        from sglang_omni.scheduling.speculative_overlap import NativeSpeculativeOverlap
+
+        self.device_module.set_device(self.gpu_id)
+        self._speculative_overlap = NativeSpeculativeOverlap(self)
+        self._speculative_overlap.run()
 
     @staticmethod
     def _batch_is_decode(batch: ScheduleBatch) -> bool:
@@ -2462,7 +2516,14 @@ class OmniScheduler:
         ``_async_pending`` is ``(batch, sched_output, pending_step)`` or None.
         """
         pending = self._async_pending
-        return pending[0] if pending is not None else None
+        if pending is not None:
+            return pending[0]
+        if self._speculative_overlap is not None:
+            try:
+                return self._speculative_overlap.pending[0][0]
+            except IndexError:
+                pass
+        return None
 
     def _resolve_and_process(self, batch, sched_output, pending_step) -> None:
         """Resolve a launched step and feed it to process_batch_result, after
@@ -2507,6 +2568,8 @@ class OmniScheduler:
         """Resolve + process the in-flight decode step, if any. Used to flush
         before prefill / pause / shutdown so a launched step is never stranded.
         """
+        if self._speculative_overlap is not None:
+            self._speculative_overlap.drain()
         if self._async_pending is None:
             return
         batch, sched_output, pending_step = self._async_pending
@@ -2885,7 +2948,6 @@ def _clear_empty_schedule_batch_rows(batch: Any) -> None:
         empty_device_indices = torch.empty(0, dtype=torch.long, device=device)
         spec_info.filter_batch(
             new_indices=empty_device_indices,
-            has_been_filtered=False,
             new_indices_cpu=[],
         )
 

@@ -1052,3 +1052,41 @@ def test_speculative_prefill_graph_requires_target_graphs() -> None:
             speculative_num_draft_tokens=4,
             speculative_prefill_cuda_graph=True,
         )
+
+
+def test_dflash_overlap_configures_native_worker_allocation():
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    result = configure_speculative_overrides(
+        {},
+        enable_speculative=True,
+        speculative_algorithm="DFLASH",
+        speculative_draft_model_path="public/drafter",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=8,
+        speculative_overlap=True,
+    )
+    assert result["disable_overlap_schedule"] is False
+
+
+@pytest.mark.parametrize(
+    "overrides,algorithm",
+    [
+        ({"disable_overlap_schedule": True}, "DFLASH"),
+        ({"tp_size": 2}, "DFLASH"),
+        ({}, "EAGLE3"),
+    ],
+)
+def test_overlap_rejects_inconsistent_worker_contract(overrides, algorithm):
+    from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
+
+    with pytest.raises(ValueError, match="speculative_overlap"):
+        configure_speculative_overrides(
+            overrides,
+            enable_speculative=True,
+            speculative_algorithm=algorithm,
+            speculative_draft_model_path="public/drafter",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_overlap=True,
+        )

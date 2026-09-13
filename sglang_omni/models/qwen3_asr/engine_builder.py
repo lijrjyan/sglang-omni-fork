@@ -42,6 +42,8 @@ def _validate_qwen3_asr_speculative_configs(
     draft_config: Any,
     *,
     context_length: int,
+    speculative_algorithm: str = "STANDALONE",
+    speculative_num_draft_tokens: int = 4,
 ) -> None:
     """Reject drafts that cannot share the target's token stream.
 
@@ -49,6 +51,38 @@ def _validate_qwen3_asr_speculative_configs(
     tower, so hidden sizes may differ but the vocabulary, the audio
     placeholder ids and the positional capacity must agree.
     """
+    if speculative_algorithm == "DFLASH":
+        if "DFlashDraftModel" not in (draft_config.architectures or []):
+            raise ValueError("Qwen3-ASR DFLASH requires a DFlashDraftModel checkpoint")
+        target_text = _thinker_config(target_config).text_config
+        for field in ("vocab_size", "hidden_size"):
+            if getattr(draft_config, field) != getattr(target_text, field):
+                raise ValueError(f"Qwen3-ASR DFLASH {field} must match target")
+        if getattr(draft_config, "block_size", None) != speculative_num_draft_tokens:
+            raise ValueError(
+                "DFLASH block_size must match speculative_num_draft_tokens"
+            )
+        layers = (getattr(draft_config, "dflash_config", None) or {}).get(
+            "target_layer_ids"
+        )
+        if (
+            not layers
+            or len(set(layers)) != len(layers)
+            or any(
+                type(i) is not int or not 0 <= i < target_text.num_hidden_layers
+                for i in layers
+            )
+        ):
+            raise ValueError(
+                "DFLASH target_layer_ids must be distinct valid target layers"
+            )
+        if draft_config.max_position_embeddings < context_length:
+            raise ValueError(
+                "DFLASH max_position_embeddings is smaller than context_length"
+            )
+        return
+    if speculative_algorithm != "STANDALONE":
+        raise ValueError("Qwen3-ASR supports STANDALONE or DFLASH")
     draft_architectures = set(draft_config.architectures or [])
     if not draft_architectures.intersection(_QWEN3_ASR_ARCHITECTURES):
         raise ValueError(
@@ -116,6 +150,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         prefill_coalesce_after_builds_during_decode: bool,
         stream_emit_interval_s: float,
         enable_speculative: bool = False,
+        speculative_algorithm: str = "STANDALONE",
         speculative_draft_model_path: str | None = None,
         speculative_num_steps: int = 3,
         speculative_num_draft_tokens: int = 4,
@@ -172,6 +207,9 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         )
         self.stream_emit_interval_s = stream_emit_interval_s
         self.enable_speculative = bool(enable_speculative)
+        self.speculative_algorithm = speculative_algorithm.upper()
+        if self.speculative_algorithm not in {"STANDALONE", "DFLASH"}:
+            raise ValueError("Qwen3-ASR supports STANDALONE or DFLASH")
         self.speculative_draft_model_path = speculative_draft_model_path
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
@@ -399,6 +437,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
                     "Qwen3-ASR speculative decoding requires the CUDA/ROCm path"
                 )
             self.enable_speculative = True
+            self.speculative_algorithm = str(overrides["speculative_algorithm"]).upper()
             self.enable_async_decode = False
             self.speculative_num_draft_tokens = overrides[
                 "speculative_num_draft_tokens"
@@ -418,6 +457,8 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
                 self._target_hf_config,
                 draft_config,
                 context_length=self.context_length,
+                speculative_algorithm=self.speculative_algorithm,
+                speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             )
         if use_mlx() or self._uses_torch_mps():
             # note (yexiaodong): Typed pipeline engine defaults are merged after
@@ -438,6 +479,8 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         # role re-encodes from the mel kept on the request
         # (request_builders keep_draft_audio_features).
         model.spec_role = "target"
+        if self.speculative_algorithm == "DFLASH":
+            return
         draft_model.spec_role = "draft"
         draft_text_config = _thinker_config(draft_model.config).text_config
         logger.info(
@@ -524,7 +567,9 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             audio_encoder_service=self.audio_encoder_service,
             should_wait_for_encode=self.should_wait_for_encode,
             greedy_only=use_mlx() or self._uses_torch_mps(),
-            keep_draft_audio_features=self.enable_speculative,
+            keep_draft_audio_features=(
+                self.enable_speculative and self.speculative_algorithm == "STANDALONE"
+            ),
         )
 
     def make_abort_callback(self) -> Any | None:

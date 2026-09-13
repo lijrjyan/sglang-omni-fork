@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from pydantic import Field
 
@@ -35,6 +35,7 @@ class Qwen3ASRFactoryArgs(FactoryArgs):
     """Qwen3-ASR's own constructor knobs, typed like the shared ones."""
 
     enable_speculative: bool | None = None
+    speculative_algorithm: Literal["STANDALONE", "DFLASH"] | None = None
     speculative_draft_model_path: str | None = None
     speculative_num_steps: int | None = Field(default=None, ge=0)
     speculative_num_draft_tokens: int | None = Field(default=None, ge=1)

@@ -67,6 +67,7 @@ def configure_speculative_overrides(
     speculative_draft_cuda_graph: bool = False,
     speculative_algorithm: str = "STANDALONE",
     speculative_prefill_cuda_graph: bool = False,
+    speculative_overlap: bool = False,
 ) -> dict[str, Any]:
     """Validate Omni's native speculative decoding configuration.
 
@@ -111,6 +112,8 @@ def configure_speculative_overrides(
 
     algorithm = configured.get("speculative_algorithm")
     if algorithm is None:
+        if speculative_overlap:
+            raise ValueError("speculative_overlap requires native DFLASH decoding")
         configured_fields = [
             name
             for name in _SPECULATIVE_OVERRIDE_FIELDS
@@ -142,8 +145,7 @@ def configure_speculative_overrides(
     topk = configured.setdefault("speculative_eagle_topk", 1)
     if topk != 1:
         raise ValueError(
-            "speculative_eagle_topk must be 1 for the synchronous lane; "
-            f"got {topk!r}"
+            f"speculative_eagle_topk must be 1 for the synchronous lane; got {topk!r}"
         )
     if normalized_algorithm == "DFLASH":
         block_size = int(configured.setdefault("speculative_num_draft_tokens", 8))
@@ -167,8 +169,15 @@ def configure_speculative_overrides(
         configured["speculative_num_steps"] = num_steps
         configured["speculative_num_draft_tokens"] = num_draft_tokens
 
-    # note (Junnan Li): target and draft graph capture follow multi-token parity.
-    configured["disable_overlap_schedule"] = True
+    if speculative_overlap:
+        if normalized_algorithm != "DFLASH" or int(configured.get("tp_size", 1)) != 1:
+            raise ValueError("speculative_overlap currently requires DFLASH and TP1")
+        if configured.get("disable_overlap_schedule") is True:
+            raise ValueError(
+                "speculative_overlap conflicts with disable_overlap_schedule=True"
+            )
+    # Worker allocation and scheduler result processing must use one contract.
+    configured["disable_overlap_schedule"] = not speculative_overlap
     configured["disable_cuda_graph"] = not speculative_cuda_graph
     # SGLang 0.5.18 gives nested graph settings precedence over flat flags.
     # The speculative path uses target verify graphs; the stage's prefill graph
@@ -220,6 +229,7 @@ class SGLangGenerationEngineBuilder(ABC):
     # CUDA graph contract; a deployment override cannot enable it otherwise.
     supports_breakable_prefill_cuda_graph: bool = False
     enable_speculative: bool = False
+    speculative_algorithm: str = "STANDALONE"
     speculative_draft_model_path: str | None = None
     speculative_num_steps: int = 3
     speculative_num_draft_tokens: int = 4
@@ -293,6 +303,7 @@ class SGLangGenerationEngineBuilder(ABC):
         overrides = configure_speculative_overrides(
             overrides,
             enable_speculative=self.enable_speculative,
+            speculative_algorithm=self.speculative_algorithm,
             speculative_draft_model_path=self.speculative_draft_model_path,
             speculative_num_steps=self.speculative_num_steps,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,

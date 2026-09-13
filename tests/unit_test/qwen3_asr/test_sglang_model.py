@@ -368,3 +368,28 @@ def test_draft_role_forward_ignores_mrope_positions(monkeypatch) -> None:
             model, torch.tensor([1, 2]), positions, forward_batch
         )
         assert torch.equal(seen["positions"], expected), role
+
+
+def test_dflash_capture_delegates_hf_layer_ids_without_double_shift():
+    from unittest.mock import Mock
+
+    language_model = Mock()
+    model = SimpleNamespace(language_model=language_model)
+    Qwen3ASRForConditionalGeneration.set_dflash_layers_to_capture(model, [1, 13, 25])
+    language_model.set_dflash_layers_to_capture.assert_called_once_with([1, 13, 25])
+    assert model.capture_aux_hidden_states
+    Qwen3ASRForConditionalGeneration.get_embed_and_head(model)
+    language_model.get_embed_and_head.assert_called_once_with()
+
+
+def test_dflash_decode_exposes_embedding_module_and_lm_head():
+    from unittest.mock import Mock
+
+    language_model = Mock()
+    model = SimpleNamespace(language_model=language_model)
+    assert Qwen3ASRForConditionalGeneration.get_input_embeddings(model) is (
+        language_model.get_input_embeddings.return_value
+    )
+    assert (
+        Qwen3ASRForConditionalGeneration.lm_head.fget(model) is language_model.lm_head
+    )

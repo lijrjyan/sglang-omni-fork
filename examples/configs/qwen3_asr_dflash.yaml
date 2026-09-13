@@ -1,0 +1,20 @@
+# DFlash integration profile; qualify your trained draft before performance use.
+# Draft block_size must equal speculative_num_draft_tokens.
+config_cls: Qwen3ASRPipelineConfig
+name: qwen3-asr-dflash
+model_path: Qwen/Qwen3-ASR-1.7B
+stages:
+  asr:
+    factory:
+      dtype: bfloat16
+      enable_speculative: true
+      speculative_algorithm: DFLASH
+      speculative_draft_model_path: /path/to/specforge/qwen3-asr/draft
+      speculative_num_draft_tokens: 4
+      enable_encoder_cuda_graph: false
+    engine:
+      context_length: 4096
+      max_running_requests: 4
+      mem_fraction_static: 0.5
+      enable_torch_compile: false
+      disable_cuda_graph: true

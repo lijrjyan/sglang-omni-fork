@@ -353,6 +353,21 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         )
         return hidden_states
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.language_model.get_input_embeddings()
+
+    @property
+    def lm_head(self) -> nn.Module:
+        return self.language_model.lm_head
+
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        # Qwen3ForCausalLM owns the HF-output to SGLang-input layer shift.
+        self.capture_aux_hidden_states = True
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         llm_stacked_params = [
             ("qkv_proj", "q_proj", "q"),

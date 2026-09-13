@@ -512,9 +512,13 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
 
 
 @pytest.mark.parametrize("standalone", [False, True])
+@pytest.mark.parametrize("needs_cpu_seq_lens", [False, True])
+@pytest.mark.parametrize("has_cpu_mirror", [False, True])
 def test_omni_scheduler_spec_run_batch_preserves_native_result_identity(
     monkeypatch,
     standalone,
+    needs_cpu_seq_lens,
+    has_cpu_mirror,
 ) -> None:
     calls: list[object] = []
     import torch
@@ -533,7 +537,7 @@ def test_omni_scheduler_spec_run_batch_preserves_native_result_identity(
 
     class NativeResult:
         def __init__(self) -> None:
-            self.new_seq_lens = None
+            self.new_seq_lens = torch.tensor([13, 27])
             self.next_draft_input = next_draft_input
             self.copy_done = None
 
@@ -552,7 +556,7 @@ def test_omni_scheduler_spec_run_batch_preserves_native_result_identity(
         is_none=lambda: False, is_standalone=lambda: standalone
     )
     scheduler.draft_worker = DraftWorker()
-    scheduler.future_map = object()
+    scheduler.future_map = SimpleNamespace(needs_cpu_seq_lens=needs_cpu_seq_lens)
     scheduler.device_module = SimpleNamespace(Event=lambda: "copy-event")
     scheduler.forward_ct = 0
     scheduler._sched_idled = False
@@ -575,16 +579,33 @@ def test_omni_scheduler_spec_run_batch_preserves_native_result_identity(
         reqs=[],
         spec_info=None,
         seq_lens=None,
-        seq_lens_cpu=None,
-        seq_lens_sum=None,
+        seq_lens_cpu=torch.tensor([10, 20]) if has_cpu_mirror else None,
+        seq_lens_sum=30 if has_cpu_mirror else None,
         input_ids=object(),
         return_logprob=False,
         return_hidden_states=False,
     )
 
+    length_copies = []
+    tensor_to = torch.Tensor.to
+
+    def track_length_copy(tensor, *args, **kwargs):
+        if tensor is native_result.new_seq_lens:
+            length_copies.append((args, kwargs))
+        return tensor_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", track_length_copy)
     result = scheduler.run_batch(batch)
+    assert len(length_copies) == int(needs_cpu_seq_lens)
 
     assert result is native_result
+    assert batch.seq_lens is native_result.new_seq_lens
+    if needs_cpu_seq_lens:
+        assert torch.equal(batch.seq_lens_cpu, torch.tensor([13, 27]))
+        assert batch.seq_lens_sum == 40
+    else:
+        assert batch.seq_lens_cpu is None
+        assert batch.seq_lens_sum is None
     assert calls[2] == ("draft_forward", batch)
     assert batch.spec_info is next_draft_input
     assert batch.input_ids is None
@@ -3070,3 +3091,155 @@ def test_omni_scheduler_running_abort_does_not_leak_prefill_dedup_state(
     assert ends == [("req-1", "aborted")]
     assert scheduler._prefill_start_done == set()
     assert scheduler._prefill_start_done == set()
+
+
+@pytest.mark.parametrize(
+    "target_needs_cpu,draft_needs_cpu,two_batch_overlap,expected",
+    [
+        (False, False, False, False),
+        (True, False, False, True),
+        (False, True, False, True),
+        (False, False, True, True),
+        (False, None, False, True),
+    ],
+)
+def test_speculative_metadata_capability_includes_draft_backend(
+    monkeypatch, target_needs_cpu, draft_needs_cpu, two_batch_overlap, expected
+):
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.enable_overlap = False
+    scheduler.device = "cpu"
+    scheduler.req_to_token_pool = object()
+    scheduler.spec_algorithm = SpeculativeAlgorithm.DFLASH
+    scheduler.server_args = SimpleNamespace(
+        speculative_algorithm="DFLASH", enable_two_batch_overlap=two_batch_overlap
+    )
+    target = SimpleNamespace(needs_cpu_seq_lens=target_needs_cpu)
+    draft = (
+        SimpleNamespace()
+        if draft_needs_cpu is None
+        else SimpleNamespace(needs_cpu_seq_lens=draft_needs_cpu)
+    )
+    scheduler.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(attn_backend=target)
+    )
+    scheduler.draft_worker = SimpleNamespace(spec_v2_attn_backends=(target, draft))
+    monkeypatch.setattr(
+        SpeculativeAlgorithm,
+        "create_future_map",
+        lambda self, device, pool, *, needs_cpu_seq_lens: SimpleNamespace(
+            needs_cpu_seq_lens=needs_cpu_seq_lens
+        ),
+    )
+
+    scheduler._init_speculative_future_map()
+
+    assert scheduler.future_map.needs_cpu_seq_lens is expected
+
+
+def test_abort_compacts_gpu_only_sequence_lengths():
+    batch = _make_row_aligned_schedule_batch(size=2)
+    batch.seq_lens_cpu = None
+    batch.seq_lens_sum = None
+    scheduler = _make_row_removal_abort_scheduler(batch)
+
+    scheduler.abort("req-0", defer_running_cleanup=False)
+
+    assert batch.req_pool_indices.tolist() == [11]
+    assert batch.seq_lens.tolist() == [111]
+    assert batch.seq_lens_cpu is None
+    assert batch.sampling_info.values.tolist() == [11]
+
+    scheduler.abort("req-1", defer_running_cleanup=False)
+
+    assert not batch.reqs
+    assert batch.seq_lens.numel() == 0
+    assert batch.seq_lens_cpu is None
+    assert batch.sampling_info.values.numel() == 0
+
+
+def test_native_overlap_pending_abort_defers_kv_release():
+    batch = _make_row_aligned_schedule_batch(size=2)
+    scheduler = _make_row_removal_abort_scheduler(batch)
+    scheduler.running_batch = None
+    scheduler.cur_batch = None
+    scheduler._scheduler_thread_id = -1  # external abort
+    scheduler._speculative_overlap = SimpleNamespace(pending=deque([(batch, object())]))
+    freed = []
+    scheduler._release_immediate_request_resources = freed.append
+    scheduler.abort("req-0", defer_running_cleanup=False)
+    assert batch.reqs[0].to_finish is not None
+    assert len(batch.reqs) == 2
+    assert not freed
+    assert scheduler._async_pending_batch() is batch
+
+
+def test_native_overlap_admin_drain_uses_native_result_queue():
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._async_pending = None
+    events = []
+    scheduler._speculative_overlap = SimpleNamespace(
+        drain=lambda: events.append("drained")
+    )
+    scheduler._resolve_pending_async()
+    assert events == ["drained"]
+
+
+def test_native_overlap_stop_keeps_workers_until_scheduler_drain():
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._scheduler_thread_id = -1
+    scheduler._speculative_overlap = object()
+    scheduler._shutdown_lock = threading.Lock()
+    events = []
+    scheduler._shutdown_callback = lambda: events.append("closed")
+    scheduler._shutdown_resources()
+    assert not events
+    scheduler._scheduler_thread_id = None
+    scheduler._shutdown_resources()
+    scheduler._shutdown_resources()
+    assert events == ["closed"]
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_abort_last_row_filters_real_native_dflash_state(overlap):
+    from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+
+    batch = _make_row_aligned_schedule_batch(size=1)
+    state = make_draft_input_v2(
+        bonus_tokens=torch.tensor([7]),
+        new_seq_lens=torch.tensor([12]),
+    )
+    state.reserved_seq_lens_cpu = torch.tensor([24])
+    state.reserved_seq_lens_sum = 24
+    if overlap:
+        state.future_indices = torch.tensor([10])
+    batch.spec_info = state
+    scheduler = _make_row_removal_abort_scheduler(batch)
+    scheduler.abort("req-0", defer_running_cleanup=False)
+    assert not batch.reqs
+    assert state.reserved_seq_lens_cpu.numel() == 0
+    assert state.reserved_seq_lens_sum == 0
+    if overlap:
+        assert state.future_indices.numel() == 0
+    else:
+        assert state.bonus_tokens.numel() == state.new_seq_lens.numel() == 0
+
+
+def test_admin_abort_emits_terminal_errors_for_waiting_clients():
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.is_entry_rank = True
+    scheduler.outbox = Queue()
+    scheduler._active_request_ids = lambda: ["req-0", "req-1"]
+    cleaned = []
+    scheduler.abort = lambda rid, **kwargs: cleaned.append(rid)
+    assert scheduler._abort_all_requests() == 2
+    assert cleaned == ["req-0", "req-1"]
+    assert scheduler.outbox.qsize() == 2
+    messages = [scheduler.outbox.get_nowait() for _ in range(2)]
+    assert [message.request_id for message in messages] == cleaned
+    assert all(
+        message.type == "error" and "aborted" in str(message.data)
+        for message in messages
+    )

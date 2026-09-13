@@ -487,8 +487,10 @@ def _patch_engine_dependencies(
     monkeypatch.setattr(
         request_builders,
         "make_qwen3_asr_stream_output_builder",
-        lambda **kwargs: recorded.stream_builder_calls.append(kwargs)
-        or recorded.stream_output_builder,
+        lambda **kwargs: (
+            recorded.stream_builder_calls.append(kwargs)
+            or recorded.stream_output_builder
+        ),
     )
     monkeypatch.setattr(
         sglang_backend,
@@ -921,3 +923,52 @@ def test_qwen3_asr_speculative_adjust_overrides_validates_draft(monkeypatch) -> 
     assert builder.enable_speculative is True
     assert builder.enable_async_decode is False
     assert overrides["enable_torch_compile"] is False
+
+
+def _dflash_config():
+    return SimpleNamespace(
+        architectures=["DFlashDraftModel"],
+        vocab_size=151936,
+        hidden_size=1024,
+        max_position_embeddings=65536,
+        block_size=4,
+        dflash_config={"target_layer_ids": [1, 5, 9]},
+    )
+
+
+def test_qwen3_asr_dflash_validates_feature_contract():
+    target = _spec_hf_config()
+    target.thinker_config.text_config.num_hidden_layers = 12
+    qwen3_asr_builder._validate_qwen3_asr_speculative_configs(
+        target,
+        _dflash_config(),
+        context_length=4096,
+        speculative_algorithm="DFLASH",
+        speculative_num_draft_tokens=4,
+    )
+    for field, value in [("hidden_size", 512), ("block_size", 8), ("vocab_size", 100)]:
+        draft = _dflash_config()
+        setattr(draft, field, value)
+        with pytest.raises(ValueError, match=field):
+            qwen3_asr_builder._validate_qwen3_asr_speculative_configs(
+                target,
+                draft,
+                context_length=4096,
+                speculative_algorithm="DFLASH",
+                speculative_num_draft_tokens=4,
+            )
+
+
+def test_qwen3_asr_dflash_setup_does_not_require_audio_tower():
+    builder = qwen3_asr_builder.Qwen3ASREngineBuilder(
+        **_builder_kwargs(
+            enable_speculative=True,
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="/models/dflash",
+        )
+    )
+    target = SimpleNamespace()
+    draft = SimpleNamespace(config=_dflash_config())
+    builder.setup_speculative_models(target, draft)
+    assert target.spec_role == "target"
+    assert not hasattr(draft, "spec_role")
