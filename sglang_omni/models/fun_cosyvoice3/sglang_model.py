@@ -97,7 +97,6 @@ def _verifyprobe_dump(pre, logits_output, input_ids, positions) -> None:
 
 
 class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
-
     def __init__(
         self,
         config: Any,
@@ -140,6 +139,18 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         verify-block penalty and the draft mirror.
         """
         _DRAFT_SAMPLING_INFO["rep_values"] = values
+
+    def set_speculative_sampling_info(self, sampling_info):
+        """Publish live state before drafting, after scheduler penalty refresh.
+
+        Target forward sees a copy and runs after drafting. Its previous copy
+        cannot supply the next draft's history or filtered batch layout.
+        This Python hook does not update operations captured in a CUDA graph.
+        """
+        _DRAFT_SAMPLING_INFO["info"] = sampling_info
+        orchestrator = getattr(sampling_info, "penalizer_orchestrator", None)
+        if orchestrator is None or not orchestrator.is_required:
+            _DRAFT_SAMPLING_INFO["rep_values"] = None
 
     def set_dspark_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
         """Capture normalized SGLang block-output ids from the draft config."""
@@ -263,58 +274,29 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
             self._trace_verify_rows(
                 input_ids, positions, hidden_states, forward_batch, logits_output
             )
-        _vp_pre = (
-            logits_output.next_token_logits.float().topk(5, dim=-1)
-            if _VERIFYPROBE_DIR and is_verify
-            else None
-        )
-        if is_verify and _is_dspark_forward(forward_batch):
-            if False:
-                self._verify_trace = getattr(self, "_verify_trace", 0) + 1
-                logits = logits_output.next_token_logits
-                spec_trace(
-                    f"verify rows: ids={input_ids[:9].tolist()} "
-                    f"argmax_pre_penalty={logits[:9].argmax(dim=-1).tolist()} "
-                    f"logits_shape={tuple(logits.shape)} hidden_rows={hidden_states.shape[0]} "
-                    f"positions={positions[:9].tolist()} seq_lens={forward_batch.seq_lens[:2].tolist()} "
-                    f"out_cache_loc={forward_batch.out_cache_loc[:9].tolist()} "
-                    f"capture={forward_batch.capture_hidden_mode} "
-                    f"hs_store={None if logits_output.hidden_states is None else tuple(logits_output.hidden_states.shape)}"
-                )
-            apply_block_repetition_penalty(
-                logits_output.next_token_logits, input_ids, forward_batch.sampling_info
-            )
-            if _A3_TRACE:
-                _a3_trace(
-                    "dspark-post-penalty",
-                    input_ids,
-                    positions,
-                    forward_batch,
-                    logits_output.next_token_logits,
-                )
-            if SPEC_DEBUG and getattr(self, "_verify_trace", 0) <= 4:
-                lg = logits_output.next_token_logits[0].float()
-                top = lg.topk(4)
-                spec_trace(
-                    f"verify row0 post-penalty: argmax={int(lg.argmax())} top_ids={top.indices.tolist()} "
-                    f"top_vals={[round(v, 3) for v in top.values.tolist()]} "
-                    f"logit3={lg[3].item():.3f} logit0={lg[0].item():.3f} contiguous={logits_output.next_token_logits.is_contiguous()}"
-                )
-        elif SPEC_DEBUG and is_verify:
-            spec_trace(
-                f"verify penalty skipped: spec_algorithm={getattr(forward_batch, 'spec_algorithm', None)}"
-            )
-            if _A3_TRACE:
-                _a3_trace(
-                    "eagle3-pre-penalty",
-                    input_ids,
-                    positions,
-                    forward_batch,
-                    logits_output.next_token_logits,
-                )
-        if _vp_pre is not None:  # diagnostic only, env-gated
-            _verifyprobe_dump(_vp_pre, logits_output, input_ids, positions)
         return logits_output
+
+    def postprocess_speculative_logits(self, logits_output, forward_batch) -> None:
+        """Apply live sampling state after eager forward or CUDA graph replay.
+
+        These penalties must not be captured inside model.forward: graph
+        warmup has no request penalizer, and replay bypasses Python branches.
+        Native speculative verification consumes the corrected logits next.
+        """
+        sampling_info = forward_batch.sampling_info
+        _DRAFT_SAMPLING_INFO["info"] = sampling_info
+        if not (
+            forward_batch.forward_mode.is_target_verify()
+            and _is_dspark_forward(forward_batch)
+        ):
+            return
+        logits = logits_output.next_token_logits
+        before = logits.float().topk(5, dim=-1) if _VERIFYPROBE_DIR else None
+        apply_block_repetition_penalty(logits, forward_batch.input_ids, sampling_info)
+        if before is not None:
+            _verifyprobe_dump(
+                before, logits_output, forward_batch.input_ids, forward_batch.positions
+            )
 
     def _trace_verify_rows(
         self, input_ids, positions, hidden_states, forward_batch, logits_output
@@ -694,7 +676,7 @@ class CosyVoice3Eagle3LlamaForCausalLM(LlamaForCausalLMEagle3):
                 f"md.cu_seqlens_q={_t(getattr(md, 'cu_seqlens_q', None))} md.cu_seqlens_k={_t(getattr(md, 'cu_seqlens_k', None))} "
                 f"md.page_table_shape={None if getattr(md, 'page_table', None) is None else tuple(md.page_table.shape)} "
                 f"md.page_table_row0={_t(getattr(md, 'page_table', None))} "
-                f"rtt_row={_t(rtt[req])} rtt_row_tail={rtt[req, max(n_hist - 3, 0): n_hist + 3].tolist()} "
+                f"rtt_row={_t(rtt[req])} rtt_row_tail={rtt[req, max(n_hist - 3, 0) : n_hist + 3].tolist()} "
                 f"rtt_live_same_as_init={rtt.data_ptr() == runner_rtt.data_ptr()} "
                 f"pool_same_as_fb={pool is runner_pool} pool={type(pool).__name__} "
                 f"k_shape={tuple(pool.get_key_buffer(attn.layer_id).shape)} layer_id={attn.layer_id} "
@@ -1167,6 +1149,7 @@ def normalize_cosyvoice3_dspark_config(config: dict) -> dict:
         normalized.setdefault(key, value)
     normalized.pop("auto_map", None)
     normalized["architectures"] = [DSPARK_DRAFT_ARCHITECTURE]
+    normalized["dspark_bonus_anchor"] = True
     normalized.setdefault("model_type", layer_config.get("model_type", "qwen3"))
     aux_ids = normalized.get("aux_hidden_state_layer_ids")
     if aux_ids is not None:

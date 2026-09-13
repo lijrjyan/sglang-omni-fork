@@ -175,9 +175,7 @@ def configure_speculative_overrides(
             configured["speculative_num_draft_tokens"] = num_draft_tokens
     else:
         num_steps = int(configured.setdefault("speculative_num_steps", 3))
-        num_draft_tokens = int(
-            configured.setdefault("speculative_num_draft_tokens", 4)
-        )
+        num_draft_tokens = int(configured.setdefault("speculative_num_draft_tokens", 4))
         if num_steps < 0:
             raise ValueError(f"speculative_num_steps must be >= 0, got {num_steps}")
         if num_draft_tokens != num_steps + 1:
@@ -430,6 +428,7 @@ class SGLangGenerationEngineBuilder(ABC):
                 scheduling_bootstrap.init_speculative_draft_cuda_graphs(
                     draft_worker,
                     capture_draft_decode_graph=self.speculative_draft_cuda_graph,
+                    spec_algorithm=model_worker.model_runner.spec_algorithm,
                 )
             self.post_cuda_graph_setup(model, server_args)
             if prefill_graph_backend != CudaGraphBackend.DISABLED:

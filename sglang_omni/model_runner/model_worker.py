@@ -115,6 +115,11 @@ class SpeculativeTargetWorkerAdapter:
             pp_proxy_tensors=pp_proxy_tensors,
         )
         logits_output = out.logits_output
+        postprocess = getattr(
+            self.model_runner.model, "postprocess_speculative_logits", None
+        )
+        if postprocess is not None:
+            postprocess(logits_output, forward_batch)
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=out.can_run_graph,
@@ -658,8 +663,7 @@ def _apply_model_worker_backend_common_policy(
     )
     if is_qwen3_omni_arch and server_args.ep_size != 1:
         raise ValueError(
-            "Qwen3-Omni ModelWorker does not support expert parallelism; "
-            "use ep_size=1."
+            "Qwen3-Omni ModelWorker does not support expert parallelism; use ep_size=1."
         )
 
 

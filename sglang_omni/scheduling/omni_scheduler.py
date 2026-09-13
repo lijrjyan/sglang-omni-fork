@@ -1586,6 +1586,16 @@ class OmniScheduler:
                 f"required={None if orchestrator is None else orchestrator.is_required}"
             )
 
+        # Native drafting precedes target forward. Publish the refreshed live
+        # batch, including transitions to no penalties, before that draft runs.
+        model_worker = getattr(self, "model_worker", None)
+        if model_worker is not None:
+            publish = getattr(
+                model_worker.model_runner.model, "set_speculative_sampling_info", None
+            )
+            if publish is not None:
+                publish(sampling_info)
+
     def _cumulate_speculative_output_tokens(self, batch) -> None:
         """Restore prepared DSpark penalizers from committed output histories.
 

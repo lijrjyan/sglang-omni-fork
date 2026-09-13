@@ -422,6 +422,7 @@ def test_normalize_dspark_config_flattens_and_remaps_ids() -> None:
     assert normalized["mask_token_id"] == DSPARK_MASK_TOKEN_ID
     assert normalized["draft_vocab_size"] == 8192
     assert normalized["block_size"] == 8
+    assert normalized["dspark_bonus_anchor"] is True
 
 
 def test_materialize_dspark_draft_writes_normalized_config(
@@ -480,11 +481,11 @@ def test_engine_builder_dspark_overrides_follow_the_checkpoint_block_size(
     builder.adjust_overrides(overrides)
 
     assert overrides["speculative_num_steps"] == 1
-    assert overrides["speculative_dspark_block_size"] == 8
-    assert overrides["speculative_num_draft_tokens"] == 9
+    assert overrides["speculative_dspark_block_size"] == 7
+    assert overrides["speculative_num_draft_tokens"] == 8
     assert overrides["disable_overlap_schedule"] is True
     assert "speculative_use_rejection_sampling" not in overrides
-    assert builder.speculative_num_draft_tokens == 9
+    assert builder.speculative_num_draft_tokens == 8
 
     with pytest.raises(ValueError, match="block size \\+ 1"):
         builder.adjust_overrides(
@@ -650,3 +651,18 @@ def test_markov_head_mirror_penalises_block_prefix_tokens(
     assert corrected[0, 0, 5] == pytest.approx(4.0)
     assert corrected[0, 1, 5] == pytest.approx(2.0)
     assert corrected[0, 0, 0] == pytest.approx(0.0)
+
+
+def test_dspark_rejects_runtime_without_bonus_anchor_support(tmp_path, monkeypatch):
+    from sglang.srt.speculative.dspark_components import dspark_config
+
+    monkeypatch.setenv("SGLANG_OMNI_CACHE_DIR", str(tmp_path / "cache"))
+    source = _write_draft(tmp_path, _dspark_config())
+    monkeypatch.setattr(engine_builder_module, "_resolve_checkpoint", lambda p: p)
+    monkeypatch.setattr(
+        dspark_config,
+        "parse_dspark_draft_config",
+        lambda **kwargs: SimpleNamespace(gamma=8),
+    )
+    with pytest.raises(RuntimeError, match="bonus-anchor"):
+        materialize_cosyvoice3_dspark_draft(source)

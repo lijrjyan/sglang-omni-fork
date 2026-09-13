@@ -97,9 +97,21 @@ def materialize_cosyvoice3_dspark_draft(draft_model_path: str) -> str:
     if int(config.get("markov_rank", 0) or 0) <= 0:
         raise ValueError("Fun-CosyVoice3 DSPARK draft requires markov_rank > 0")
     normalized = normalize_cosyvoice3_dspark_config(config)
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        parse_dspark_draft_config,
+    )
+
+    if (
+        parse_dspark_draft_config(draft_hf_config=normalized).gamma
+        != int(normalized["block_size"]) - 1
+    ):
+        raise RuntimeError(
+            "CosyVoice3 DSpark requires SGLang bonus-anchor layout support; "
+            "update the native DSpark runtime before enabling this checkpoint."
+        )
     target_dir = _materialize_draft_dir(resolved, normalized, "dspark")
     logger.info(
-        "Materialized normalized CosyVoice3 DSpark draft %s -> %s (gamma=%s)",
+        "Materialized normalized CosyVoice3 DSpark draft %s -> %s (input_block_size=%s)",
         draft_model_path,
         target_dir,
         normalized.get("block_size"),
@@ -161,7 +173,11 @@ def materialize_cosyvoice3_eagle3_draft(draft_model_path: str) -> str:
 def _validate_cosyvoice3_draft_config(
     target_config: Any,
     draft_dir: str,
-    fields: tuple[str, ...] = ("hidden_size", "num_attention_heads", "num_key_value_heads"),
+    fields: tuple[str, ...] = (
+        "hidden_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+    ),
 ) -> None:
     with open(os.path.join(draft_dir, "config.json"), encoding="utf-8") as handle:
         draft_config = json.load(handle)
@@ -216,7 +232,9 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
         else:
             self.speculative_num_steps = int(speculative_num_steps)
             self.speculative_num_draft_tokens = int(
-                4 if speculative_num_draft_tokens is None else speculative_num_draft_tokens
+                4
+                if speculative_num_draft_tokens is None
+                else speculative_num_draft_tokens
             )
         self.speculative_cuda_graph = bool(speculative_cuda_graph)
         self.speculative_draft_cuda_graph = bool(speculative_draft_cuda_graph)
@@ -276,7 +294,7 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
         with open(os.path.join(draft_dir, "config.json"), encoding="utf-8") as handle:
             draft_config = json.load(handle)
         # gamma = verify window - 1; SGLang cross-checks it against the
-        # checkpoint block size, so publish both consistently.
+        # checkpoint proposal count (the bonus anchor is not a proposal).
         gamma = overrides.get("speculative_dspark_block_size")
         num_draft_tokens = overrides.get("speculative_num_draft_tokens")
         if gamma is None:
@@ -284,6 +302,7 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
                 int(num_draft_tokens) - 1
                 if num_draft_tokens is not None
                 else int(draft_config["block_size"])
+                - int(draft_config.get("dspark_bonus_anchor", False))
             )
         gamma = int(gamma)
         if gamma < 1:
@@ -300,6 +319,7 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
         overrides["speculative_num_steps"] = 1
         overrides["speculative_draft_model_path"] = draft_dir
         self.speculative_num_draft_tokens = gamma + 1
+
     def generation_defaults(
         self,
         *,
