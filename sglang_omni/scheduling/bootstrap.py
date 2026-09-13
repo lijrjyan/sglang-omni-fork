@@ -89,6 +89,10 @@ def is_omni_native_spec(spec_algorithm: Any) -> bool:
 
 def speculative_draft_model(draft_worker: Any) -> Any:
     """Return the draft model owned by a native speculative worker."""
+    # The DSpark worker holds ``draft_model`` itself; EAGLE-family workers nest it.
+    draft_model = getattr(draft_worker, "draft_model", None)
+    if draft_model is not None:
+        return draft_model
     return draft_worker.draft_worker.draft_runner.model
 
 

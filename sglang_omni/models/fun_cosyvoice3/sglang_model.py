@@ -44,6 +44,11 @@ DSPARK_UNIFIED_SPEECH_OFFSET = 151924
 # Draft-owned embedding rows: the speech vocab plus one trained mask row.
 DSPARK_MASK_TOKEN_ID = TOTAL_VOCAB_SIZE
 DSPARK_EMBED_ROWS = TOTAL_VOCAB_SIZE + 1
+# Where the draft's speech embedding / lm_head come from: speculators drafts
+# ship their own reduced-vocab modules ("checkpoint"); SpecForge native exports
+# share the target's, so Omni copies the speech rows in once both models are
+# loaded ("target").
+DSPARK_VOCAB_SOURCE_KEY = "cosyvoice3_vocab_source"
 
 
 _VERIFYPROBE_DIR = os.environ.get("SGLANG_OMNI_VERIFYPROBE_DIR")
@@ -1076,6 +1081,11 @@ class CosyVoice3DSparkDraftModel(DSparkDraftModel):
         draft_vocab = int(getattr(config, "draft_vocab_size", 0) or 0)
         if draft_vocab <= 0:
             raise ValueError("CosyVoice3 DSpark draft requires draft_vocab_size")
+        self.vocab_source = str(getattr(config, DSPARK_VOCAB_SOURCE_KEY, "checkpoint"))
+        if self.vocab_source not in ("checkpoint", "target"):
+            raise ValueError(f"unknown {DSPARK_VOCAB_SOURCE_KEY}={self.vocab_source!r}")
+        # Set by load_weights for target-vocab drafts; cleared by adopt_target_vocab.
+        self._awaiting_target_vocab = False
         self.embed_tokens = nn.Embedding(DSPARK_EMBED_ROWS, hidden)
         self.lm_head = nn.Linear(hidden, draft_vocab, bias=False)
         # Width of the proposal distribution handed to verify / graph buffers.
@@ -1095,7 +1105,42 @@ class CosyVoice3DSparkDraftModel(DSparkDraftModel):
         raise RuntimeError("CosyVoice3 DSpark draft owns its vocab modules")
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self._awaiting_target_vocab:
+            raise RuntimeError(
+                "CosyVoice3 DSpark draft takes its vocab modules from the target; "
+                "adopt_target_vocab was not called"
+            )
         return self.embed_tokens(input_ids)
+
+    @torch.no_grad()
+    def adopt_target_vocab(
+        self, *, embed_weight: torch.Tensor, head_weight: torch.Tensor
+    ) -> None:
+        """Copy the target's speech embedding / head into the draft's modules.
+
+        SpecForge native exports are trained against the HF unified embedding
+        and head, whose speech rows equal the target's ``speech_embedding`` /
+        ``llm_decoder`` (checked against ``llm.pt``, bf16 rounding only). The
+        mask token is a real speech id there, so the extra mask row stays zero.
+        """
+        if not self._awaiting_target_vocab:
+            raise RuntimeError("CosyVoice3 DSpark draft ships its own vocab modules")
+        embed = self.embed_tokens.weight
+        head = self.lm_head.weight
+        if tuple(embed_weight.shape) != (TOTAL_VOCAB_SIZE, embed.shape[1]):
+            raise ValueError(
+                f"target speech embedding must be {(TOTAL_VOCAB_SIZE, embed.shape[1])}; "
+                f"got {tuple(embed_weight.shape)}"
+            )
+        if tuple(head_weight.shape) != tuple(head.shape):
+            raise ValueError(
+                f"target speech head must be {tuple(head.shape)}; got "
+                f"{tuple(head_weight.shape)}"
+            )
+        embed[:TOTAL_VOCAB_SIZE].copy_(embed_weight.to(embed.dtype))
+        embed[TOTAL_VOCAB_SIZE].zero_()
+        head.copy_(head_weight.to(head.dtype))
+        self._awaiting_target_vocab = False
 
     @torch.no_grad()
     def compute_base_logits(self, hidden: torch.Tensor):
@@ -1108,18 +1153,29 @@ class CosyVoice3DSparkDraftModel(DSparkDraftModel):
         params = dict(self.named_parameters())
         backbone, confidence = [], []
         offset = DSPARK_UNIFIED_SPEECH_OFFSET
+        from_target = self.vocab_source == "target"
         for name, loaded in weights:
             if name == "embed_tokens.weight":
+                if from_target:
+                    continue
                 rows = loaded[offset : offset + DSPARK_EMBED_ROWS]
                 default_weight_loader(params["embed_tokens.weight"], rows)
             elif name == "lm_head.weight":
+                if from_target:
+                    continue
                 default_weight_loader(params["lm_head.weight"], loaded)
             elif name == "markov_head.markov_w1.weight":
                 rows = loaded[offset : offset + TOTAL_VOCAB_SIZE]
                 default_weight_loader(params[name], rows)
             elif name == "markov_head.markov_w2.weight":
+                # Native exports keep the full unified vocabulary on the Markov
+                # output projection too; speculators drafts already reduced it.
+                if from_target:
+                    loaded = loaded[offset : offset + TOTAL_VOCAB_SIZE]
                 default_weight_loader(params[name], loaded)
             elif name == "d2t":
+                if from_target:
+                    continue
                 self.markov_head.set_d2t(loaded.to(self.markov_head.d2t_omni.device))
             elif name == "t2d":
                 continue
@@ -1131,33 +1187,81 @@ class CosyVoice3DSparkDraftModel(DSparkDraftModel):
         # loader would drop the vocab modules this draft owns.
         DFlashDraftModel.load_weights(self, backbone)
         self._load_confidence_weights(confidence_weights=confidence, params_dict=params)
-        if (self.markov_head.d2t_omni < 0).all():
+        if from_target:
+            # Identity map over the speech range: target id = offset + j - offset.
+            d2t = self.markov_head.d2t_omni
+            self.markov_head.set_d2t(
+                torch.full((TOTAL_VOCAB_SIZE,), offset, dtype=torch.long, device=d2t.device)
+            )
+            self._awaiting_target_vocab = True
+        elif (self.markov_head.d2t_omni < 0).all():
             raise ValueError("CosyVoice3 DSpark draft checkpoint has no usable d2t")
 
 
-def normalize_cosyvoice3_dspark_config(config: dict) -> dict:
-    """Flatten the speculators-format DSpark config for SGLang's loader.
+def is_native_dspark_export(config: dict) -> bool:
+    """SpecForge ``export --to hf`` DSpark layout: a flat config with a nested
+    ``dflash_config`` and the full unified vocabulary, no speculators fields."""
+    return "transformer_layer_config" not in config and isinstance(
+        config.get("dflash_config"), dict
+    )
 
-    Nested ``transformer_layer_config`` fields move to the top level, the
-    architecture becomes the Omni draft class, ``aux_hidden_state_layer_ids``
-    become DFlash ``target_layer_ids``, and the vocab / mask ids are expressed
-    in the draft-owned speech embedding space.
+
+def normalize_cosyvoice3_dspark_config(config: dict) -> dict:
+    """Rewrite a DSpark draft config for SGLang's loader and the Omni draft class.
+
+    Speculators checkpoints: nested ``transformer_layer_config`` fields move to
+    the top level, ``aux_hidden_state_layer_ids`` become DFlash
+    ``target_layer_ids``, and the vocab / mask ids are expressed in the
+    draft-owned speech embedding space.
+
+    SpecForge native exports: ``dflash_config`` fields are mirrored to the top
+    level (the stock loader reads ``markov_rank`` and friends there), the mask
+    id is translated from the unified HF vocabulary into a speech id, and the
+    draft is marked to take its embedding / head from the target.
+    ``target_layer_ids`` already index block outputs, like SGLang's explicit
+    capture ids, so they are not shifted.
+
+    Both layouts train with a bonus-anchor input block.
     """
     normalized = dict(config)
-    layer_config = normalized.pop("transformer_layer_config", None) or {}
-    for key, value in layer_config.items():
-        normalized.setdefault(key, value)
-    normalized.pop("auto_map", None)
-    normalized["architectures"] = [DSPARK_DRAFT_ARCHITECTURE]
+    if is_native_dspark_export(config):
+        dflash_config = dict(normalized["dflash_config"])
+        for key, value in dflash_config.items():
+            normalized.setdefault(key, value)
+        mask_token_id = int(dflash_config["mask_token_id"]) - DSPARK_UNIFIED_SPEECH_OFFSET
+        if not 0 <= mask_token_id < TOTAL_VOCAB_SIZE:
+            raise ValueError(
+                "Fun-CosyVoice3 native DSpark export must mask with a speech id "
+                f"(unified ids {DSPARK_UNIFIED_SPEECH_OFFSET}.."
+                f"{DSPARK_UNIFIED_SPEECH_OFFSET + TOTAL_VOCAB_SIZE - 1}); got "
+                f"{dflash_config['mask_token_id']!r}"
+            )
+        dflash_config["mask_token_id"] = mask_token_id
+        normalized["dflash_config"] = dflash_config
+        normalized["mask_token_id"] = mask_token_id
+        normalized["draft_vocab_size"] = TOTAL_VOCAB_SIZE
+        normalized[DSPARK_VOCAB_SOURCE_KEY] = "target"
+    else:
+        layer_config = normalized.pop("transformer_layer_config", None) or {}
+        for key, value in layer_config.items():
+            normalized.setdefault(key, value)
+        normalized.pop("auto_map", None)
+        normalized.setdefault("model_type", layer_config.get("model_type", "qwen3"))
+        aux_ids = normalized.get("aux_hidden_state_layer_ids")
+        if aux_ids is not None:
+            # The checkpoint indexes HF hidden_states (input of block i).
+            # SGLang's explicit capture ids select output of block i instead.
+            normalized["target_layer_ids"] = [int(i) - 1 for i in aux_ids]
+        normalized["mask_token_id"] = DSPARK_MASK_TOKEN_ID
+        normalized[DSPARK_VOCAB_SOURCE_KEY] = "checkpoint"
+    if normalized.get("dspark_bonus_anchor") is False:
+        raise ValueError(
+            "Fun-CosyVoice3 DSpark drafts are trained with a bonus-anchor input "
+            "block; dspark_bonus_anchor=false is not a supported layout"
+        )
     normalized["dspark_bonus_anchor"] = True
-    normalized.setdefault("model_type", layer_config.get("model_type", "qwen3"))
-    aux_ids = normalized.get("aux_hidden_state_layer_ids")
-    if aux_ids is not None:
-        # The checkpoint indexes HF hidden_states (input of block i).
-        # SGLang's explicit capture ids select output of block i instead.
-        normalized["target_layer_ids"] = [int(i) - 1 for i in aux_ids]
+    normalized["architectures"] = [DSPARK_DRAFT_ARCHITECTURE]
     normalized["vocab_size"] = DSPARK_EMBED_ROWS
-    normalized["mask_token_id"] = DSPARK_MASK_TOKEN_ID
     normalized["tie_word_embeddings"] = False
     return normalized
 

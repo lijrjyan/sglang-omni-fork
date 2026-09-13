@@ -68,6 +68,7 @@ def materialize_cosyvoice3_dspark_draft(draft_model_path: str) -> str:
     """
     from sglang_omni.models.fun_cosyvoice3.sglang_model import (
         DSPARK_UNIFIED_SPEECH_OFFSET,
+        is_native_dspark_export,
         TOTAL_VOCAB_SIZE,
         normalize_cosyvoice3_dspark_config,
     )
@@ -82,19 +83,32 @@ def materialize_cosyvoice3_dspark_draft(draft_model_path: str) -> str:
             "Fun-CosyVoice3 DSPARK speculative decoding expects a DSpark draft "
             f"checkpoint; got architectures={config.get('architectures')!r}"
         )
-    layer_config = config.get("transformer_layer_config") or {}
-    vocab = int(layer_config.get("vocab_size") or config.get("vocab_size") or 0)
-    mask_token_id = config.get("mask_token_id")
-    if vocab < DSPARK_UNIFIED_SPEECH_OFFSET + TOTAL_VOCAB_SIZE + 1 or (
-        mask_token_id != DSPARK_UNIFIED_SPEECH_OFFSET + TOTAL_VOCAB_SIZE
-    ):
+    native = is_native_dspark_export(config)
+    layer_config = (
+        config.get("dflash_config") if native else config.get("transformer_layer_config")
+    ) or {}
+    vocab = int(config.get("vocab_size") or layer_config.get("vocab_size") or 0)
+    mask_token_id = config.get("mask_token_id", layer_config.get("mask_token_id"))
+    speech_end = DSPARK_UNIFIED_SPEECH_OFFSET + TOTAL_VOCAB_SIZE
+    if native:
+        # SpecForge exports keep the HF unified vocabulary and mask with a real
+        # speech id (the recipe uses the target EOS embedding).
+        mask_ok = isinstance(mask_token_id, int) and (
+            DSPARK_UNIFIED_SPEECH_OFFSET <= mask_token_id < speech_end
+        )
+        vocab_ok = vocab >= speech_end
+    else:
+        mask_ok = mask_token_id == speech_end
+        vocab_ok = vocab >= speech_end + 1
+    if not (vocab_ok and mask_ok):
         raise ValueError(
             "Fun-CosyVoice3 DSPARK draft must use the unified vocab with the "
-            f"speech range at offset {DSPARK_UNIFIED_SPEECH_OFFSET} and the mask "
-            f"token right after it; got vocab_size={vocab} "
-            f"mask_token_id={mask_token_id!r}"
+            f"speech range at offset {DSPARK_UNIFIED_SPEECH_OFFSET} and a mask "
+            f"token in ({'that range' if native else 'the row right after it'}); "
+            f"got vocab_size={vocab} mask_token_id={mask_token_id!r}"
         )
-    if int(config.get("markov_rank", 0) or 0) <= 0:
+    markov_rank = config.get("markov_rank", layer_config.get("markov_rank"))
+    if int(markov_rank or 0) <= 0:
         raise ValueError("Fun-CosyVoice3 DSPARK draft requires markov_rank > 0")
     normalized = normalize_cosyvoice3_dspark_config(config)
     from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -319,6 +333,13 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
         overrides["speculative_num_steps"] = 1
         overrides["speculative_draft_model_path"] = draft_dir
         self.speculative_num_draft_tokens = gamma + 1
+
+    def setup_speculative_models(self, model: Any, draft_model: Any) -> None:
+        """Give a target-vocab DSpark draft the target's speech embedding / head."""
+        if not getattr(draft_model, "_awaiting_target_vocab", False):
+            return
+        embed_weight, head_weight = model.get_embed_and_head()
+        draft_model.adopt_target_vocab(embed_weight=embed_weight, head_weight=head_weight)
 
     def generation_defaults(
         self,

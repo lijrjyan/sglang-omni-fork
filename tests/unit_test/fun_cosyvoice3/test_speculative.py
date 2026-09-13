@@ -666,3 +666,177 @@ def test_dspark_rejects_runtime_without_bonus_anchor_support(tmp_path, monkeypat
     )
     with pytest.raises(RuntimeError, match="bonus-anchor"):
         materialize_cosyvoice3_dspark_draft(source)
+
+
+# --- SpecForge native DSpark exports (target-shared vocabulary) ---------------
+
+
+def _native_dspark_config(**overrides) -> dict:
+    """Shape of ``specforge export --to hf`` for the speech DSpark recipe."""
+    config = {
+        "architectures": ["DSparkDraftModel"],
+        "block_size": 8,
+        "dflash_config": {
+            "attention_mode": "gqa",
+            "confidence_head_with_markov": True,
+            "enable_confidence_head": True,
+            "markov_head_type": "vanilla",
+            "markov_rank": 256,
+            "mask_token_id": DSPARK_UNIFIED_SPEECH_OFFSET + EOS_ID,
+            "projector_type": "dspark",
+            "target_layer_ids": [1, 11, 21],
+        },
+        "draft_vocab_size": _UNIFIED_VOCAB,
+        "hidden_size": 896,
+        "model_type": "qwen3",
+        "num_attention_heads": 14,
+        "num_hidden_layers": 3,
+        "num_key_value_heads": 2,
+        "num_target_layers": 24,
+        "tie_word_embeddings": False,
+        "vocab_size": _UNIFIED_VOCAB,
+    }
+    config.update(overrides)
+    return config
+
+
+def test_normalize_native_dspark_export_shares_the_target_vocab() -> None:
+    from sglang_omni.models.fun_cosyvoice3.sglang_model import (
+        DSPARK_VOCAB_SOURCE_KEY,
+        is_native_dspark_export,
+    )
+
+    config = _native_dspark_config()
+    assert is_native_dspark_export(config)
+    assert not is_native_dspark_export(_dspark_config())
+
+    normalized = normalize_cosyvoice3_dspark_config(config)
+
+    assert normalized["architectures"] == [DSPARK_DRAFT_ARCHITECTURE]
+    # dflash_config fields are mirrored where the stock loader reads them.
+    assert normalized["markov_rank"] == 256
+    assert normalized["markov_head_type"] == "vanilla"
+    assert normalized["enable_confidence_head"] is True
+    # Block-output capture ids are already in SGLang's explicit convention.
+    assert normalized["target_layer_ids"] == [1, 11, 21]
+    assert normalized["dflash_config"]["target_layer_ids"] == [1, 11, 21]
+    # The unified-vocab mask id becomes the speech id it embeds (EOS here).
+    assert normalized["mask_token_id"] == EOS_ID
+    assert normalized["dflash_config"]["mask_token_id"] == EOS_ID
+    assert normalized["vocab_size"] == DSPARK_EMBED_ROWS
+    assert normalized["draft_vocab_size"] == TOTAL_VOCAB_SIZE
+    assert normalized["dspark_bonus_anchor"] is True
+    assert normalized["tie_word_embeddings"] is False
+    assert normalized[DSPARK_VOCAB_SOURCE_KEY] == "target"
+    assert normalize_cosyvoice3_dspark_config(_dspark_config())[
+        DSPARK_VOCAB_SOURCE_KEY
+    ] == "checkpoint"
+
+
+def test_normalize_native_dspark_export_rejects_foreign_layouts() -> None:
+    bad_mask = _native_dspark_config()
+    bad_mask["dflash_config"]["mask_token_id"] = 5
+    with pytest.raises(ValueError, match="speech id"):
+        normalize_cosyvoice3_dspark_config(bad_mask)
+    with pytest.raises(ValueError, match="bonus-anchor"):
+        normalize_cosyvoice3_dspark_config(
+            _native_dspark_config(dspark_bonus_anchor=False)
+        )
+
+
+def test_materialize_native_dspark_export(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(engine_builder_module, "_resolve_checkpoint", lambda p: p)
+
+    target = materialize_cosyvoice3_dspark_draft(
+        _write_draft(tmp_path, _native_dspark_config())
+    )
+
+    with open(os.path.join(target, "config.json"), encoding="utf-8") as handle:
+        config = json.load(handle)
+    assert config["mask_token_id"] == EOS_ID
+    assert config["draft_vocab_size"] == TOTAL_VOCAB_SIZE
+    assert config["dspark_bonus_anchor"] is True
+
+    (tmp_path / "text").mkdir()
+    text_mask = _native_dspark_config()
+    text_mask["dflash_config"]["mask_token_id"] = 151643
+    with pytest.raises(ValueError, match="mask"):
+        materialize_cosyvoice3_dspark_draft(_write_draft(tmp_path / "text", text_mask))
+
+
+def _target_vocab_draft(rank: int = 4, hidden: int = 8):
+    from sglang_omni.models.fun_cosyvoice3.sglang_model import (
+        CosyVoice3DSparkDraftModel,
+    )
+
+    draft = CosyVoice3DSparkDraftModel.__new__(CosyVoice3DSparkDraftModel)
+    torch.nn.Module.__init__(draft)
+    draft.vocab_source = "target"
+    draft._awaiting_target_vocab = False
+    draft.embed_tokens = torch.nn.Embedding(DSPARK_EMBED_ROWS, hidden)
+    draft.lm_head = torch.nn.Linear(hidden, TOTAL_VOCAB_SIZE, bias=False)
+    draft.markov_head = CosyVoice3MarkovHead(
+        vocab_size=TOTAL_VOCAB_SIZE, draft_vocab_size=TOTAL_VOCAB_SIZE, markov_rank=rank
+    )
+    draft.confidence_head = None
+    return draft
+
+
+def test_native_dspark_draft_takes_vocab_from_target(monkeypatch) -> None:
+    from sglang_omni.models.fun_cosyvoice3 import sglang_model as module
+
+    draft = _target_vocab_draft()
+    backbone_seen = []
+    monkeypatch.setattr(
+        module.DFlashDraftModel, "load_weights", lambda self, ws: backbone_seen.extend(ws)
+    )
+    offset = DSPARK_UNIFIED_SPEECH_OFFSET
+    w1 = torch.randn(_UNIFIED_VOCAB, 4)
+    w2 = torch.randn(_UNIFIED_VOCAB, 4)
+    draft.load_weights(
+        [
+            ("markov_head.markov_w1.weight", w1),
+            ("markov_head.markov_w2.weight", w2),
+            ("fc.weight", torch.zeros(8, 24)),
+        ]
+    )
+
+    assert [name for name, _ in backbone_seen] == ["fc.weight"]
+    assert torch.equal(draft.markov_head.markov_w1.weight, w1[offset : offset + TOTAL_VOCAB_SIZE])
+    assert torch.equal(draft.markov_head.markov_w2.weight, w2[offset : offset + TOTAL_VOCAB_SIZE])
+    # Identity map: every speech id proposes itself.
+    assert torch.equal(draft.markov_head.d2t_omni, torch.arange(TOTAL_VOCAB_SIZE))
+    assert draft._awaiting_target_vocab
+    with pytest.raises(RuntimeError, match="adopt_target_vocab"):
+        draft.forward_embed(torch.tensor([EOS_ID]))
+
+    embed = torch.randn(TOTAL_VOCAB_SIZE, 8)
+    head = torch.randn(TOTAL_VOCAB_SIZE, 8)
+    with pytest.raises(ValueError, match="speech embedding"):
+        draft.adopt_target_vocab(embed_weight=embed[:5], head_weight=head)
+    draft.adopt_target_vocab(embed_weight=embed, head_weight=head)
+
+    assert torch.equal(draft.embed_tokens.weight[:TOTAL_VOCAB_SIZE], embed)
+    assert torch.equal(draft.embed_tokens.weight[TOTAL_VOCAB_SIZE], torch.zeros(8))
+    assert torch.equal(draft.lm_head.weight, head)
+    assert torch.equal(draft.forward_embed(torch.tensor([EOS_ID])), embed[EOS_ID : EOS_ID + 1])
+    with pytest.raises(RuntimeError, match="own vocab"):
+        draft.adopt_target_vocab(embed_weight=embed, head_weight=head)
+
+
+def test_engine_builder_links_target_vocab_into_native_draft() -> None:
+    builder = FunCosyVoice3EngineBuilder()
+    calls = []
+    target = SimpleNamespace(get_embed_and_head=lambda: ("embed", "head"))
+    draft = SimpleNamespace(
+        _awaiting_target_vocab=True,
+        adopt_target_vocab=lambda **kwargs: calls.append(kwargs),
+    )
+
+    builder.setup_speculative_models(target, draft)
+    builder.setup_speculative_models(
+        target, SimpleNamespace(_awaiting_target_vocab=False, adopt_target_vocab=None)
+    )
+
+    assert calls == [{"embed_weight": "embed", "head_weight": "head"}]
