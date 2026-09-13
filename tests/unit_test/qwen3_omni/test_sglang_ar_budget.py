@@ -681,3 +681,29 @@ def test_talker_graph_stays_available_to_an_explicit_override(monkeypatch) -> No
     )
 
     assert overrides["disable_cuda_graph"] is False
+
+
+@pytest.mark.parametrize("keep_prefill", [False, True])
+def test_thinker_speculative_prefill_graph_opt_in(monkeypatch, keep_prefill) -> None:
+    overrides = _thinker_overrides(
+        monkeypatch,
+        allows=True,
+        enable_speculative=True,
+        speculative_algorithm="DFLASH",
+        speculative_draft_model_path="draft",
+        speculative_num_draft_tokens=8,
+        speculative_cuda_graph=True,
+        speculative_prefill_cuda_graph=keep_prefill,
+        server_args_overrides={
+            "cuda_graph_backend_prefill": "breakable",
+            "cuda_graph_bs_prefill": [1, 4, 8],
+        },
+    )
+    assert overrides["cuda_graph_backend_prefill"] == (
+        "breakable" if keep_prefill else "disabled"
+    )
+    assert overrides.get("cuda_graph_bs_prefill") == (
+        [1, 4, 8] if keep_prefill else None
+    )
+    assert overrides["enable_mixed_chunk"] is False
+    assert overrides["disable_cuda_graph"] is False

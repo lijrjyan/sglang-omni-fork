@@ -1020,6 +1020,7 @@ def create_sglang_thinker_executor_from_config(
     speculative_num_draft_tokens: int = 4,
     speculative_cuda_graph: bool = False,
     speculative_draft_cuda_graph: bool = False,
+    speculative_prefill_cuda_graph: bool = False,
 ):
     """Returns OmniScheduler for thinker."""
     # note (luojiaxuan):
@@ -1052,6 +1053,7 @@ def create_sglang_thinker_executor_from_config(
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         speculative_cuda_graph=speculative_cuda_graph,
         speculative_draft_cuda_graph=speculative_draft_cuda_graph,
+        speculative_prefill_cuda_graph=speculative_prefill_cuda_graph,
     )
     speculative_enabled = overrides.get("speculative_algorithm") is not None
     if speculative_enabled:
