@@ -34,7 +34,7 @@ class SpeculativeTargetRegistration:
     architecture), either as a class or a lazy ``"module:Class"`` path;
     ``None`` means the draft is a native SGLang architecture and nothing needs
     registering. ``draft_archs`` lists Omni-owned draft architectures to
-    register alongside (empty for every family on this branch).
+    register alongside (for example, a speech-vocabulary draft).
     """
 
     target_arch: str
@@ -99,11 +99,6 @@ class SpeculativeTargetWorkerAdapter:
     """Present Omni's target worker through native TpModelWorker semantics."""
 
     def __init__(self, worker: ModelWorker, *, tokenizer: Any) -> None:
-        if tokenizer is None:
-            raise ValueError(
-                "Omni speculative decoding requires the target tokenizer "
-                "during worker bootstrap"
-            )
         self.worker = worker
         self.server_args = worker.server_args
         self.model_runner = worker.model_runner
@@ -224,6 +219,11 @@ class SpeculativeTargetWorkerAdapter:
             if omni_prefill_requests is not None:
                 self._finish_omni_prefill(forward_batch, batch, omni_prefill_requests)
         logits_output = out.logits_output
+        postprocess = getattr(
+            self.model_runner.model, "postprocess_speculative_logits", None
+        )
+        if postprocess is not None:
+            postprocess(logits_output, forward_batch)
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=out.can_run_graph,
@@ -371,6 +371,20 @@ class ModelWorker:
             model_config.vocab_size = int(cfg.vocab_size)
             model_config.head_dim = int(cfg.d_model) // int(cfg.decoder_attention_heads)
             model_config.v_head_dim = model_config.head_dim
+            return
+        if arch == "FunCosyVoice3SGLangModel":
+            from sglang_omni.models.fun_cosyvoice3.sglang_model import (
+                DSPARK_EMBED_ROWS,
+                TOTAL_VOCAB_SIZE,
+            )
+
+            # The Qwen2 text vocab in CosyVoice-BlankEN/config.json is not the
+            # generation vocab; publish the speech vocab before native
+            # speculative workers size their draft/verify buffers against it.
+            model_config.vocab_size = TOTAL_VOCAB_SIZE
+            # DSpark bounds its (input-only) mask token by the embedding row
+            # count; the Omni DSpark draft owns speech rows + one mask row.
+            model_config.hf_text_config.padded_vocab_size = DSPARK_EMBED_ROWS
             return
         entry = _ARCH_CONFIG_MAP.get(arch)
         if entry is None:
@@ -753,8 +767,7 @@ def _apply_model_worker_backend_common_policy(
     )
     if is_qwen3_omni_arch and server_args.ep_size != 1:
         raise ValueError(
-            "Qwen3-Omni ModelWorker does not support expert parallelism; "
-            "use ep_size=1."
+            "Qwen3-Omni ModelWorker does not support expert parallelism; use ep_size=1."
         )
 
 

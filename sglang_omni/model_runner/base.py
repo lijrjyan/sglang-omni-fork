@@ -657,6 +657,19 @@ class ModelRunner:
     ) -> None:
         """Called after decode forward."""
 
+    def speculative_prefill_input_embeds(
+        self, schedule_batch: Any, requests: list
+    ) -> Any | None:
+        """Prefill embeddings for a native speculative target forward.
+
+        Native speculative workers run the target prefill through SGLang's
+        own ``ForwardBatch`` rather than ``custom_prefill_forward``. Runners
+        whose prefill consumes runner-composed embeddings return them here
+        (rows ordered like ``requests``); ``None`` keeps the id-driven path.
+        """
+        del schedule_batch, requests
+        return None
+
     def lookahead_eligible(self, batch: Any) -> bool:
         """Whether this batch may use one-step async-decode lookahead.
 

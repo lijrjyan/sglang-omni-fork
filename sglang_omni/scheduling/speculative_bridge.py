@@ -13,6 +13,7 @@ model-specific runtime needs go through ``speculative_model_support``.
 from __future__ import annotations
 
 import inspect
+from collections import Counter
 from typing import Any
 
 import torch
@@ -21,6 +22,7 @@ from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang_omni.scheduling.speculative_support import (
     eager_prefill_has_hidden,
     is_omni_supported_speculative_algorithm,
+    requires_history_restore,
     unsupported_speculative_algorithm_message,
 )
 
@@ -96,14 +98,79 @@ def handoff_speculative_result(
     batch.input_ids = None
 
 
-def cumulate_accepted_tokens(batch: Any, batch_result: Any) -> None:
-    """Reserved for lanes with exact per-prefix sampling processors.
+def cumulate_accepted_tokens(batch) -> None:
+    """Restore prepared penalizers from committed output histories.
 
-    Family admission owns the sampling restrictions; this hook restores no
-    history. Greedy sampling alone does not make history penalties safe to omit.
-    Replaying between steps also cannot repair native block-broadcast penalties.
+    Native accumulation accepts one token per row; padding ragged histories
+    changes frequency and min-length semantics. Absolute state also survives
+    re-prefill, filtering and merging without a request-local cursor.
     """
-    del batch, batch_result
+    from sglang.srt.sampling.penaltylib import (
+        BatchedFrequencyPenalizer,
+        BatchedMinNewTokensPenalizer,
+        BatchedPresencePenalizer,
+        BatchedRepetitionPenalizer,
+    )
+
+    reqs = batch.reqs
+    if not reqs:
+        return
+    orchestrator = batch.sampling_info.penalizer_orchestrator
+    minimum = orchestrator.penalizers.get(BatchedMinNewTokensPenalizer)
+    if minimum is not None and minimum.is_prepared():
+        minimum.len_output_tokens.copy_(
+            torch.tensor(
+                [len(req.output_ids) for req in reqs],
+                dtype=minimum.len_output_tokens.dtype,
+                device=batch.device,
+            ).view(-1, 1)
+        )
+
+    rows, tokens, counts = [], [], []
+    for row, req in enumerate(reqs):
+        history = Counter(
+            token
+            for value in req.output_ids
+            if 0 <= (token := int(value)) < orchestrator.vocab_size
+        )
+        rows.extend([row] * len(history))
+        tokens.extend(history)
+        counts.extend(history.values())
+    row_indices = torch.tensor(rows, dtype=torch.long, device=batch.device)
+    token_indices = torch.tensor(tokens, dtype=torch.long, device=batch.device)
+    for cls, state_name, param_name, initial in (
+        (
+            BatchedRepetitionPenalizer,
+            "cumulated_repetition_penalties",
+            "repetition_penalty",
+            1,
+        ),
+        (
+            BatchedFrequencyPenalizer,
+            "cumulated_frequency_penalties",
+            "frequency_penalty",
+            0,
+        ),
+        (
+            BatchedPresencePenalizer,
+            "cumulated_presence_penalties",
+            "presence_penalty",
+            0,
+        ),
+    ):
+        penalizer = orchestrator.penalizers.get(cls)
+        if penalizer is None or not penalizer.is_prepared():
+            continue
+        state = getattr(penalizer, state_name)
+        state.fill_(initial)
+        values = [
+            float(getattr(reqs[row].sampling_params, param_name))
+            * (count if cls is BatchedFrequencyPenalizer else 1)
+            for row, count in zip(rows, counts)
+        ]
+        state[row_indices, token_indices] = torch.tensor(
+            values, dtype=state.dtype, device=batch.device
+        )
 
 
 def run_speculative_batch(scheduler: Any, batch: Any) -> Any:
@@ -111,10 +178,10 @@ def run_speculative_batch(scheduler: Any, batch: Any) -> Any:
     scheduler._emit_prefill_start_for_batch(batch)
     scheduler._stamp_batch_launch(batch)
     resolve_forward_inputs(batch, scheduler.future_map)
+    prepare_speculative_batch(scheduler, batch)
     with scheduler._forward_isolation(batch, overlap=False):
         batch_result = scheduler.draft_worker.forward_batch_generation(batch)
     handoff_speculative_result(batch, batch_result, algorithm=scheduler.spec_algorithm)
-    cumulate_accepted_tokens(batch, batch_result)
     scheduler.update_cache_from_scheduler(batch, batch_result)
     batch_result.copy_done = scheduler.device_module.Event()
     batch_result.copy_to_cpu(
@@ -163,3 +230,32 @@ __all__ = [
     "run_speculative_batch",
     "validate_scheduler_speculative_config",
 ]
+
+
+def prepare_speculative_batch(scheduler: Any, batch: Any) -> None:
+    """Prepare embeddings, restore history, then publish live sampling state."""
+    runner = getattr(scheduler, "_model_runner", None)
+    forward_mode = getattr(batch, "forward_mode", None)
+    if (
+        runner is not None
+        and forward_mode is not None
+        and forward_mode.is_extend()
+        and not forward_mode.is_idle()
+    ):
+        output = scheduler._build_sched_output(batch)
+        embeds = runner.speculative_prefill_input_embeds(batch, output.requests)
+        if embeds is not None:
+            batch.input_embeds = embeds
+    info = getattr(batch, "sampling_info", None)
+    orchestrator = getattr(info, "penalizer_orchestrator", None)
+    if orchestrator is not None and orchestrator.is_required:
+        if requires_history_restore(scheduler.spec_algorithm):
+            cumulate_accepted_tokens(batch)
+        info.update_penalties()
+    worker = getattr(scheduler, "model_worker", None)
+    if worker is not None:
+        publish = getattr(
+            worker.model_runner.model, "set_speculative_sampling_info", None
+        )
+        if publish is not None:
+            publish(info)

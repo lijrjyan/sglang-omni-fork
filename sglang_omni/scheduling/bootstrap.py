@@ -94,13 +94,20 @@ def _inner_draft_worker(draft_worker: Any) -> Any:
     return inner
 
 
+def speculative_draft_runner(draft_worker: Any) -> Any:
+    runner = getattr(draft_worker, "draft_model_runner", None)
+    if runner is not None:
+        return runner
+    return _inner_draft_worker(draft_worker).draft_runner
+
+
 def speculative_draft_model(draft_worker: Any) -> Any:
     """Return the draft model owned by a native speculative worker."""
-    return _inner_draft_worker(draft_worker).draft_runner.model
+    return speculative_draft_runner(draft_worker).model
 
 
 def init_speculative_draft_cuda_graphs(
-    draft_worker: Any, *, capture_draft_decode_graph: bool
+    draft_worker: Any, *, capture_draft_decode_graph: bool, spec_algorithm: Any = None
 ) -> None:
     """Install the draft runner's graph state (one helper for every algorithm).
 
@@ -314,9 +321,9 @@ def create_sglang_infrastructure(
     model_runner = model_worker.model_runner
     if draft_worker is not None:
         # Price the loaded draft's KV layers; encoder layers have no persistent KV.
-        model_runner.spec_aux_config.eagle_draft_num_layers = _inner_draft_worker(
+        model_runner.spec_aux_config.eagle_draft_num_layers = speculative_draft_runner(
             draft_worker
-        ).draft_runner.layer_info.num_effective_layers
+        ).layer_info.num_effective_layers
     model_runner.alloc_memory_pool()
     if draft_worker is not None:
         req_to_token_pool, token_to_kv_pool_allocator = model_worker.get_memory_pool()
@@ -335,7 +342,9 @@ def create_sglang_infrastructure(
             # note (Junnan Li): with graphs disabled this is the draft
             # eager-runner hook.
             init_speculative_draft_cuda_graphs(
-                draft_worker, capture_draft_decode_graph=False
+                draft_worker,
+                capture_draft_decode_graph=False,
+                spec_algorithm=spec_algorithm,
             )
 
     req_to_token_pool, token_to_kv_pool_allocator = model_worker.get_memory_pool()

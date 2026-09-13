@@ -3070,3 +3070,84 @@ def test_omni_scheduler_running_abort_does_not_leak_prefill_dedup_state(
     assert ends == [("req-1", "aborted")]
     assert scheduler._prefill_start_done == set()
     assert scheduler._prefill_start_done == set()
+
+
+def test_omni_scheduler_prepares_spec_prefill_rows_and_penalties() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    rows = object()
+    seen = {}
+
+    class Runner:
+        def speculative_prefill_input_embeds(self, batch, requests):
+            seen["requests"] = requests
+            return rows
+
+    class Orchestrator:
+        is_required = True
+
+    class SamplingInfo:
+        penalizer_orchestrator = Orchestrator()
+        acc_scaling_penalties = None
+        acc_additive_penalties = None
+
+        def update_penalties(self):
+            seen["penalties"] = True
+
+    scheduler._model_runner = Runner()
+    scheduler._build_sched_output = lambda batch: SimpleNamespace(requests=["r"])
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: True, is_idle=lambda: False),
+        sampling_info=SamplingInfo(),
+        input_embeds=None,
+        reqs=[object()],
+    )
+
+    from sglang_omni.scheduling import speculative_bridge
+
+    scheduler.spec_algorithm = SimpleNamespace(is_dspark=lambda: False)
+    speculative_bridge.prepare_speculative_batch(scheduler, batch)
+
+    assert batch.input_embeds is rows
+    assert seen == {"requests": ["r"], "penalties": True}
+
+
+def test_omni_scheduler_spec_decode_batches_skip_prefill_rows() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._model_runner = SimpleNamespace(
+        speculative_prefill_input_embeds=lambda *_: pytest.fail("decode has no rows")
+    )
+
+    class Orchestrator:
+        is_required = False
+
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: False, is_idle=lambda: False),
+        sampling_info=SimpleNamespace(
+            penalizer_orchestrator=Orchestrator(),
+            update_penalties=lambda: pytest.fail("no penalties required"),
+        ),
+        input_embeds=None,
+    )
+
+    from sglang_omni.scheduling import speculative_bridge
+
+    scheduler.spec_algorithm = SimpleNamespace(is_dspark=lambda: False)
+    speculative_bridge.prepare_speculative_batch(scheduler, batch)
+
+    assert batch.input_embeds is None
+
+
+def test_finished_output_ids_trims_speculative_overshoot_at_finished_len() -> None:
+    """A spec step commits a whole accepted run; the payload must stop at the
+    upstream-recorded stop position (``req.finished_len``), like
+    ``Req.output_ids_through_stop``."""
+    from sglang_omni.scheduling.speculative_bridge import finished_output_ids
+
+    spec_req = SimpleNamespace(output_ids=array("i", [5, 6, 7, 8, 9]), finished_len=3)
+    assert finished_output_ids(spec_req) == [5, 6, 7]
+
+    non_spec_req = SimpleNamespace(output_ids=[5, 6, 7], finished_len=None)
+    assert finished_output_ids(non_spec_req) == [5, 6, 7]
+
+    legacy_req = SimpleNamespace(output_ids=[1, 2])
+    assert finished_output_ids(legacy_req) == [1, 2]

@@ -35,7 +35,7 @@ def test_asr_engine_builder_preserves_model_path() -> None:
     assert AsrEngineBuilder.resolve_checkpoint(object(), "repo/id") == "repo/id"
 
 
-@pytest.mark.parametrize("algorithm", ["EAGLE", "NGRAM", "DSPARK", "MULTI_LAYER_EAGLE"])
+@pytest.mark.parametrize("algorithm", ["EAGLE", "NGRAM", "MULTI_LAYER_EAGLE"])
 def test_speculative_overrides_reject_unsupported_algorithms(algorithm: str) -> None:
     from sglang_omni.scheduling.engine_factory import configure_speculative_overrides
 

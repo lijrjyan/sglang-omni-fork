@@ -21,6 +21,7 @@ from sglang_omni.scheduling.speculative_model_support import (
         ("STANDALONE", "chain", "decode+extend"),
         ("eagle3", "chain", "decode+extend"),
         ("DFLASH", "block", "verify"),
+        ("DSPARK", "block", "verify"),
     ],
 )
 def test_algorithm_rule_tables_cover_every_admitted_algorithm(algorithm, rule, graph):
@@ -31,7 +32,7 @@ def test_algorithm_rule_tables_cover_every_admitted_algorithm(algorithm, rule, g
 
 def test_rule_tables_refuse_unadmitted_algorithms() -> None:
     with pytest.raises(ValueError, match="only supports STANDALONE, EAGLE3, DFLASH"):
-        speculative_support.window_rule("DSPARK")
+        speculative_support.window_rule("NGRAM")
 
 
 def test_window_rules_normalise_chain_and_block_knobs() -> None:

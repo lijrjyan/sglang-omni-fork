@@ -178,7 +178,11 @@ def test_speculative_bootstrap_shares_pools_before_initializing_backends(monkeyp
         return draft
 
     algorithm = SimpleNamespace(
-        is_none=lambda: False, create_worker=lambda args: create_draft
+        name="STANDALONE",
+        is_none=lambda: False,
+        is_standalone=lambda: True,
+        is_eagle3=lambda: False,
+        create_worker=lambda args: create_draft,
     )
     monkeypatch.setattr(
         bootstrap, "_parse_speculative_algorithm", lambda args: algorithm
@@ -609,7 +613,7 @@ def test_create_sglang_infrastructure_consumes_scoped_kv_budget(
     assert captured["kv_cache_bytes"] is None
 
 
-@pytest.mark.parametrize("algorithm", ["STANDALONE", "EAGLE3", "DFLASH"])
+@pytest.mark.parametrize("algorithm", ["STANDALONE", "EAGLE3", "DFLASH", "DSPARK"])
 def test_parse_speculative_algorithm_admits_native_v2_workers(algorithm: str) -> None:
     parsed = bootstrap._parse_speculative_algorithm(
         SimpleNamespace(speculative_algorithm=algorithm)
@@ -703,3 +707,27 @@ def test_stock_dflash_draft_disable_initializes_eager_runner():
         worker, capture_draft_decode_graph=False
     )
     assert calls == [{"capture_decode_cuda_graph": False}]
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_dspark_graph_initialization_and_runner_ownership(capture):
+    calls = []
+    runner = SimpleNamespace(
+        model="draft", layer_info=SimpleNamespace(num_effective_layers=3)
+    )
+    inner = SimpleNamespace(init_cuda_graphs=lambda **kw: calls.append(("inner", kw)))
+    worker = SimpleNamespace(
+        _draft_worker=inner,
+        draft_model_runner=runner,
+        server_args=SimpleNamespace(speculative_algorithm="DSPARK"),
+        init_cuda_graphs=lambda: calls.append(("outer", {})),
+    )
+    assert bootstrap.speculative_draft_model(worker) == "draft"
+    bootstrap.init_speculative_draft_cuda_graphs(
+        worker, capture_draft_decode_graph=capture
+    )
+    assert (
+        calls == [("outer", {})]
+        if capture
+        else calls == [("inner", {"capture_decode_cuda_graph": False})]
+    )

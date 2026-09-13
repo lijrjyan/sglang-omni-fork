@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import ClassVar
 
+from pydantic import Field
+
 from sglang_omni.config import (
     EngineStageConfig,
     FactoryArgs,
@@ -14,6 +16,23 @@ from sglang_omni.config import (
 from sglang_omni.platforms import current_platform
 
 _PKG = "sglang_omni.models.fun_cosyvoice3"
+
+
+class FunCosyVoice3FactoryArgs(FactoryArgs):
+    """Fun-CosyVoice3 tts_engine constructor knobs, typed like the shared ones."""
+
+    enable_speculative: bool | None = None
+    speculative_algorithm: str | None = None
+    speculative_draft_model_path: str | None = None
+    speculative_num_steps: int | None = Field(default=None, ge=0)
+    speculative_num_draft_tokens: int | None = Field(default=None, ge=1)
+    speculative_cuda_graph: bool | None = None
+    speculative_draft_cuda_graph: bool | None = None
+    speculative_use_rejection_sampling: bool | None = None
+
+
+class FunCosyVoice3EngineStageConfig(EngineStageConfig):
+    factory: FunCosyVoice3FactoryArgs = Field(default_factory=FunCosyVoice3FactoryArgs)
 
 
 class FunCosyVoice3PipelineConfig(PipelineConfig):
@@ -26,7 +45,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
     speech_reference_text_excludes_instructions: ClassVar[bool] = True
 
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
-        "tts_engine": EngineStageConfig,
+        "tts_engine": FunCosyVoice3EngineStageConfig,
     }
 
     @classmethod
@@ -40,11 +59,13 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             factory_path=f"{_PKG}.stages.create_preprocessing_executor",
             next="tts_engine",
         ),
-        EngineStageConfig(
+        FunCosyVoice3EngineStageConfig(
             name="tts_engine",
             process="pipeline",
             factory_path=f"{_PKG}.stages.create_sglang_tts_engine_executor",
-            factory=FactoryArgs(device=current_platform.device_type, dtype="bfloat16"),
+            factory=FunCosyVoice3FactoryArgs(
+                device=current_platform.device_type, dtype="bfloat16"
+            ),
             gpu=0,
             next="vocoder",
         ),

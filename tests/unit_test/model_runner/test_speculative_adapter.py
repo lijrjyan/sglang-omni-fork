@@ -71,6 +71,7 @@ def _adapter(monkeypatch, *, forward_mode: _Mode, batch_size: int = 2):
         indexer_topk_output=None,
     )
     model_runner = SimpleNamespace(
+        model=SimpleNamespace(),
         forward=lambda fb, pp_proxy_tensors=None: runner_out,
         sample=lambda logits, fb: torch.zeros(batch_size, dtype=torch.long),
     )

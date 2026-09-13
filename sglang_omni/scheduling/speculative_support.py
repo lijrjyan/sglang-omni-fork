@@ -14,11 +14,8 @@ factory and bootstrap never branch on algorithm names themselves:
 * the graph policy applied to the stage's ``cuda_graph_config``.
 
 Adding an algorithm means one predicate in ``is_omni_supported_speculative_algorithm``
-plus one row in each rule table below. ``DSPARK`` is the documented next slot:
-it is a block draft (``steps == 1``, ``N == block_size + 1`` resolvable from
-the draft checkpoint) whose worker has no ``speculative_algorithm``
-attribute of its own; admit it with ``algorithm.is_dspark()`` and give it the
-``BLOCK`` window rule and the ``VERIFY`` draft graph kind.
+plus one row in each rule table below. DSPARK query blocks may include an
+input-only bonus anchor; the verify window contains proposals plus one.
 """
 
 from __future__ import annotations
@@ -28,14 +25,21 @@ from typing import Any
 
 # Native SGLang V2 draft workers that share one scheduler-facing interface
 # (``forward_batch_generation`` returning ``next_draft_input``/``new_seq_lens``).
-OMNI_SPECULATIVE_ALGORITHMS: tuple[str, ...] = ("STANDALONE", "EAGLE3", "DFLASH")
+OMNI_SPECULATIVE_ALGORITHMS: tuple[str, ...] = (
+    "STANDALONE",
+    "EAGLE3",
+    "DFLASH",
+    "DSPARK",
+)
 
 
 def is_omni_supported_speculative_algorithm(algorithm: Any) -> bool:
     """Return whether a parsed ``SpeculativeAlgorithm`` runs in Omni's lane."""
-    # DSPARK slot: ``or algorithm.is_dspark()`` once the CosyVoice3 contract lands.
     return bool(
-        algorithm.is_standalone() or algorithm.is_eagle3() or algorithm.is_dflash()
+        algorithm.is_standalone()
+        or algorithm.is_eagle3()
+        or algorithm.is_dflash()
+        or algorithm.is_dspark()
     )
 
 
@@ -71,7 +75,7 @@ _WINDOW_RULES: dict[str, WindowRule] = {
     "STANDALONE": WindowRule.CHAIN,
     "EAGLE3": WindowRule.CHAIN,
     "DFLASH": WindowRule.BLOCK,
-    # "DSPARK": WindowRule.BLOCK  (steps forced to 1, N resolvable from checkpoint)
+    "DSPARK": WindowRule.BLOCK,
 }
 
 
@@ -86,6 +90,17 @@ def takes_step_count(algorithm: str) -> bool:
 
 def apply_window_rule(configured: dict[str, Any], algorithm: str) -> None:
     """Validate and normalise the window knobs in ``configured`` in place."""
+    if normalize_speculative_algorithm(algorithm) == "DSPARK":
+        steps = configured.get("speculative_num_steps")
+        if steps not in (None, 1):
+            raise ValueError(f"DSPARK requires speculative_num_steps == 1; got {steps}")
+        configured["speculative_num_steps"] = 1
+        n = configured.get("speculative_num_draft_tokens")
+        if n is not None:
+            if int(n) < 2:
+                raise ValueError("DSPARK requires speculative_num_draft_tokens >= 2")
+            configured["speculative_num_draft_tokens"] = int(n)
+        return
     if window_rule(algorithm) is WindowRule.BLOCK:
         block_size = int(configured.setdefault("speculative_num_draft_tokens", 8))
         if block_size < 1:
@@ -133,7 +148,7 @@ _DRAFT_GRAPH_KINDS: dict[str, DraftGraphKind] = {
     "STANDALONE": DraftGraphKind.DECODE_AND_EXTEND,
     "EAGLE3": DraftGraphKind.DECODE_AND_EXTEND,
     "DFLASH": DraftGraphKind.VERIFY,
-    # "DSPARK": DraftGraphKind.VERIFY
+    "DSPARK": DraftGraphKind.VERIFY,
 }
 
 
@@ -188,12 +203,61 @@ def apply_graph_policy(
         configured.pop("cuda_graph_max_bs_prefill", None)
 
 
+def requires_history_restore(algorithm: Any) -> bool:
+    """DSPARK needs committed-history restoration before native drafting."""
+    return algorithm.is_dspark()
+
+
+def assert_native_reads(algorithm: str, config: dict[str, Any]) -> None:
+    if normalize_speculative_algorithm(algorithm) != "DSPARK":
+        return
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        parse_dspark_draft_config,
+    )
+
+    expected = int(config["block_size"]) - int(config.get("dspark_bonus_anchor", False))
+    if parse_dspark_draft_config(draft_hf_config=config).gamma != expected:
+        raise RuntimeError(
+            "DSpark requires SGLang bonus-anchor layout support; "
+            "update the native DSpark runtime before enabling this checkpoint."
+        )
+
+
+def resolve_draft_window(configured: dict[str, Any], config: dict[str, Any]) -> None:
+    """Resolve a DSPARK verify window using the native checkpoint parser."""
+    algorithm = normalize_speculative_algorithm(configured["speculative_algorithm"])
+    if algorithm != "DSPARK":
+        return
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        parse_dspark_draft_config,
+    )
+
+    assert_native_reads(algorithm, config)
+    proposals = parse_dspark_draft_config(draft_hf_config=config).gamma
+    explicit = configured.get("speculative_dspark_block_size")
+    n = configured.get("speculative_num_draft_tokens")
+    if explicit is not None and int(explicit) != proposals:
+        raise ValueError(
+            f"DSPARK block size must equal checkpoint proposal count {proposals}; got {explicit}"
+        )
+    if n is not None and int(n) != proposals + 1:
+        raise ValueError(
+            f"DSPARK speculative_num_draft_tokens must equal block size + 1 ({proposals + 1}); got {n}"
+        )
+    configured["speculative_dspark_block_size"] = proposals
+    configured["speculative_num_draft_tokens"] = proposals + 1
+    configured["speculative_num_steps"] = 1
+
+
 __all__ = [
     "DraftGraphKind",
     "OMNI_SPECULATIVE_ALGORITHMS",
     "WindowRule",
     "apply_graph_policy",
     "apply_window_rule",
+    "assert_native_reads",
+    "resolve_draft_window",
+    "requires_history_restore",
     "draft_graph_kind",
     "eager_prefill_has_hidden",
     "is_omni_supported_speculative_algorithm",

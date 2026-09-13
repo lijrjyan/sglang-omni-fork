@@ -30,6 +30,9 @@ from typing import Any
 class SpeculativeModelSupport:
     """Defaults: text-only decoder target, stock draft, nothing to reject."""
 
+    def normalize_draft_checkpoint(self, path: str, algorithm: str) -> str:
+        return path
+
     def validate_speculative_draft(
         self,
         target_cfg: Any,
