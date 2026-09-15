@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Omni communication engine facade used by pipeline stages."""
+
 from __future__ import annotations
 
 import asyncio
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
+from itertools import count
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -28,6 +30,7 @@ from sglang_omni.comm.kv_transfer import (
 )
 from sglang_omni.comm.router import CommRouter
 from sglang_omni.pipeline.control_plane import PullSocket, PushSocket, send_to_endpoint
+from sglang_omni.platforms import current_platform
 from sglang_omni.profiler.comm_trace import elapsed_ms as _comm_elapsed_ms
 from sglang_omni.profiler.comm_trace import emit as _comm_trace
 from sglang_omni.profiler.comm_trace import now_ns as _comm_now_ns
@@ -43,6 +46,14 @@ from sglang_omni.relay.base import Relay
 logger = logging.getLogger(__name__)
 
 
+class KVTransferCancelled(RuntimeError):
+    """Request-scoped cancellation of an outbound paged-KV transfer."""
+
+
+class KVTransferRejected(RuntimeError):
+    """Request-scoped failure reported by the KV receiver's terminal ACK."""
+
+
 @dataclass
 class _InboundKVTransfer:
     request: KVTransferPrepareMessage
@@ -55,10 +66,11 @@ class _InboundKVTransfer:
 class _PendingTransfer(msgspec.Struct):
     ops: list[Any]
     ack: asyncio.Future[None]
-    task: asyncio.Task | None = None
+    task: asyncio.Task[bool] | None = None
     lease: KVPageLease | None = None
     retain_pending_on_failure: bool = False
     receiver_terminal: bool = False
+    cleanup_requested: bool = False
 
 
 class _PayloadSendJob(msgspec.Struct, frozen=True):
@@ -72,6 +84,7 @@ class _PayloadSendJob(msgspec.Struct, frozen=True):
     target_endpoint: str
     ready: asyncio.Future[DataRef]
     enqueued_ns: int
+    replica_bindings: dict[str, int] | None = None
 
 
 class _StreamSendJob(msgspec.Struct, frozen=True):
@@ -87,6 +100,7 @@ class _StreamSendJob(msgspec.Struct, frozen=True):
     transport: TransportKind
     ready: asyncio.Future[DataRef]
     enqueued_ns: int
+    replica_bindings: dict[str, int] | None = None
 
 
 class CommEngine:
@@ -120,6 +134,7 @@ class CommEngine:
         ] = {}
         self._send_workers: dict[str, asyncio.Task] = {}
         self._pending: dict[str, _PendingTransfer] = {}
+        self._stream_send_sequence = count()
         # Failed pending KV transfers stay pinned until this dying process exits.
         self._retained_pending_kv_transfers: list[_PendingTransfer] = []
         self._kv_pools: dict[str, KVPool] = {}
@@ -196,6 +211,7 @@ class CommEngine:
         from_stage: str,
         to_stage: str,
         target_endpoint: str,
+        replica_bindings: dict[str, int] | None = None,
     ) -> DataRef:
         if not isinstance(payload, StagePayload):
             raise TypeError(
@@ -217,6 +233,7 @@ class CommEngine:
                 target_endpoint=target_endpoint,
                 ready=ready,
                 enqueued_ns=enqueue_start,
+                replica_bindings=replica_bindings,
             )
         )
         _comm_trace(
@@ -231,6 +248,13 @@ class CommEngine:
         )
         return await ready
 
+    @property
+    def local_payload_device(self) -> str | None:
+        """This stage's own accelerator, or None for a host-only stage."""
+        if self.router.gpu_id is None:
+            return None
+        return f"{current_platform.device_type}:{self.router.gpu_id}"
+
     async def read_payload(
         self,
         *,
@@ -238,7 +262,9 @@ class CommEngine:
         request_id: str,
         data_ref: DataRef,
     ) -> StagePayload:
-        return await stage_io.read_payload(relay, request_id, data_ref)
+        return await stage_io.read_payload(
+            relay, request_id, data_ref, self.local_payload_device
+        )
 
     async def read_data(
         self,
@@ -284,6 +310,7 @@ class CommEngine:
         chunk_id: int,
         metadata: dict[str, Any] | None,
         transport: TransportKind,
+        replica_bindings: dict[str, int] | None = None,
     ) -> None:
         queue = self._send_queue_for(target_stage)
         loop = asyncio.get_running_loop()
@@ -303,6 +330,7 @@ class CommEngine:
                 transport=transport,
                 ready=ready,
                 enqueued_ns=enqueue_start,
+                replica_bindings=replica_bindings,
             )
         )
         _comm_trace(
@@ -324,7 +352,18 @@ class CommEngine:
         relay: Relay,
         data_ref: DataRef,
     ) -> tuple[torch.Tensor, dict[str, Any] | None]:
-        return await stage_io.read_stream_chunk(relay, data_ref)
+        read_start = _comm_now_ns()
+        data, metadata = await stage_io.read_stream_chunk(
+            relay, data_ref, self.local_payload_device
+        )
+        _comm_trace(
+            "comm_stream_read",
+            object_id=data_ref.object_id,
+            transport=data_ref.transport.value,
+            bytes=data_ref.buffer.length,
+            elapsed_ms=round(_comm_elapsed_ms(read_start), 6),
+        )
+        return data, metadata
 
     def register_kv_pool(self, pool: KVPool) -> None:
         self._kv_pools[pool.pool_id] = pool
@@ -349,7 +388,25 @@ class CommEngine:
         transfer_id = transfer_id or (
             f"{request_id}:kv_pages:{from_stage}:{to_stage}:{uuid4().hex}"
         )
+        num_pages = len(source_page_indices)
+        send_start = _comm_now_ns()
+        _comm_trace(
+            "comm_kv_send_start",
+            request_id=request_id,
+            transfer_id=transfer_id,
+            from_stage=from_stage,
+            to_stage=to_stage,
+            source_pool_id=source_pool_id,
+            target_pool_id=target_pool_id,
+            num_pages=num_pages,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
         try:
+            if request_id in self._aborted_kv_requests:
+                raise KVTransferCancelled(
+                    f"KV transfer request {request_id!r} was cleaned up"
+                )
             pool = self._kv_pools.get(source_pool_id)
             if pool is None:
                 raise KeyError(f"unknown source KV pool {source_pool_id!r}")
@@ -374,6 +431,7 @@ class CommEngine:
             relay.register_kv_pool(pool)
 
             ready_future = asyncio.get_running_loop().create_future()
+            prepare_start = _comm_now_ns()
             self._kv_ready[transfer_id] = ready_future
             self._outbound_kv_requests[transfer_id] = request_id
             await send_to_endpoint(
@@ -395,13 +453,29 @@ class CommEngine:
                 ready_future,
                 timeout=self._ack_timeout_s,
             )
+            _comm_trace(
+                "comm_kv_ready",
+                transfer_id=transfer_id,
+                success=ready.success,
+                error=ready.error,
+                wait_ms=round(_comm_elapsed_ms(prepare_start), 6),
+            )
             if not ready.success:
                 raise RuntimeError(ready.error)
+            if request_id in self._aborted_kv_requests:
+                raise KVTransferCancelled(
+                    f"KV transfer request {request_id!r} was cleaned up"
+                )
             op = await relay.put_kv_pages(
                 source_pool_id=source_pool_id,
                 source_page_indices=source_page_indices,
                 destination_ref=ready.destination_ref,
+                transfer_id=transfer_id,
             )
+            if request_id in self._aborted_kv_requests:
+                raise KVTransferCancelled(
+                    f"KV transfer request {request_id!r} was cleaned up"
+                )
             data_ref = DataRef(
                 version=1,
                 object_id=transfer_id,
@@ -437,8 +511,29 @@ class CommEngine:
                 self._fail_pending(data_ref.object_id, exc)
                 raise
             pending_task = self._arm_pending(data_ref.object_id)
-            await asyncio.shield(pending_task)
+            cleanup_requested = await asyncio.shield(pending_task)
+            if cleanup_requested or request_id in self._aborted_kv_requests:
+                raise KVTransferCancelled(
+                    f"KV transfer request {request_id!r} was cleaned up"
+                )
+            _comm_trace(
+                "comm_kv_transfer_complete",
+                transfer_id=transfer_id,
+                num_pages=num_pages,
+                bytes=op.metadata.get("transfer_info", {}).get("size", -1),
+                elapsed_ms=round(_comm_elapsed_ms(send_start), 6),
+            )
             return data_ref
+        except BaseException as exc:
+            _comm_trace(
+                "comm_kv_transfer_failed",
+                transfer_id=transfer_id,
+                num_pages=num_pages,
+                error=type(exc).__name__,
+                detail=exc,
+                elapsed_ms=round(_comm_elapsed_ms(send_start), 6),
+            )
+            raise
         finally:
             self._kv_ready.pop(transfer_id, None)
             self._outbound_kv_requests.pop(transfer_id, None)
@@ -567,6 +662,15 @@ class CommEngine:
                 receiver=receiver,
                 destination=destination,
             )
+            _comm_trace(
+                "comm_kv_prepare_ready",
+                request_id=message.request_id,
+                transfer_id=message.transfer_id,
+                from_stage=message.from_stage,
+                to_stage=message.to_stage,
+                destination_pool_id=destination.pool_id,
+                num_pages=len(destination.page_indices),
+            )
             return KVTransferReadyMessage(
                 request_id=message.request_id,
                 transfer_id=message.transfer_id,
@@ -598,6 +702,7 @@ class CommEngine:
         if state is None:
             raise KeyError(f"unknown inbound KV transfer {data_ref.object_id!r}")
 
+        read_start = _comm_now_ns()
         try:
             state.copy_started = True
             op = await relay.get_kv_pages(
@@ -606,16 +711,28 @@ class CommEngine:
                 source_page_indices=state.request.source_page_indices,
                 destination_page_indices=state.destination.page_indices,
                 request_id=request_id,
+                transfer_id=data_ref.object_id,
             )
             await op.wait_for_completion(timeout=self._ack_timeout_s)
             if state.abort_error is not None:
                 raise state.abort_error
             state.receiver.commit(state.request, state.destination)
-        except asyncio.CancelledError as exc:
-            with suppress(Exception):
-                state.receiver.abort(state.request, state.destination, exc)
-            raise
-        except Exception as exc:
+            _comm_trace(
+                "comm_kv_read_complete",
+                transfer_id=data_ref.object_id,
+                request_id=request_id,
+                num_pages=len(state.destination.page_indices),
+                elapsed_ms=round(_comm_elapsed_ms(read_start), 6),
+            )
+        except (asyncio.CancelledError, Exception) as exc:
+            _comm_trace(
+                "comm_kv_read_failed",
+                transfer_id=data_ref.object_id,
+                request_id=request_id,
+                error=type(exc).__name__,
+                detail=exc,
+                elapsed_ms=round(_comm_elapsed_ms(read_start), 6),
+            )
             with suppress(Exception):
                 state.receiver.abort(state.request, state.destination, exc)
             raise
@@ -627,6 +744,16 @@ class CommEngine:
         message: KVTransferPrepareMessage,
         error: str,
     ) -> KVTransferReadyMessage:
+        _comm_trace(
+            "comm_kv_prepare_rejected",
+            request_id=message.request_id,
+            transfer_id=message.transfer_id,
+            from_stage=message.from_stage,
+            to_stage=message.to_stage,
+            target_pool_id=message.target_pool_id,
+            num_pages=len(message.source_page_indices),
+            error=error,
+        )
         return KVTransferReadyMessage(
             request_id=message.request_id,
             transfer_id=message.transfer_id,
@@ -657,10 +784,17 @@ class CommEngine:
         ):
             if outbound_request_id != request_id:
                 continue
+            pending = self._pending.get(transfer_id)
+            if pending is not None:
+                # DataReady may already have exposed the sender buffers.  Keep
+                # their lease pinned until the receiver reaches a terminal ACK;
+                # the watcher converts that terminal result into request-scoped
+                # cancellation instead of a stage-fatal transfer failure.
+                pending.cleanup_requested = True
+                continue
             future = self._kv_ready.get(transfer_id)
             if future is not None and not future.done():
-                future.set_exception(error)
-            self._fail_pending(transfer_id, error)
+                future.set_exception(KVTransferCancelled(str(error)))
         self.router.cleanup(request_id)
 
     async def close(self) -> None:
@@ -726,7 +860,12 @@ class CommEngine:
             raise ValueError("failed data_ack is missing error")
         pending.receiver_terminal = True
         if not pending.ack.done():
-            pending.ack.set_exception(RuntimeError(error))
+            error_type = (
+                KVTransferRejected
+                if pending.retain_pending_on_failure
+                else RuntimeError
+            )
+            pending.ack.set_exception(error_type(error))
 
     def _send_queue_for(
         self, queue_key: str
@@ -786,6 +925,7 @@ class CommEngine:
                 target_endpoint=job.target_endpoint,
                 data_ref=data_ref,
                 ops=[op],
+                replica_bindings=job.replica_bindings,
             )
             control_ms = _comm_elapsed_ms(control_start)
             _comm_trace(
@@ -809,6 +949,10 @@ class CommEngine:
 
     async def _run_stream_send(self, job: _StreamSendJob, queue_key: str) -> None:
         object_id: str | None = None
+        stream_object_id = (
+            f"{job.request_id}:stream:{job.from_stage}:{job.target_stage}:"
+            f"{job.chunk_id}:{next(self._stream_send_sequence)}"
+        )
         send_start = _comm_now_ns()
         write_ms = -1.0
         control_ms = -1.0
@@ -821,6 +965,7 @@ class CommEngine:
                 target_stage=job.target_stage,
                 from_stage=job.from_stage,
                 chunk_id=job.chunk_id,
+                object_id=stream_object_id,
                 metadata=job.metadata,
                 transport=job.transport,
             )
@@ -836,6 +981,7 @@ class CommEngine:
                 data_ref=data_ref,
                 ops=ops,
                 chunk_id=job.chunk_id,
+                replica_bindings=job.replica_bindings,
             )
             control_ms = _comm_elapsed_ms(control_start)
             _comm_trace(
@@ -845,6 +991,7 @@ class CommEngine:
                 to_stage=job.target_stage,
                 chunk_id=job.chunk_id,
                 transport=job.transport.value,
+                bytes=job.data.nbytes,
                 queue_key=queue_key,
                 queue_wait_ms=round((send_start - job.enqueued_ns) / 1_000_000.0, 6),
                 write_ms=round(write_ms, 6),
@@ -869,6 +1016,7 @@ class CommEngine:
         data_ref: DataRef,
         ops: list[Any],
         chunk_id: int | None = None,
+        replica_bindings: dict[str, int] | None = None,
     ) -> asyncio.Task:
         """Publish a relay object and arm its existing ACK lifecycle."""
 
@@ -882,6 +1030,7 @@ class CommEngine:
             target_endpoint=target_endpoint,
             data_ref=data_ref,
             chunk_id=chunk_id,
+            replica_bindings=replica_bindings,
         )
 
     async def _publish_registered_data_ready(
@@ -894,6 +1043,7 @@ class CommEngine:
         target_endpoint: str,
         data_ref: DataRef,
         chunk_id: int | None = None,
+        replica_bindings: dict[str, int] | None = None,
     ) -> asyncio.Task:
         object_id = data_ref.object_id
         try:
@@ -906,6 +1056,7 @@ class CommEngine:
                     to_stage=to_stage,
                     data_ref=data_ref.to_dict(),
                     chunk_id=chunk_id,
+                    replica_bindings=replica_bindings,
                 ),
             )
         except BaseException as exc:
@@ -930,14 +1081,14 @@ class CommEngine:
             retain_pending_on_failure=retain_pending_on_failure,
         )
 
-    def _arm_pending(self, object_id: str) -> asyncio.Task:
+    def _arm_pending(self, object_id: str) -> asyncio.Task[bool]:
         pending = self._pending[object_id]
         assert pending.task is None
         pending.task = asyncio.create_task(self._watch_pending(object_id, pending))
         self._track_task(pending.task, f"comm ack {object_id}")
         return pending.task
 
-    async def _watch_pending(self, object_id: str, pending: _PendingTransfer) -> None:
+    async def _watch_pending(self, object_id: str, pending: _PendingTransfer) -> bool:
         retained = False
         try:
             ack = (
@@ -950,6 +1101,7 @@ class CommEngine:
                 op.mark_receiver_done()
             for op in pending.ops:
                 await op.wait_for_completion(timeout=self._ack_timeout_s)
+            return pending.cleanup_requested
         except asyncio.CancelledError as exc:
             if pending.retain_pending_on_failure and not pending.receiver_terminal:
                 # A local failure is not proof that the peer stopped reading.
@@ -967,6 +1119,8 @@ class CommEngine:
             for op in pending.ops:
                 with suppress(Exception):
                     await op.wait_for_completion(timeout=self._ack_timeout_s)
+            if pending.cleanup_requested:
+                return True
             raise
         finally:
             if not retained:
@@ -982,6 +1136,13 @@ class CommEngine:
     ) -> None:
         self._pending.pop(object_id, None)
         self._retained_pending_kv_transfers.append(pending)
+        _comm_trace(
+            "comm_kv_pending_retained",
+            object_id=object_id,
+            retained_count=len(self._retained_pending_kv_transfers),
+            num_ops=len(pending.ops),
+            error=type(error).__name__,
+        )
         logger.error(
             "Retaining pending KV transfer %s after sender failure: %s",
             object_id,

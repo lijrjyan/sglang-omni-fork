@@ -24,6 +24,7 @@ from .base import Relay, RelayOperation, register_relay
 logger = logging.getLogger(__name__)
 
 _PEER_ENABLED: set[tuple[int, int]] = set()
+_PEER_UNAVAILABLE: set[tuple[int, int]] = set()
 _PEER_VISIBILITY_WARNED: set[tuple[int, int, int]] = set()
 _DEFAULT_WAIT_THREADS = 8
 
@@ -106,21 +107,26 @@ def _parse_device_id(device: str) -> int:
     return 0
 
 
-def _ensure_peer_access(src_index: int, dst_index: int) -> None:
-    """Enable P2P access when available and warn when it is not."""
+def _ensure_peer_access(src_index: int, dst_index: int) -> bool:
+    """Check P2P access and report whether a cross-GPU copy is safe."""
     if src_index == dst_index:
-        return
+        return True
     key = (dst_index, src_index)
+    if key in _PEER_UNAVAILABLE:
+        return False
     if key in _PEER_ENABLED:
-        return
+        return True
     if not torch.cuda.can_device_access_peer(dst_index, src_index):
+        _PEER_UNAVAILABLE.add(key)
         logger.warning(
-            "cuda_ipc: GPU %d cannot peer-access GPU %d; cross-GPU copy will "
-            "stage through host memory (no NVLink fast path)",
+            "cuda_ipc: GPU %d cannot peer-access GPU %d; CUDA IPC cannot perform "
+            "this cross-GPU copy (select the shm relay instead)",
             dst_index,
             src_index,
         )
+        return False
     _PEER_ENABLED.add(key)
+    return True
 
 
 def _dump_cuda_storage_handle(tensor: torch.Tensor) -> dict[str, Any]:
@@ -861,7 +867,12 @@ class CudaIpcRelay(Relay):
         peer_start = _comm_now_ns()
         device_count = torch.cuda.device_count()
         if 0 <= src_index < device_count:
-            _ensure_peer_access(src_index, dst_index)
+            if not _ensure_peer_access(src_index, dst_index):
+                raise RuntimeError(
+                    "cuda_ipc cross-GPU transfer requires peer access, but "
+                    f"GPU {dst_index} cannot access GPU {src_index}; use the "
+                    "shm relay for host-staged transfer"
+                )
         else:
             warn_key = (dst_index, src_index, device_count)
             if warn_key not in _PEER_VISIBILITY_WARNED:
@@ -1012,6 +1023,7 @@ class CudaIpcRelay(Relay):
         source_pool_id: str,
         source_page_indices: tuple[int, ...],
         destination_ref: dict[str, Any],
+        transfer_id: str | None = None,
     ) -> _ReceiverAckOperation:
         pool = self._kv_pools.get(source_pool_id)
         if pool is None:
@@ -1037,6 +1049,14 @@ class CudaIpcRelay(Relay):
         }
         relay_info["cuda_ipc_kv"] = dict(relay_info["cuda_ipc_kv"])
         relay_info["cuda_ipc_kv"]["ready_event"] = ready_event.ipc_handle()
+        _comm_trace(
+            "cuda_ipc_kv_put",
+            transfer_id=transfer_id,
+            source_pool_id=source_pool_id,
+            num_pages=len(source_page_indices),
+            bytes=relay_info["transfer_info"]["size"],
+            device_id=device.index if device.index is not None else 0,
+        )
         return _ReceiverAckOperation(
             relay_info,
             held_references=(
@@ -1053,6 +1073,7 @@ class CudaIpcRelay(Relay):
         source_page_indices: tuple[int, ...],
         destination_page_indices: tuple[int, ...],
         request_id: str,
+        transfer_id: str | None = None,
     ) -> CudaIpcGetOperation:
         destination = self._kv_pools.get(destination_pool_id)
         if destination is None:
@@ -1070,6 +1091,13 @@ class CudaIpcRelay(Relay):
                     source_device_id,
                 )
             ):
+                _comm_trace(
+                    "cuda_ipc_kv_peer_access_denied",
+                    transfer_id=transfer_id,
+                    request_id=request_id,
+                    source_device_id=source_device_id,
+                    destination_device_id=destination_device_id,
+                )
                 raise RuntimeError(
                     "direct CUDA-IPC KV transfer requires GPU peer access; "
                     f"cuda:{destination_device_id} cannot access "
@@ -1080,6 +1108,7 @@ class CudaIpcRelay(Relay):
         source_registration_id = source_meta["registration_id"]
         remote_pool_key = (source_engine_id, source_registration_id)
         source_buffers = self._remote_kv_pools.get(remote_pool_key)
+        remote_pool_cached = source_buffers is not None
         if source_buffers is None:
             source_buffers = tuple(
                 _load_cuda_storage_handle(storage, device=destination_device)
@@ -1133,6 +1162,18 @@ class CudaIpcRelay(Relay):
         transfer_size = sum(
             buffer.bytes_per_page * len(source_page_indices)
             for buffer in destination.buffers
+        )
+        _comm_trace(
+            "cuda_ipc_kv_get",
+            transfer_id=transfer_id,
+            request_id=request_id,
+            destination_pool_id=destination_pool_id,
+            num_pages=len(source_page_indices),
+            bytes=transfer_size,
+            source_device_id=source_device_id,
+            destination_device_id=destination_device_id,
+            cross_device=source_device_id != destination_device_id,
+            remote_pool_cached=remote_pool_cached,
         )
         return CudaIpcGetOperation(
             done_event,

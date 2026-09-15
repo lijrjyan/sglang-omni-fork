@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Long-audio chunking for /v1/audio/transcriptions.
 
-Chunking is opt-in per model, declared via sglang_omni.config.AudioChunkingConfig.
+Chunking is opt-in per model, declared on the model's PipelineConfig; the
+handlers receive the merged sglang_omni.config.ResolvedAudioChunking contract.
 Audio longer than max_audio_clip_s is split into non-overlapping chunks at the quietest point near each nominal boundary.
 """
 
@@ -14,18 +15,22 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from sglang_omni.config import AudioChunkingConfig
+from sglang_omni.config import ResolvedAudioChunking
 from sglang_omni.utils.audio import load_audio
 
 logger = logging.getLogger(__name__)
 
 TARGET_SAMPLE_RATE = 16000
 
+# Note (Jiaxin Deng): peak amplitude below -60 dBFS means a chunk holds no
+# speech at all; decoding one anyway free-runs into repeated hallucinated text.
+SILENT_CHUNK_PEAK_THRESHOLD = 1e-3
+
 # Half-open [start, end) sample range of one chunk.
 Span = tuple[int, int]
 
 
-def needs_chunking(duration_s: float, config: AudioChunkingConfig) -> bool:
+def needs_chunking(duration_s: float, config: ResolvedAudioChunking) -> bool:
     """Whether a probed clip duration calls for splitting.
 
     duration_s <= 0 means the duration probe failed (PyAV could not read
@@ -40,7 +45,7 @@ def needs_chunking(duration_s: float, config: AudioChunkingConfig) -> bool:
     return duration_s > config.max_audio_clip_s
 
 
-def check_total_duration(duration_s: float, config: AudioChunkingConfig) -> None:
+def check_total_duration(duration_s: float, config: ResolvedAudioChunking) -> None:
     """Reject uploads past max_total_audio_s.
 
     Raises ValueError; the handler maps it to HTTP 400. The wording matches
@@ -83,7 +88,7 @@ class RMSSplitter:
         """Split the waveform into the spans that become chunk requests.
 
         min_tail_s is the model's floor for a worth-transcribing final
-        chunk (AudioChunkingConfig.min_tail_s); 0 disables the guard.
+        chunk (ResolvedAudioChunking.min_tail_s); 0 disables the guard.
         """
         total_samples = int(waveform.shape[-1])
         if total_samples <= 0:
@@ -142,6 +147,7 @@ class ChunkSpan:
     end_sample: int
     start_s: float
     end_s: float
+    has_speech: bool = True
 
     @property
     def duration_s(self) -> float:
@@ -192,7 +198,7 @@ def encode_wav(waveform: np.ndarray, sample_rate: int) -> bytes:
 
 def plan_audio_chunks(
     audio_bytes: bytes,
-    config: AudioChunkingConfig,
+    config: ResolvedAudioChunking,
     *,
     splitter: RMSSplitter | None = None,
     sample_rate: int = TARGET_SAMPLE_RATE,
@@ -229,6 +235,9 @@ def plan_audio_chunks(
                 end_sample=end,
                 start_s=start / sample_rate,
                 end_s=end / sample_rate,
+                has_speech=bool(
+                    np.max(np.abs(waveform[start:end])) >= SILENT_CHUNK_PEAK_THRESHOLD
+                ),
             )
             for index, (start, end) in enumerate(spans)
         ],
