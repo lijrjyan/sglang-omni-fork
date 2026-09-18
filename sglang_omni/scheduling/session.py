@@ -12,11 +12,12 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     SESSION_METADATA_KEY,
     ResourceUsage,
+    SessionOp,
     SessionRef,
     TimedChunk,
     wire_size,
 )
-from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
 
@@ -75,13 +76,18 @@ class _Order:
 
 
 class _SessionInbox(queue.Queue):
-    def __init__(self, register):
+    def __init__(self, register: Callable[[IncomingMessage], None]) -> None:
         super().__init__()
-        self._register = register
+        self.register = register
 
-    def put(self, message, block=True, timeout=None):
+    def put(
+        self,
+        message: IncomingMessage,
+        block: bool = True,
+        timeout: float | None = None,
+    ) -> None:
         if message.type == "new_request":
-            self._register(message)
+            self.register(message)
         super().put(message, block, timeout)
 
 
@@ -98,25 +104,25 @@ class SessionScheduler(SimpleScheduler):
         max_state_bytes: int = 1 << 30,
     ):
         self.hooks = hooks
-        self._ordinary_compute = compute_fn
+        self.ordinary_compute = compute_fn
         self.max_sessions = max_sessions
         self.max_state_bytes = max_state_bytes
-        self._sessions: dict[tuple[str, int], _StageSession] = {}
-        self._commands: dict[str, threading.Event] = {}
-        self._session_lock = threading.Lock()
-        self._closing = False
-        self._tickets: dict[str, tuple[tuple[str, int], int]] = {}
-        self._orders: dict[tuple[str, int], _Order] = {}
-        self._served = threading.Condition(self._session_lock)
+        self.sessions: dict[tuple[str, int], _StageSession] = {}
+        self.commands: dict[str, threading.Event] = {}
+        self.session_lock = threading.Lock()
+        self.closing = False
+        self.tickets: dict[str, tuple[tuple[str, int], int]] = {}
+        self.orders: dict[tuple[str, int], _Order] = {}
+        self.served = threading.Condition(self.session_lock)
         super().__init__(
-            self._compute,
+            self.compute,
             max_concurrency=max_concurrency,
-            abort_callback=self._cancel_command,
-            shutdown_callback=self._shutdown_sessions,
+            abort_callback=self.cancel_command,
+            shutdown_callback=self.shutdown_sessions,
         )
-        self.inbox = _SessionInbox(self._register_command)
+        self.inbox = _SessionInbox(self.register_command)
 
-    def _register_command(self, message) -> None:
+    def register_command(self, message: IncomingMessage) -> None:
         command = message.data.request.metadata.get(SESSION_METADATA_KEY)
         if command is None:
             return
@@ -124,20 +130,20 @@ class SessionScheduler(SimpleScheduler):
             key = (command["ref"]["session_id"], command["ref"]["incarnation"])
         except (KeyError, TypeError):
             # Note (Junnan Li): put() runs on the stage loop; a malformed command
-            # must fail in _compute, inside the request error boundary.
+            # must fail in compute, inside the request error boundary.
             return
-        with self._session_lock:
-            order = self._orders.setdefault(key, _Order())
-            self._tickets[message.request_id] = (key, order.issued)
+        with self.session_lock:
+            order = self.orders.setdefault(key, _Order())
+            self.tickets[message.request_id] = (key, order.issued)
             order.issued += 1
 
-    def _finish_command(self, request_id) -> None:
-        with self._served:
-            ticket = self._tickets.pop(request_id, None)
+    def finish_command(self, request_id: str) -> None:
+        with self.served:
+            ticket = self.tickets.pop(request_id, None)
             if ticket is None:
                 return
             key, seq = ticket
-            order = self._orders.get(key)
+            order = self.orders.get(key)
             if order is None:
                 return
             # Note (Junnan Li): An aborted command can finish before its predecessors ran.
@@ -146,65 +152,65 @@ class SessionScheduler(SimpleScheduler):
                 order.finished.discard(order.served)
                 order.served += 1
             if order.served == order.issued:
-                del self._orders[key]
-            self._served.notify_all()
+                del self.orders[key]
+            self.served.notify_all()
 
-    def _consume_if_aborted(self, request_id):
+    def _consume_if_aborted(self, request_id: str) -> bool:
         aborted = super()._consume_if_aborted(request_id)
         if aborted:
-            self._finish_command(request_id)
+            self.finish_command(request_id)
         return aborted
 
-    def _compute(self, payload: StagePayload) -> StagePayload:
+    def compute(self, payload: StagePayload) -> StagePayload:
         command = payload.request.metadata.get(SESSION_METADATA_KEY)
         if command is None:
-            if self._ordinary_compute is None:
+            if self.ordinary_compute is None:
                 raise ValueError("this stage has no compute_fn for ordinary requests")
-            return self._ordinary_compute(payload)
+            return self.ordinary_compute(payload)
         ref = command["ref"]
         key = (ref["session_id"], ref["incarnation"])
         try:
-            with self._served:
+            with self.served:
                 # Note (Junnan Li): A request-level abort can consume this command's number
                 # before it runs (a stream message for the same request arrives first);
                 # such a command has no ticket left and must not wait.
-                ticket = self._tickets.get(payload.request_id)
+                ticket = self.tickets.get(payload.request_id)
                 if ticket is not None:
                     key, seq = ticket
-                    self._served.wait_for(
-                        lambda: (order := self._orders.get(key)) is None
+                    self.served.wait_for(
+                        lambda: (order := self.orders.get(key)) is None
                         or order.served >= seq
                     )
-            return self._compute_session(payload)
+            return self.compute_session(payload)
         finally:
             try:
                 # Once the hook released its owner lock, either stop observes
                 # that unlocked owner or this completion observes shutdown.
-                with self._session_lock:
-                    session = self._sessions.get(key) if self._closing else None
+                with self.session_lock:
+                    session = self.sessions.get(key) if self.closing else None
                 if session is not None:
                     with session.lock:
-                        self._close(key, session)
+                        self.close_session(key, session)
             finally:
-                self._finish_command(payload.request_id)
+                self.finish_command(payload.request_id)
 
-    def _cancel_command(self, request_id: str) -> None:
-        with self._session_lock:
-            event = self._commands.get(request_id)
+    def cancel_command(self, request_id: str) -> None:
+        with self.session_lock:
+            event = self.commands.get(request_id)
             if event is not None:
                 event.set()
 
-    def _shutdown_sessions(self) -> None:
-        with self._session_lock:
-            self._closing = True
-            for event in self._commands.values():
+    def shutdown_sessions(self) -> None:
+        with self.session_lock:
+            self.closing = True
+            for event in self.commands.values():
                 event.set()
-            sessions = list(self._sessions.items())
+            sessions = list(self.sessions.items())
         errors = []
         for key, session in sessions:
             if session.lock.acquire(blocking=False):
                 try:
-                    self._close(key, session)
+                    self.close_session(key, session)
                 except Exception as exc:
                     errors.append(exc)
                 finally:
@@ -212,62 +218,62 @@ class SessionScheduler(SimpleScheduler):
         if errors:
             raise RuntimeError("session shutdown cleanup failed") from errors[0]
 
-    def _close(self, key, session) -> None:
+    def close_session(self, key: tuple[str, int], session: _StageSession) -> None:
         if session.state is not None:
             self.hooks.close(session.state)
             session.state = None
-        with self._session_lock:
-            self._sessions.pop(key, None)
+        with self.session_lock:
+            self.sessions.pop(key, None)
 
-    def _update_usage(self, session: _StageSession, *, admit: bool = True) -> None:
+    def update_usage(self, session: _StageSession, *, admit: bool = True) -> None:
         usage = self.hooks.usage(session.state)
-        with self._session_lock:
+        with self.session_lock:
             session.usage = usage
             if (
                 admit
-                and sum(s.usage.bytes for s in self._sessions.values())
+                and sum(s.usage.bytes for s in self.sessions.values())
                 > self.max_state_bytes
             ):
                 raise QueueFullError()
 
-    def _open_session(self, ref: SessionRef, request: OmniRequest) -> None:
+    def open_session(self, ref: SessionRef, request: OmniRequest) -> None:
         key = (ref.session_id, ref.incarnation)
         session = _StageSession(ref, None)
         session.lock.acquire()
-        with self._session_lock:
-            if self._closing:
+        with self.session_lock:
+            if self.closing:
                 session.lock.release()
                 raise RuntimeError("session scheduler is stopping")
-            if key in self._sessions:
+            if key in self.sessions:
                 session.lock.release()
                 raise ValueError("session already opened")
-            if len(self._sessions) >= self.max_sessions:
+            if len(self.sessions) >= self.max_sessions:
                 session.lock.release()
                 raise QueueFullError()
-            self._sessions[key] = session
+            self.sessions[key] = session
         try:
             session.state = self.hooks.open(ref, request)
-            self._update_usage(session)
-            if self._closing:
+            self.update_usage(session)
+            if self.closing:
                 raise RuntimeError("session scheduler is stopping")
         except BaseException:
-            self._close(key, session)
+            self.close_session(key, session)
             raise
         finally:
             session.lock.release()
 
-    def _compute_session(self, payload: StagePayload) -> StagePayload:
+    def compute_session(self, payload: StagePayload) -> StagePayload:
         command = payload.request.metadata[SESSION_METADATA_KEY]
         ref = SessionRef(**command["ref"])
         key = (ref.session_id, ref.incarnation)
-        op = command["op"]
+        op: SessionOp = command["op"]
         if op == "open":
-            self._open_session(ref, payload.request)
+            self.open_session(ref, payload.request)
             payload.data = {"opened": True}
             return payload
 
-        with self._session_lock:
-            session = self._sessions.get(key)
+        with self.session_lock:
+            session = self.sessions.get(key)
         if session is None:
             if op == "close":
                 payload.data = {"closed": True}
@@ -275,24 +281,24 @@ class SessionScheduler(SimpleScheduler):
             raise ValueError("unknown session incarnation")
         with session.lock:
             if op == "close":
-                self._close(key, session)
+                self.close_session(key, session)
                 payload.data = {"closed": True}
                 return payload
-            if self._closing:
+            if self.closing:
                 raise RuntimeError("session scheduler is stopping")
             if op == "abort":
                 if ref.epoch != session.ref.epoch + 1:
                     raise ValueError("invalid abort epoch")
                 self.hooks.abort(session.state, ref)
                 session.ref = ref
-                self._update_usage(session, admit=False)
+                self.update_usage(session, admit=False)
                 payload.data = {"aborted": True}
                 return payload
             if ref != session.ref:
                 raise ValueError("stale session epoch")
             event = threading.Event()
-            with self._session_lock:
-                self._commands[payload.request_id] = event
+            with self.session_lock:
+                self.commands[payload.request_id] = event
             with self._abort_lock:
                 if payload.request_id in self._aborted:
                     event.set()
@@ -323,8 +329,8 @@ class SessionScheduler(SimpleScheduler):
                     payload,
                     SessionContext(ref, event, emit),
                 )
-                self._update_usage(session)
+                self.update_usage(session)
                 return result
             finally:
-                with self._session_lock:
-                    self._commands.pop(payload.request_id, None)
+                with self.session_lock:
+                    self.commands.pop(payload.request_id, None)

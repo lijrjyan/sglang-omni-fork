@@ -220,14 +220,12 @@ def test_session_commands_run_in_arrival_order_even_when_one_is_aborted():
     for payload in payloads:
         scheduler.inbox.put(IncomingMessage(payload.request_id, "new_request", payload))
     messages = [scheduler.inbox.get_nowait() for _ in payloads]
-    threads = [threading.Thread(target=scheduler._compute, args=(messages[0].data,))]
+    threads = [threading.Thread(target=scheduler.compute, args=(messages[0].data,))]
     threads[0].start()
     assert hooks.entered.wait(5)
     scheduler._aborted.add("second")
     assert scheduler._consume_if_aborted("second")
-    threads.append(
-        threading.Thread(target=scheduler._compute, args=(messages[2].data,))
-    )
+    threads.append(threading.Thread(target=scheduler.compute, args=(messages[2].data,)))
     threads[1].start()
     threads[1].join(0.2)
     assert threads[1].is_alive(), "third command ran before the first finished"
@@ -241,7 +239,7 @@ def test_session_commands_run_in_arrival_order_even_when_one_is_aborted():
         if event[0] == "append":
             order.append(event[1])
     assert order == ["first", "third"]
-    assert not scheduler._orders and not scheduler._tickets
+    assert not scheduler.orders and not scheduler.tickets
 
 
 def test_command_finished_by_abort_before_running_does_not_wait():
@@ -276,7 +274,7 @@ def test_command_finished_by_abort_before_running_does_not_wait():
 
     def run():
         try:
-            scheduler._compute(message.data)
+            scheduler.compute(message.data)
         except BaseException as exc:
             errors.append(exc)
 
@@ -289,4 +287,4 @@ def test_command_finished_by_abort_before_running_does_not_wait():
     while not events.empty():
         seen.append(events.get_nowait()[0])
     assert seen == ["open", "close"]
-    assert not scheduler._orders and not scheduler._tickets
+    assert not scheduler.orders and not scheduler.tickets

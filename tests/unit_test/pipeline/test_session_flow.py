@@ -39,7 +39,7 @@ async def test_interleaved_cadences_input_during_output_eos_and_disconnect(tmp_p
             await coordinator.append_session(a, chunk(2))
         await output_a.aclose()
         await output_b.aclose()
-        assert not coordinator._sessions
+        assert not coordinator.sessions
         assert not coordinator._requests
 
 

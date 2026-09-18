@@ -87,7 +87,7 @@ def worker(spec, ready):
         await stage.start()
         ready.set()
         await stage.run()
-        assert not stage.scheduler._sessions
+        assert not stage.scheduler.sessions
 
     asyncio.run(run())
 
@@ -152,6 +152,7 @@ async def pipeline(tmp_path, *, stage_count=2, replicated=False, list_next=False
                 replica_topology=topology.to_dict(),
             )
             process = ctx.Process(target=worker, args=(spec, ready))
+            process.expected_exitcode = 0
             process.start()
             processes.append(process)
             assert await asyncio.to_thread(ready.wait, 30)
@@ -169,7 +170,7 @@ async def pipeline(tmp_path, *, stage_count=2, replicated=False, list_next=False
             if process.is_alive():
                 process.kill()
                 process.join()
-            assert process.exitcode == getattr(process, "expected_exitcode", 0)
+            assert process.exitcode == process.expected_exitcode
         events.close()
 
 
@@ -197,4 +198,4 @@ def compute_registered(scheduler, payload):
 
     scheduler.inbox.put(IncomingMessage(payload.request_id, "new_request", payload))
     message = scheduler.inbox.get_nowait()
-    return scheduler._compute(message.data)
+    return scheduler.compute(message.data)
