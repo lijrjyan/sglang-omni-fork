@@ -5,21 +5,22 @@ import base64
 import binascii
 import json
 import uuid
+from typing import Literal
 
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from sglang_omni.serve.realtime.control import ControlEvent, Failure
 from sglang_omni.serve.realtime.projection import project_control, project_output
-from sglang_omni.serve.realtime.runtime import ProtocolError
+from sglang_omni.serve.realtime.runtime import ProtocolError, SessionRuntime
 
 
 class SharedRealtimeSession:
-    def __init__(self, websocket, runtime):
+    def __init__(self, websocket: WebSocket, runtime: SessionRuntime) -> None:
         self.websocket = websocket
         self.runtime = runtime
         self.session_id = runtime.session_id
 
-    async def run(self):
+    async def run(self) -> None:
         self.runtime.created()
         reader = asyncio.create_task(self._read())
         sender = asyncio.create_task(self._send())
@@ -49,10 +50,10 @@ class SharedRealtimeSession:
                 task.cancel()
             await asyncio.gather(reader, sender, timer, return_exceptions=True)
 
-    async def teardown(self):
+    async def teardown(self) -> None:
         await self.runtime.close("disconnect")
 
-    async def _send(self):
+    async def _send(self) -> None:
         async for envelope in self.runtime.outputs():
             if envelope.epoch != self.runtime.epoch and not envelope.control:
                 continue
@@ -84,7 +85,7 @@ class SharedRealtimeSession:
             self.runtime.sent(envelope)
         await self.websocket.close()
 
-    async def _read(self):
+    async def _read(self) -> Literal["disconnect"] | None:
         while self.runtime.state != "CLOSED":
             message = await self.websocket.receive()
             if message["type"] == "websocket.disconnect":

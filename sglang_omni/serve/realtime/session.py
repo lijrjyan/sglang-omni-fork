@@ -87,7 +87,7 @@ class ResponseOutput:
 
 
 class TurnConfigurationError(ValueError):
-    def __init__(self, type_: str, code: str, message: str):
+    def __init__(self, type_: str, code: str, message: str) -> None:
         self.type, self.code = type_, code
         super().__init__(message)
 
@@ -167,9 +167,9 @@ class TurnBasedSession:
         self.speech_idle.set()
         # VAD may emit speech_stopped while engine is still busy on an
         # earlier utterance — serialize via FIFO.
-        self.response_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(
-            maxsize=max_queued_turns
-        )
+        self.response_queue: asyncio.Queue[
+            tuple[str, str] | tuple[str, str, contextvars.Context]
+        ] = asyncio.Queue(maxsize=max_queued_turns)
         self.queue_drainer: asyncio.Task | None = None
         self.queue_idle = asyncio.Event()
         self.queue_idle.set()
@@ -182,7 +182,9 @@ class TurnBasedSession:
         self.utterance_start_byte: int | None = None
         self.utterance_item_id: str | None = None
 
-    async def prepare_update(self, config: SessionConfig):
+    async def prepare_update(
+        self, config: SessionConfig
+    ) -> tuple[SessionObject, TurnDetector | None]:
         # Validate a candidate first so a rejected update never lands in live state.
         update = config.model_dump(
             exclude_none=True,
@@ -276,7 +278,9 @@ class TurnBasedSession:
 
         return candidate, replacement_vad
 
-    def apply_update(self, candidate, replacement_vad) -> bool:
+    def apply_update(
+        self, candidate: SessionObject, replacement_vad: TurnDetector | None
+    ) -> bool:
         had_pending_audio = (
             not self.audio_buffer.is_empty() or self.utterance_item_id is not None
         )
@@ -1023,10 +1027,7 @@ class RealtimeSession(TurnBasedSession):
     async def emit_output(self, event: OutputEvent) -> None:
         await self.send(project_output(event, legacy=True))
 
-    async def send(self, event: Any) -> None:
-        if not isinstance(event, dict):
-            await self.emit_output(event)
-            return
+    async def send(self, event: dict[str, Any]) -> None:
         if self.closed or self.websocket.application_state != WebSocketState.CONNECTED:
             return
         event.setdefault("event_id", new_id("evt"))

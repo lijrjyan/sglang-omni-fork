@@ -7,15 +7,16 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Callable
 
+from sglang_omni.client.client import Client
 from sglang_omni.proto.session import SessionLimits, TimedChunk
 from sglang_omni.serve.realtime.events import SessionConfig
-from sglang_omni.serve.realtime.output import TurnFailure
+from sglang_omni.serve.realtime.output import ContextLimitError, TurnFailure
 from sglang_omni.serve.realtime.runtime import (
-    ContextLimitError,
     InteractionAdapter,
     ProtocolError,
     RuntimeLimits,
 )
+from sglang_omni.serve.realtime.semantic_vad import SemanticEOUModel
 from sglang_omni.serve.realtime.session import TurnBasedSession, TurnConfigurationError
 from sglang_omni.serve.realtime.task_cleanup import cancel_local_tasks
 
@@ -154,19 +155,19 @@ class CoordinatorAdapter(InteractionAdapter):
 
 @dataclass(frozen=True)
 class TurnBasedAdapterFactory:
-    client: object
+    client: Client
     model_name: str
     supports_audio_output: bool = False
-    smart_turn_model: object = None
+    smart_turn_model: SemanticEOUModel | None = None
 
-    def __call__(self):
+    def __call__(self) -> TurnBasedAdapter:
         return TurnBasedAdapter(self)
 
 
 class TurnBasedAdapter(InteractionAdapter):
     """Use the existing request/VAD/history computation with a typed sink."""
 
-    def __init__(self, factory):
+    def __init__(self, factory: TurnBasedAdapterFactory) -> None:
         self.factory = factory
         self.engine = None
         self.emit = None

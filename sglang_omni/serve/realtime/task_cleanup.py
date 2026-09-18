@@ -1,9 +1,12 @@
 """Bounded teardown of local asyncio plumbing, never native resource ownership."""
 
 import asyncio
+from collections.abc import Iterable
 
 
-async def cancel_local_tasks(tasks, timeout):
+async def cancel_local_tasks(
+    tasks: Iterable[asyncio.Task[None] | None], timeout: float
+) -> None:
     tasks = {
         task
         for task in tasks

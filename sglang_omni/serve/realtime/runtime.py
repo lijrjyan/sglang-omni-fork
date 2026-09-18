@@ -10,7 +10,7 @@ import uuid
 from collections import deque
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
-from typing import Callable
+from typing import Callable, Literal
 
 from sglang_omni.serve.realtime.control import (
     Accepted,
@@ -69,12 +69,12 @@ class RuntimeLimits:
 
 @dataclass(frozen=True)
 class Capabilities:
-    interaction: str = "native"
+    interaction: Literal["native", "turn_based", "transcription"] = "native"
     input_rate: int = 16000
     output_rate: int = 16000
     output_modalities: tuple[str, ...] = ("text",)
     native_unit_ms: int = 20
-    tail_policy: str = "flush"
+    tail_policy: Literal["flush", "pad", "reject"] = "flush"
     cancel_is_noop: bool = False
     partial_style: str = "append_only"
 
@@ -175,11 +175,11 @@ class InteractionAdapter:
         raise NotImplementedError
 
 
-def _merge(current: dict, patch: dict) -> dict:
+def merge_config(current: dict, patch: dict) -> dict:
     result = copy.deepcopy(current)
     for key, value in patch.items():
         result[key] = (
-            _merge(result[key], value)
+            merge_config(result[key], value)
             if isinstance(value, dict) and isinstance(result.get(key), dict)
             else copy.deepcopy(value)
         )
@@ -198,7 +198,7 @@ class SessionRuntime:
         self.model, self.capabilities, self.limits = model, capabilities, limits
         self.factory = adapter_factory
         self.adapter = None
-        self.state = "CREATED"
+        self.state: Literal["CREATED", "OPEN", "CLOSING", "CLOSED"] = "CREATED"
         self.epoch = 0
         self.config: dict = {}
         self.granted: dict = {}
@@ -391,7 +391,7 @@ class SessionRuntime:
             raise ProtocolError(
                 "invalid_request", "unsupported session field", "session"
             )
-        candidate = _merge(self.config, patch)
+        candidate = merge_config(self.config, patch)
         if self.state == "OPEN":
 
             def frozen(config):
@@ -640,7 +640,7 @@ class SessionRuntime:
                 raise ProtocolError("invalid_state", "audio input has ended")
             if type(seq) is not int or seq != self.next_seq:
                 raise ProtocolError("invalid_state", "audio seq must be contiguous")
-            if not isinstance(pcm, bytes) or not pcm or len(pcm) % 2:
+            if not pcm or len(pcm) % 2:
                 raise ProtocolError(
                     "invalid_request", "audio must contain whole PCM16 samples"
                 )

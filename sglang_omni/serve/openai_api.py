@@ -27,6 +27,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing, suppress
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 if TYPE_CHECKING:
@@ -1214,8 +1215,6 @@ def _build_generate_response(
 
 def _register_realtime(app: FastAPI) -> None:
     """Mount the OpenAI-compatible WebSocket Realtime endpoint."""
-    from dataclasses import asdict
-
     from sglang_omni.serve.realtime import RealtimeSessionManager
     from sglang_omni.serve.realtime.smart_turn import load_smart_turn
 

@@ -12,6 +12,7 @@ from sglang_omni.serve.realtime.adapters import TurnBasedAdapterFactory
 from sglang_omni.serve.realtime.protocol import SharedRealtimeSession
 from sglang_omni.serve.realtime.runtime import (
     Capabilities,
+    InteractionAdapter,
     RuntimeLimits,
     SessionRuntime,
 )
@@ -25,11 +26,11 @@ from sglang_omni.serve.realtime.transcription_session import (
 class RealtimeDeployment:
 
     capabilities: Capabilities
-    adapter_factory: Callable
+    adapter_factory: Callable[[], InteractionAdapter]
     limits: RuntimeLimits = field(default_factory=RuntimeLimits)
     max_connections: int = 128
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if type(self.max_connections) is not int or self.max_connections < 1:
             raise ValueError("max_connections must be a positive integer")
 
@@ -71,7 +72,9 @@ class RealtimeSessionManager:
             str, SharedRealtimeSession | RealtimeTranscriptionSession
         ] = {}
 
-    def open(self, websocket: WebSocket, *, intent: str = "conversation"):
+    def open(
+        self, websocket: WebSocket, *, intent: str = "conversation"
+    ) -> SharedRealtimeSession | RealtimeTranscriptionSession:
         intent = intent.strip().casefold()
         if intent == "transcription":
             if self.transcription_config is None:
