@@ -182,15 +182,15 @@ def observe_connection_release(monkeypatch, manager):
 
 def native_sessions(coordinator):
     # Note (Junnan Li): No public query exposes retained native cleanup ownership.
-    return coordinator._sessions
+    return coordinator.sessions
 
 
 def observe_native_command(monkeypatch, coordinator, observe):
     # Note (Junnan Li): The command boundary is below public close error handling.
-    original = coordinator._session_command
+    original = coordinator.session_command
 
     async def command(session, op, **kwargs):
         observe(op)
         return await original(session, op, **kwargs)
 
-    monkeypatch.setattr(coordinator, "_session_command", command)
+    monkeypatch.setattr(coordinator, "session_command", command)
