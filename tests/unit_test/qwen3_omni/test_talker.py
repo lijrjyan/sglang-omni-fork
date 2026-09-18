@@ -1080,6 +1080,7 @@ def test_process_input_requests_builds_at_one_chunk_under_topology() -> None:
     scheduler._append_stream_chunk = lambda req_data, chunk: None
     scheduler._mark_stream_done = lambda req_data: None
     payload = SimpleNamespace(
+        request=OmniRequest(None),
         request_id="rid-topo",
         prefetched_chunks=[SimpleNamespace(data=torch.tensor([0.0]))],
         prefetched_stream_done=False,
