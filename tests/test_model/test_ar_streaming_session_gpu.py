@@ -177,7 +177,7 @@ def test_real_streaming_session_gpu():
         lifecycle("open")
         first = generate(prompt, "s")
         slot = scheduler.tree_cache.slots[b.native_id(SessionRef("s"))]
-        first_slot, retained = slot.req_pool_idx, slot.kv_committed_len
+        first_slot, retained = slot.kv.req_pool_idx, slot.kv.kv_committed_len
         assert first_slot is not None and retained >= len(prompt)
         assert b.usage(SessionRef("s")).bytes > 0
         prior = free()
@@ -193,7 +193,9 @@ def test_real_streaming_session_gpu():
             b.native_id(SessionRef("s"))
         )._inflight
         assert scheduler.tree_cache.slots[b.native_id(SessionRef("s"))] is slot
-        assert slot.req_pool_idx == first_slot and slot.kv_committed_len == retained
+        assert (
+            slot.kv.req_pool_idx == first_slot and slot.kv.kv_committed_len == retained
+        )
         assert free() == prior
         scheduler.max_req_len = previous_limit
         print(
@@ -204,7 +206,7 @@ def test_real_streaming_session_gpu():
         req = b.requests[second_req.request_id].unit.req
         assert list(req.origin_input_ids) == prompt + first + tail
         batch = scheduler.get_next_batch_to_run()
-        assert req.req_pool_idx == first_slot and len(req.prefix_indices) >= retained
+        assert req.kv.req_pool_idx == first_slot and len(req.prefix_indices) >= retained
         scheduler.cur_batch = batch
         scheduler.process_batch_result(batch, scheduler.run_batch(batch))
         scheduler.last_batch = batch
@@ -219,7 +221,7 @@ def test_real_streaming_session_gpu():
         scheduler.abort(queued.request_id)
         assert free() == prior
         assert (
-            scheduler.tree_cache.slots[b.native_id(SessionRef("s"))].req_pool_idx
+            scheduler.tree_cache.slots[b.native_id(SessionRef("s"))].kv.req_pool_idx
             == first_slot
         )
         history = prompt + first + tail + second
@@ -228,9 +230,9 @@ def test_real_streaming_session_gpu():
 
         lifecycle("open", "t")
         tfirst = generate(prompt, "t")
-        left = p("append", "t", tail, 12)
-        middle = p("append", "s", tail, 12)
-        right = p(None, ids=prompt, n=12)
+        left = p("append", "t", tail)
+        middle = p("append", "s", tail)
+        right = p(None, ids=prompt)
         for item in (left, middle, right):
             submit(item)
         prefill = step()
@@ -251,24 +253,32 @@ def test_real_streaming_session_gpu():
         scheduler._resolve_pending_async()
         survivors = collect([left.request_id, middle.request_id, right.request_id])
         committed_slot = scheduler.tree_cache.slots["s"]
-        committed_length = committed_slot.kv_committed_len
-        committed_pool = committed_slot.req_pool_idx
+        committed_length = committed_slot.kv.kv_committed_len
+        committed_pool = committed_slot.kv.req_pool_idx
         lifecycle("abort", "s", epoch=1)
         assert scheduler._async_pending is None
         assert scheduler.tree_cache.slots["s"] is committed_slot
-        assert committed_slot.kv_committed_len == committed_length
-        assert committed_slot.req_pool_idx == committed_pool
-        left_oracle = generate(prompt + tfirst + tail, n=12)
-        right_oracle = generate(prompt, n=12)
-        assert survivors[left.request_id] == left_oracle
-        assert survivors[right.request_id] == right_oracle
+        assert committed_slot.kv.kv_committed_len == committed_length
+        assert committed_slot.kv.req_pool_idx == committed_pool
+        # Note (Junnan Li): Decode the same three inputs as ordinary rows of one
+        # batch; a single-row oracle can differ in the last token on bf16.
+        oracles = [
+            p(None, ids=prompt + tfirst + tail),
+            p(None, ids=history + tail),
+            p(None, ids=prompt),
+        ]
+        for item in oracles:
+            submit(item)
+        expected = collect([item.request_id for item in oracles])
+        for survivor, oracle in zip((left, middle, right), oracles):
+            assert survivors[survivor.request_id] == expected[oracle.request_id]
         history += tail + survivors[middle.request_id]
         continuation = p("append", "s", tail, epoch=1)
         submit(continuation)
         req = b.requests[continuation.request_id].unit.req
         batch = scheduler.get_next_batch_to_run()
         assert len(req.prefix_indices) >= committed_length
-        assert req.req_pool_idx == committed_pool
+        assert req.kv.req_pool_idx == committed_pool
         matched = len(req.prefix_indices)
         scheduler.cur_batch = batch
         scheduler.process_batch_result(batch, scheduler.run_batch(batch))
