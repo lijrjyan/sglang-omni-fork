@@ -9,7 +9,7 @@ import uuid
 from collections import deque
 from collections.abc import Coroutine
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, AsyncIterator, Callable, Literal
+from typing import Any, AsyncIterator, Callable, Literal, TypeVar
 
 import msgpack
 
@@ -20,10 +20,13 @@ from sglang_omni.proto.session import (
     SESSION_METADATA_KEY,
     OutputChunk,
     SessionLimits,
+    SessionOp,
     SessionRef,
     TimedChunk,
     wire_size,
 )
+
+TaskResult = TypeVar("TaskResult")
 
 
 @dataclass
@@ -34,10 +37,10 @@ class _Session:
     bindings: dict[str, int]
     limits: SessionLimits
     opened: list[str] = field(default_factory=list)
-    pending: deque = field(default_factory=deque)
+    pending: deque[tuple[TimedChunk, int]] = field(default_factory=deque)
     pending_bytes: int = 0
     pending_count: int = 0
-    outputs: deque = field(default_factory=deque)
+    outputs: deque[tuple[OutputChunk, int]] = field(default_factory=deque)
     output_bytes: int = 0
     next_input: int = 0
     next_output: int = 0
@@ -58,27 +61,29 @@ class _Session:
 class CoordinatorSessions:
     """Coordinator-owned sessions over fixed stage routes."""
 
-    def _init_sessions(self, max_sessions: int) -> None:
+    def init_sessions(self, max_sessions: int) -> None:
         self.max_sessions = max_sessions
-        self._sessions_stopping = False
-        self._session_unavailable_stages: set[str] = set()
-        self._sessions: dict[str, _Session] = {}
-        self._session_stream_handlers: dict[str, Callable[[StreamMessage], None]] = {}
-        self._session_cleanup_tasks: set[asyncio.Task] = set()
+        self.sessions_stopping = False
+        self.session_unavailable_stages: set[str] = set()
+        self.sessions: dict[str, _Session] = {}
+        self.session_stream_handlers: dict[str, Callable[[StreamMessage], None]] = {}
+        self.session_cleanup_tasks: set[asyncio.Task] = set()
 
-    def _owned_session_task(self, coroutine) -> asyncio.Task:
+    def owned_session_task(
+        self, coroutine: Coroutine[Any, Any, TaskResult]
+    ) -> asyncio.Task[TaskResult]:
         task = asyncio.create_task(coroutine)
-        self._session_cleanup_tasks.add(task)
-        task.add_done_callback(self._session_task_done)
+        self.session_cleanup_tasks.add(task)
+        task.add_done_callback(self.session_task_done)
         return task
 
-    def _session_task_done(self, task: asyncio.Task) -> None:
-        self._session_cleanup_tasks.discard(task)
+    def session_task_done(self, task: asyncio.Task) -> None:
+        self.session_cleanup_tasks.discard(task)
         if not task.cancelled():
             task.exception()
 
-    def _session(self, ref: SessionRef) -> _Session:
-        session = self._sessions.get(ref.session_id)
+    def get_session(self, ref: SessionRef) -> _Session:
+        session = self.sessions.get(ref.session_id)
         if session is None or session.ref != ref:
             raise ValueError("unknown or stale session reference")
         return session
@@ -92,11 +97,7 @@ class CoordinatorSessions:
         session_id: str | None = None,
     ) -> SessionRef:
         """Open a fixed linear route, upstream to downstream, before accepting input."""
-        if (
-            self._sessions_stopping
-            or not self._running
-            or self._fatal_error is not None
-        ):
+        if self.sessions_stopping or not self._running or self._fatal_error is not None:
             raise RuntimeError(self._fatal_error or "Coordinator is not running")
         if (
             not stages
@@ -104,10 +105,10 @@ class CoordinatorSessions:
             or len(set(stages)) != len(stages)
         ):
             raise ValueError("stages must be a unique route beginning at entry_stage")
-        if len(self._sessions) >= self.max_sessions:
+        if len(self.sessions) >= self.max_sessions:
             raise QueueFullError()
         session_id = session_id or str(uuid.uuid4())
-        if session_id in self._sessions:
+        if session_id in self.sessions:
             raise ValueError("session ID already reserved")
         bindings = (
             assign_replica_bindings(
@@ -125,7 +126,7 @@ class CoordinatorSessions:
         )
         if any(owner not in self._stages for owner in owners):
             raise ValueError("session route contains an unregistered owner")
-        if self._session_unavailable_stages.intersection(owners):
+        if self.session_unavailable_stages.intersection(owners):
             raise ValueError(
                 "session route contains an unregistered owner or unavailable owner"
             )
@@ -136,25 +137,25 @@ class CoordinatorSessions:
             bindings,
             limits or SessionLimits(),
         )
-        self._sessions[session_id] = session
+        self.sessions[session_id] = session
         try:
             async with session.lock:
                 for owner in owners:
                     # Include attempts: open may allocate before its reply is lost.
                     session.opened.append(owner)
-                    await self._session_command(session, "open", owner=owner)
+                    await self.session_command(session, "open", owner=owner)
                 if (
-                    self._sessions_stopping
-                    or self._session_unavailable_stages.intersection(owners)
+                    self.sessions_stopping
+                    or self.session_unavailable_stages.intersection(owners)
                 ):
                     raise RuntimeError("session owners are shutting down")
         except BaseException:
             await asyncio.shield(
-                self._owned_session_task(self._close_session_state(session))
+                self.owned_session_task(self.close_session_state(session))
             )
             raise
         session.request = replace(request, inputs=None)
-        session.pump = asyncio.create_task(self._pump_session(session))
+        session.pump = asyncio.create_task(self.pump_session(session))
         return session.ref
 
     async def append_session(self, ref: SessionRef, chunk: TimedChunk) -> int:
@@ -163,7 +164,7 @@ class CoordinatorSessions:
         Adapters map per-stream seq to this order. Rejected input keeps its seq
         for retry; accepted input advances it and must not be resubmitted.
         """
-        session = self._session(ref)
+        session = self.get_session(ref)
         if session.closing or session.closed:
             raise RuntimeError("session is closing")
         if chunk.seq != session.next_input:
@@ -209,7 +210,7 @@ class CoordinatorSessions:
 
     async def session_outputs(self, ref: SessionRef) -> AsyncIterator[OutputChunk]:
         """One output consumer; disconnect closes the owned session."""
-        session = self._session(ref)
+        session = self.get_session(ref)
         if session.reading:
             raise RuntimeError("session already has an output consumer")
         session.reading = True
@@ -232,10 +233,10 @@ class CoordinatorSessions:
         finally:
             session.reading = False
             await asyncio.shield(
-                self._owned_session_task(self._close_session_state(session))
+                self.owned_session_task(self.close_session_state(session))
             )
 
-    def _emit_session_output(
+    def emit_session_output(
         self,
         session: _Session,
         ref: SessionRef,
@@ -269,7 +270,7 @@ class CoordinatorSessions:
         session.next_output += 1
         session.output_wake.set()
 
-    async def _pump_session(self, session: _Session) -> None:
+    async def pump_session(self, session: _Session) -> None:
         try:
             while not session.closing:
                 if not session.pending:
@@ -284,8 +285,8 @@ class CoordinatorSessions:
                     chunk, size = session.pending.popleft()
                     ref = session.ref
                     try:
-                        await self._session_command(session, "append", chunk=chunk)
-                        self._emit_session_output(
+                        await self.session_command(session, "append", chunk=chunk)
+                        self.emit_session_output(
                             session,
                             ref,
                             chunk.seq,
@@ -297,12 +298,12 @@ class CoordinatorSessions:
                         session.pending_bytes -= size
         except Exception as exc:
             session.error = exc
-            self._owned_session_task(self._close_session_state(session))
+            self.owned_session_task(self.close_session_state(session))
 
-    async def _session_command(
+    async def session_command(
         self,
         session: _Session,
-        op: str,
+        op: SessionOp,
         *,
         owner: str | None = None,
         chunk: TimedChunk | None = None,
@@ -327,14 +328,14 @@ class CoordinatorSessions:
 
         def output(msg: StreamMessage) -> None:
             try:
-                self._emit_session_output(
+                self.emit_session_output(
                     session, ref, chunk.seq, TimedChunk(**msg.chunk)
                 )
             except Exception as exc:
                 self._reject_completion_future(request_id, exc)
 
         if chunk is not None:
-            self._session_stream_handlers[request_id] = output
+            self.session_stream_handlers[request_id] = output
 
         async def run() -> dict[str, Any]:
             await self._submit_request(
@@ -354,14 +355,14 @@ class CoordinatorSessions:
         try:
             return await asyncio.wait_for(run(), session.limits.command_timeout_s)
         except asyncio.TimeoutError as exc:
-            self._begin_session_close(session)
+            self.begin_session_close(session)
             raise TimeoutError(f"session {op} timed out") from exc
         except BaseException:
             # Note (Junnan Li): Request abort can yield before the pump sees this fatal failure.
-            self._begin_session_close(session)
+            self.begin_session_close(session)
             raise
         finally:
-            self._session_stream_handlers.pop(request_id, None)
+            self.session_stream_handlers.pop(request_id, None)
             if request_id in self._requests:
                 await self.abort(request_id)
             future = self._completion_futures.pop(request_id, None)
@@ -370,11 +371,11 @@ class CoordinatorSessions:
 
     async def abort_session(self, ref: SessionRef) -> SessionRef:
         """Fence output immediately; finish the active unit before changing stage state."""
-        task = self._owned_session_task(self._abort_session(ref))
+        task = self.owned_session_task(self._abort_session(ref))
         return await asyncio.shield(task)
 
     async def _abort_session(self, ref: SessionRef) -> SessionRef:
-        session = self._session(ref)
+        session = self.get_session(ref)
         async with session.lock:
             if session.closing:
                 raise RuntimeError("session is closing")
@@ -390,29 +391,27 @@ class CoordinatorSessions:
                 # Canceling the pump here would abort that request and free KV.
                 async with session.unit_lock:
                     for owner in reversed(session.opened):
-                        await self._session_command(session, "abort", owner=owner)
+                        await self.session_command(session, "abort", owner=owner)
             except BaseException as exc:
                 session.error = exc
-                await self._cleanup_session(session)
+                await self.cleanup_session(session)
                 raise
             return session.ref
 
     async def close_session(self, ref: SessionRef) -> None:
         """Close the referenced incarnation regardless of its current output epoch."""
-        session = self._sessions.get(ref.session_id)
+        session = self.sessions.get(ref.session_id)
         if session is None:
             return
         if session.ref.incarnation != ref.incarnation:
             raise ValueError("stale session reference")
-        await asyncio.shield(
-            self._owned_session_task(self._close_session_state(session))
-        )
+        await asyncio.shield(self.owned_session_task(self.close_session_state(session)))
         if session.cleanup_error is not None:
             raise RuntimeError(
                 "session cleanup incomplete; capacity remains reserved"
             ) from session.cleanup_error
 
-    def _begin_session_close(self, session: _Session) -> None:
+    def begin_session_close(self, session: _Session) -> None:
         session.closing = True
         # Note (Junnan Li): Close fences output like cancel; queued data is dropped, not drained.
         session.outputs.clear()
@@ -420,18 +419,18 @@ class CoordinatorSessions:
         session.wake.set()
         session.output_wake.set()
 
-    def _close_session_state(self, session: _Session) -> Coroutine[Any, Any, None]:
-        self._begin_session_close(session)
-        return self._finish_session_close(session)
+    def close_session_state(self, session: _Session) -> Coroutine[Any, Any, None]:
+        self.begin_session_close(session)
+        return self.finish_session_close(session)
 
-    async def _finish_session_close(self, session: _Session) -> None:
+    async def finish_session_close(self, session: _Session) -> None:
         async with session.lock:
             if session.closed:
                 return
-            await self._cleanup_session(session)
+            await self.cleanup_session(session)
 
-    async def _cleanup_session(self, session: _Session) -> None:
-        self._begin_session_close(session)
+    async def cleanup_session(self, session: _Session) -> None:
+        self.begin_session_close(session)
         if session.pump is not None and session.pump is not asyncio.current_task():
             try:
                 await asyncio.wait_for(
@@ -439,7 +438,7 @@ class CoordinatorSessions:
                 )
             except asyncio.TimeoutError as exc:
                 session.cleanup_error = session.error = exc
-                self._session_unavailable_stages.update(session.opened)
+                self.session_unavailable_stages.update(session.opened)
                 session.pump.cancel()
                 await asyncio.gather(session.pump, return_exceptions=True)
                 session.closed = True
@@ -450,43 +449,43 @@ class CoordinatorSessions:
         unconfirmed = list(session.opened)
         for owner in reversed(session.opened):
             try:
-                await self._session_command(session, "close", owner=owner)
+                await self.session_command(session, "close", owner=owner)
                 unconfirmed.pop()
             except Exception as exc:
                 session.cleanup_error = exc
                 session.error = session.error or exc
                 # An unacknowledged downstream owner may still use upstream data.
-                self._session_unavailable_stages.update(unconfirmed)
+                self.session_unavailable_stages.update(unconfirmed)
                 break
         session.closed = True
         session.output_wake.set()
         # Never reclaim capacity on an unacknowledged close: a worker may still
         # own buffers or be finishing a command. Worker teardown owns that case.
         if session.cleanup_error is None:
-            del self._sessions[session.ref.session_id]
+            del self.sessions[session.ref.session_id]
 
-    async def _shutdown_stage_sessions(self, selected: set[str] | None) -> None:
+    async def shutdown_stage_sessions(self, selected: set[str] | None) -> None:
         affected = set(self._stages) if selected is None else selected
-        self._session_unavailable_stages.update(affected)
+        self.session_unavailable_stages.update(affected)
         if selected is None:
-            await self._stop_sessions()
+            await self.stop_sessions()
         else:
             await asyncio.gather(
                 *(
-                    self._close_session_state(session)
-                    for session in list(self._sessions.values())
+                    self.close_session_state(session)
+                    for session in list(self.sessions.values())
                     if affected.intersection(session.stages)
                 )
             )
 
-    async def _stop_sessions(self) -> None:
-        self._sessions_stopping = True
+    async def stop_sessions(self) -> None:
+        self.sessions_stopping = True
         await asyncio.gather(
-            *(self._close_session_state(s) for s in list(self._sessions.values()))
+            *(self.close_session_state(s) for s in list(self.sessions.values()))
         )
-        await asyncio.gather(*self._session_cleanup_tasks, return_exceptions=True)
+        await asyncio.gather(*self.session_cleanup_tasks, return_exceptions=True)
 
-    async def _fail_sessions(self, message: str) -> None:
-        for session in list(self._sessions.values()):
+    async def fail_sessions(self, message: str) -> None:
+        for session in list(self.sessions.values()):
             session.error = RuntimeError(message)
-        await self._stop_sessions()
+        await self.stop_sessions()

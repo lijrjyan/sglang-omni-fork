@@ -8,6 +8,7 @@ from typing import Any, Literal
 import msgpack
 
 SESSION_METADATA_KEY = "omni_session"
+SessionOp = Literal["open", "append", "abort", "close"]
 
 
 @dataclass(frozen=True)

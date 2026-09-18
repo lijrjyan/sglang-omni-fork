@@ -25,7 +25,7 @@ async def test_timeout_cancel_noop_waits_before_close(tmp_path):
             OmniRequest(None, {"ignore_cancel": True, "delay": 0.3}),
             stages=["source", "sink"],
         )
-        coordinator._sessions[ref.session_id].limits = SessionLimits(
+        coordinator.sessions[ref.session_id].limits = SessionLimits(
             command_timeout_s=0.1
         )
         output = coordinator.session_outputs(ref)
@@ -33,7 +33,7 @@ async def test_timeout_cancel_noop_waits_before_close(tmp_path):
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(anext(output), 5)
         # Note (Junnan Li): A failed close retains the session reservation until worker teardown.
-        assert coordinator._sessions[ref.session_id].cleanup_error is not None
+        assert coordinator.sessions[ref.session_id].cleanup_error is not None
         await asyncio.sleep(0.4)
         log = []
         while not events.empty():
@@ -56,10 +56,10 @@ async def test_open_timeout_quarantines_and_worker_shutdown_releases(tmp_path):
                 session_id="slow-open",
                 limits=SessionLimits(command_timeout_s=0.08),
             )
-        assert coordinator._sessions["slow-open"].cleanup_error is not None
+        assert coordinator.sessions["slow-open"].cleanup_error is not None
         await asyncio.sleep(0.4)
         with pytest.raises(RuntimeError, match="capacity remains reserved"):
-            await coordinator.close_session(coordinator._sessions["slow-open"].ref)
+            await coordinator.close_session(coordinator.sessions["slow-open"].ref)
 
 
 @pytest.mark.asyncio
@@ -73,7 +73,7 @@ async def test_unconfirmed_owner_release_blocks_new_sessions(tmp_path, reason):
             OmniRequest(None, params), stages=["source", "sink"], session_id="held"
         )
         if reason == "pump_unresponsive":
-            coordinator._sessions["held"].limits = SessionLimits(command_timeout_s=0.1)
+            coordinator.sessions["held"].limits = SessionLimits(command_timeout_s=0.1)
             output = coordinator.session_outputs(ref)
             await coordinator.append_session(ref, chunk(0))
             with pytest.raises(TimeoutError):
@@ -82,7 +82,7 @@ async def test_unconfirmed_owner_release_blocks_new_sessions(tmp_path, reason):
         else:
             with pytest.raises(RuntimeError, match="cleanup incomplete"):
                 await coordinator.close_session(ref)
-        assert coordinator._sessions["held"].cleanup_error is not None
+        assert coordinator.sessions["held"].cleanup_error is not None
         with pytest.raises(ValueError, match="unavailable owner"):
             await coordinator.open_session(OmniRequest(None), stages=["source", "sink"])
         with pytest.raises(ValueError, match="already reserved"):
@@ -120,7 +120,7 @@ async def test_worker_failure_wakes_output_and_fails_session(tmp_path, monkeypat
         # Note (Junnan Li): The pump is parked on the unit's completion future; cleanup waits
         # for the pump, so request waiters must be failed before cleanup is entered.
         entered, release, _ = block_async_call(
-            monkeypatch, coordinator, "_cleanup_session", coordinator._cleanup_session
+            monkeypatch, coordinator, "cleanup_session", coordinator.cleanup_session
         )
         failing = asyncio.create_task(
             coordinator.fail_pending_requests("session worker exited")
@@ -145,10 +145,10 @@ async def test_public_subset_shutdown_closes_owners_despite_full_admission(tmp_p
         with pytest.raises(QueueFullError):
             await coordinator.open_session(OmniRequest(None), stages=["source", "sink"])
         await coordinator.shutdown_stages([])
-        assert len(coordinator._sessions) == 3
+        assert len(coordinator.sessions) == 3
         coordinator.max_in_flight = 0
         await coordinator.shutdown_stages(["sink"])
-        assert not coordinator._sessions
+        assert not coordinator.sessions
         assert processes[0].is_alive()
         await asyncio.to_thread(processes[1].join, 5)
         assert processes[1].exitcode == 0
@@ -201,10 +201,10 @@ async def test_output_overflow_closes_session(tmp_path):
             stages=["source", "sink"],
             limits=SessionLimits(max_output_chunks=1),
         )
-        state = coordinator._sessions[ref.session_id]
+        state = coordinator.sessions[ref.session_id]
         await coordinator.append_session(ref, chunk(0))
         async with asyncio.timeout(5):
-            while ref.session_id in coordinator._sessions:
+            while ref.session_id in coordinator.sessions:
                 await asyncio.sleep(0.01)
         assert isinstance(state.error, QueueFullError)
 
@@ -276,7 +276,7 @@ async def test_closing_rejects_input_before_cleanup(tmp_path, monkeypatch, trigg
         if trigger == "command_timeout":
             seam, original = "abort", coordinator.abort
         else:
-            seam, original = "_cleanup_session", coordinator._cleanup_session
+            seam, original = "cleanup_session", coordinator.cleanup_session
         entered, release, _ = block_async_call(monkeypatch, coordinator, seam, original)
         task = None
         if trigger == "close":
@@ -324,7 +324,7 @@ async def test_close_fences_queued_outputs(tmp_path):
         await coordinator.append_session(ref, chunk(0))
         first = await asyncio.wait_for(anext(output), 5)
         assert first.kind == "data"
-        session = coordinator._sessions[ref.session_id]
+        session = coordinator.sessions[ref.session_id]
         await coordinator.append_session(ref, chunk(1, eos=True))
         for _ in range(500):
             if session.outputs:

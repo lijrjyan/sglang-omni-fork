@@ -86,7 +86,7 @@ def test_stop_hands_cleanup_to_active_hook_completion(op):
         thread.join(5)
     assert not thread.is_alive() and not errors
     assert len(hooks.closed) == 1
-    assert not scheduler._sessions
+    assert not scheduler.sessions
     scheduler.stop()
     assert len(hooks.closed) == 1
 
@@ -97,7 +97,7 @@ def test_stop_after_last_hook_check_before_owner_unlock(op):
     scheduler = SessionScheduler(hooks)
     if op != "open":
         compute_registered(scheduler, command("open"))
-    target = scheduler._open_session if op == "open" else scheduler._compute_session
+    target = scheduler.open_session if op == "open" else scheduler.compute_session
     lines, first_line = inspect.getsourcelines(target)
     if op == "open":
         pause_line = max(
@@ -134,6 +134,6 @@ def test_stop_after_last_hook_check_before_owner_unlock(op):
         thread.join(5)
     assert not thread.is_alive() and not errors
     assert len(hooks.closed) == 1
-    assert not scheduler._sessions
+    assert not scheduler.sessions
     scheduler.stop()
     assert len(hooks.closed) == 1

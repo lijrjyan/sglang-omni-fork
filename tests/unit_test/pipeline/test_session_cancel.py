@@ -48,7 +48,7 @@ async def test_abort_keeps_queued_completion_receipt_but_drops_old_data(tmp_path
         assert (await asyncio.wait_for(anext(output), 5)).kind == "data"
         assert (await asyncio.wait_for(anext(output), 5)).kind == "input_done"
         await coordinator.append_session(ref, chunk(1))
-        session = coordinator._sessions[ref.session_id]
+        session = coordinator.sessions[ref.session_id]
         async with asyncio.timeout(5):
             while session.pending_count:
                 await asyncio.sleep(0.01)

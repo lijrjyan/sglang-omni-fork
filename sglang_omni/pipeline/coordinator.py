@@ -89,7 +89,7 @@ class Coordinator(CoordinatorSessions):
                 are already tracked. Intended as generation capacity
                 (max_running_requests + max_queued_requests).
         """
-        self._init_sessions(max_sessions)
+        self.init_sessions(max_sessions)
         self.entry_stage = entry_stage
         self._terminal_stages: set[str] = (
             set(terminal_stages) if terminal_stages else set()
@@ -152,7 +152,7 @@ class Coordinator(CoordinatorSessions):
 
     async def stop(self) -> None:
         """Stop the coordinator."""
-        await self._stop_sessions()
+        await self.stop_sessions()
         self._running = False
         self.control_plane.close()
         logger.info("Coordinator stopped")
@@ -179,12 +179,12 @@ class Coordinator(CoordinatorSessions):
         self._requests.clear()
         self._partial_results.clear()
         # Note (Junnan Li): Session pumps await request futures; wake them before waiting for cleanup.
-        await self._fail_sessions(message)
+        await self.fail_sessions(message)
 
     async def shutdown_stages(self, stage_names: Sequence[str] | None = None) -> None:
         """Send shutdown to registered stages, or only to *stage_names*."""
         selected = None if stage_names is None else set(stage_names)
-        await self._shutdown_stage_sessions(selected)
+        await self.shutdown_stage_sessions(selected)
         for name, info in self._stages.items():
             if selected is not None and name not in selected:
                 continue
@@ -753,7 +753,7 @@ class Coordinator(CoordinatorSessions):
     async def _handle_stream(self, msg: StreamMessage) -> None:
         """Handle a stream chunk from a stage."""
         request_id = msg.request_id
-        handler = self._session_stream_handlers.get(request_id)
+        handler = self.session_stream_handlers.get(request_id)
         if handler is not None:
             handler(msg)
             return
