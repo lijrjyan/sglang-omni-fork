@@ -27,6 +27,7 @@ from typing import Any, Callable
 import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -38,6 +39,7 @@ from sglang.srt.managers.scheduler import Scheduler as _Upstream
 from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.runtime_context import get_model, get_serving
+from sglang.srt.session.session_controller import SessionController
 from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.admission import QueueFullError
@@ -598,8 +600,6 @@ class OmniScheduler:
             enabled=False, table=None, n=0, k=0
         )
         from types import SimpleNamespace
-
-        from sglang.srt.session.session_controller import SessionController
 
         self.session_controller = SessionController(self.tree_cache)
         if self._session_adapter is not None:
@@ -1622,7 +1622,6 @@ class OmniScheduler:
     def _make_batch_result(mr_output):
         # process_batch_result reads reporting tokens. The next-forward GPU
         # token rail is independently published through FutureMap.
-        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
         # Note (wenyao): reuse the runner-staged pinned host copy so the mixin's
@@ -2405,15 +2404,12 @@ class OmniScheduler:
         self.chunked_req = None
         return len(retracted_reqs)
 
-    def flush_cache(self, empty_cache: bool = True):
+    def flush_cache(self, empty_cache: bool = True) -> bool:
         if self._session_bridge is not None and self._session_bridge.owners:
             return False
         return _Upstream.flush_cache(self, empty_cache=empty_cache)
 
     def _flush_cache_after_update(self) -> bool:
-        bridge = self._session_bridge
-        if bridge is not None and bridge.owners:
-            return False
         try:
             return bool(self.flush_cache())
         except Exception:

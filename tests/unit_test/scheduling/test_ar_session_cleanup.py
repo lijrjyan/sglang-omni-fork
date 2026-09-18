@@ -162,7 +162,7 @@ def test_failed_device_wait_retains_ownership_and_retries(bridge_env, case):
         else:
             assert pending is h.current
         assert h.bridge.requests["r"].unit.rid == "r"
-        assert h.bridge.requests["r"].unit.native_owned and h.inflight()
+        assert h.bridge.requests["r"].unit.req is not None and h.inflight()
         assert len(h.scheduler.session_controller.sessions) == 1
         if case.shutdown:
             assert h.events.count("resources") == 1

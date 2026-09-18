@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from array import array
 from dataclasses import asdict, dataclass
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
@@ -12,11 +12,11 @@ from sglang.srt.managers.io_struct import (
     SessionParams,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.profiler.event_recorder import get_active_stage
-from sglang_omni.proto import StagePayload
+from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     SESSION_METADATA_KEY,
     ResourceUsage,
@@ -28,6 +28,9 @@ from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import RequestOutput
 
+if TYPE_CHECKING:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
 
 class ARSessionAdapter:
     """Convert unit inputs and outputs without mutating native session state.
@@ -35,7 +38,7 @@ class ARSessionAdapter:
     Build from the relayed payload; only the entry stage consumes chunk.payload.
     """
 
-    def open(self, ref: SessionRef, request) -> None:
+    def open(self, ref: SessionRef, request: OmniRequest) -> None:
         """Initialize auxiliary model history after native session creation."""
 
     def close(self, ref: SessionRef) -> None:
@@ -68,8 +71,7 @@ class ARSessionAdapter:
 class _Unit:
     rid: str
     payload: StagePayload
-    req: object = None
-    native_owned: bool = False
+    req: Req | None = None
     enqueued: bool = False
     emitted_count: int = 0
     emitted_bytes: int = 0
@@ -84,7 +86,7 @@ class _Owner:
 class ARSessionBridge:
     """All methods run on the scheduler thread, including lifecycle commands."""
 
-    def __init__(self, scheduler, adapter: ARSessionAdapter):
+    def __init__(self, scheduler: "OmniScheduler", adapter: ARSessionAdapter) -> None:
         self.scheduler = scheduler
         self.adapter = adapter
         self.owners: dict[str, _Owner] = {}
@@ -106,7 +108,7 @@ class ARSessionBridge:
         return payload.request.metadata.get(SESSION_METADATA_KEY)
 
     @classmethod
-    def is_cleanup(cls, payload) -> bool:
+    def is_cleanup(cls, payload: StagePayload) -> bool:
         command = cls.metadata(payload)
         return command is not None and command.get("op") in {"abort", "close"}
 
@@ -174,14 +176,14 @@ class ARSessionBridge:
         owner.unit = _Unit(payload.request_id, payload)
         self.requests[payload.request_id] = owner
 
-    def build(self, payload):
+    def build(self, payload: StagePayload) -> SGLangARRequestData:
         owner = self.requests[payload.request_id]
         data = self.adapter.build(
             owner.ref, TimedChunk(**self.metadata(payload)["chunk"]), payload
         )
         return data
 
-    def finish_input(self, payload):
+    def finish_input(self, payload: StagePayload) -> StagePayload | None:
         owner = self.requests[payload.request_id]
         try:
             result = self.adapter.finish_input(owner.ref, payload)
@@ -192,7 +194,7 @@ class ARSessionBridge:
             self.complete(payload.request_id)
         return result
 
-    def materialize(self, payload, data: SGLangARRequestData) -> None:
+    def materialize(self, payload: StagePayload, data: SGLangARRequestData) -> None:
         self._drain()
         owner = self.requests[payload.request_id]
         old = data.req
@@ -209,27 +211,6 @@ class ARSessionBridge:
                 "history-aware session embedding and multimodal inputs are not supported"
             )
         native = self.scheduler.session_controller.get(self.native_id(owner.ref))
-        fields = {
-            name: getattr(old, name)
-            for name in (
-                "stream",
-                "return_logprob",
-                "return_sampling_mask",
-                "lora_id",
-                "custom_logit_processor",
-                "require_reasoning",
-                "return_hidden_states",
-                "return_routed_experts",
-                "routed_experts_start_len",
-                "priority",
-                "routing_key",
-                "extra_key",
-                "cache_salt",
-                "http_worker_ipc",
-            )
-        }
-        fields["top_logprobs_num"] = old.logprob.top_logprobs_num
-        fields["token_ids_logprob"] = old.logprob.token_ids_logprob
         tokenized = TokenizedGenerateReqInput(
             rid=old.rid,
             input_text=None,
@@ -240,7 +221,22 @@ class ARSessionBridge:
             sampling_params=old.sampling_params,
             logprob_start_len=old.logprob_start_len,
             session_params=SessionParams(id=native.session_id),
-            **fields,
+            stream=old.stream,
+            return_logprob=old.return_logprob,
+            return_sampling_mask=old.return_sampling_mask,
+            lora_id=old.lora_id,
+            custom_logit_processor=old.custom_logit_processor,
+            require_reasoning=old.require_reasoning,
+            return_hidden_states=old.return_hidden_states,
+            return_routed_experts=old.return_routed_experts,
+            routed_experts_start_len=old.routed_experts_start_len,
+            priority=old.priority,
+            routing_key=old.routing_key,
+            extra_key=old.extra_key,
+            cache_salt=old.cache_salt,
+            http_worker_ipc=old.http_worker_ipc,
+            top_logprobs_num=old.logprob.top_logprobs_num,
+            token_ids_logprob=old.logprob.token_ids_logprob,
         )
         req = native.create_req(
             tokenized,
@@ -251,7 +247,6 @@ class ARSessionBridge:
         if req.to_finish is not None:
             raise ValueError("native session rejected append")
         owner.unit.req = req
-        owner.unit.native_owned = True
         req.logprob_start_len = old.logprob_start_len
         req._omni_prompt_cache_key = getattr(old, "_omni_prompt_cache_key", None)
         data.req = req
@@ -262,7 +257,7 @@ class ARSessionBridge:
         if owner is None:
             return
         native = self.scheduler.session_controller.get(self.native_id(owner.ref))
-        if native is not None and owner.unit.native_owned:
+        if native is not None and owner.unit.req is not None:
             native.abort_req()
         owner.unit = None
 
@@ -278,16 +273,14 @@ class ARSessionBridge:
                 self.scheduler.abort(rid)
                 self.rollback(rid)
                 return
-            queued = req is not None and any(
-                r is req for r in self.scheduler.waiting_queue
-            )
+            queued = any(r is req for r in self.scheduler.waiting_queue)
             if queued:
                 # Note (Junnan Li): Failed prefill admission may have restored the prior slot.
                 req.detach_kv()
                 req.session = None
             self.scheduler.abort(rid)
             self._drain()
-            if req is not None and not queued:
+            if not queued:
                 req.finished_reason = FINISH_ABORT()
                 self.scheduler._release_request_kv_cache(req)
                 # Note (Junnan Li): Removing only reqs would misalign batch tensors;
@@ -345,10 +338,17 @@ class ARSessionBridge:
             return "session KV capacity exhausted"
         return None
 
-    def result(self, rid, data):
+    def result(self, rid: str, data: SGLangARRequestData) -> StagePayload:
         return self.adapter.result(self.requests[rid].ref, data)
 
-    def messages(self, rid, data, output=None, *, flush=False):
+    def messages(
+        self,
+        rid: str,
+        data: SGLangARRequestData,
+        output: RequestOutput | None = None,
+        *,
+        flush: bool = False,
+    ) -> Iterable[OutgoingMessage]:
         unit = self.requests[rid].unit
         stages = self.metadata(unit.payload)["stages"]
         if get_active_stage() != stages[-1]:
@@ -373,7 +373,7 @@ class ARSessionBridge:
                 metadata={"modality": chunk.modality},
             )
 
-    def complete(self, rid):
+    def complete(self, rid: str) -> None:
         owner = self.requests.pop(rid, None)
         if owner is not None:
             owner.unit = None
@@ -401,7 +401,7 @@ class ARSessionBridge:
             kv_tokens=tokens, slots={"request": 1}, bytes=tokens * token_bytes
         )
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         for owner in list(self.owners.values()):
             if owner.unit is not None:
                 self.scheduler.abort(owner.unit.rid)

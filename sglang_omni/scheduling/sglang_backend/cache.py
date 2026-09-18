@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.runtime_context import get_memory, get_schedule, get_serving
+from sglang.srt.session.streaming_session import StreamingSession
 
 from sglang_omni.scheduling.sglang_backend.evict_heap_radix_cache import (
     EvictHeapRadixCache,
@@ -45,7 +46,5 @@ def create_tree_cache(
         get_serving().enable_streaming_session
         and not cache.supports_streaming_session()
     ):
-        from sglang.srt.session.streaming_session import StreamingSession
-
         cache = StreamingSession(cache)
     return cache
