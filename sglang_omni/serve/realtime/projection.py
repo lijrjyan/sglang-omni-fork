@@ -154,7 +154,6 @@ def project_control(event: ControlEvent) -> JsonObject:
             type="session.closed",
             reason=event.reason,
             client_event_id=event.client_event_id,
-            held=dict(kv_tokens=0, slots={}, bytes=0),
         )
     else:
         names = {
