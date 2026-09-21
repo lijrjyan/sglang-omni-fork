@@ -70,8 +70,6 @@ class SharedRealtimeSession:
 
     async def send(self) -> None:
         async for envelope in self.runtime.outputs():
-            if envelope.epoch != self.runtime.epoch and not envelope.control:
-                continue
             if isinstance(envelope.event, CONTROL_EVENT_TYPES):
                 event = project_control(cast(ControlEvent, envelope.event))
             else:
@@ -84,10 +82,9 @@ class SharedRealtimeSession:
                     ),
                 )
             event["event_id"] = "evt_" + uuid.uuid4().hex
-            metadata = cast(JsonObject, event.setdefault("sglang", {}))
-            metadata["epoch"] = envelope.epoch
             if envelope.unit is not None:
                 unit = envelope.unit
+                metadata = cast(JsonObject, event.setdefault("sglang", {}))
                 metadata.update(
                     unit_id=f"unit_{unit.seq}",
                     chunk_seq=envelope.chunk_seq,
@@ -176,8 +173,6 @@ class SharedRealtimeSession:
             await self.runtime.clear(event.event_id)
         elif event.type == "sglang.input_audio.end":
             await self.runtime.end(event.event_id)
-        elif event.type == "response.cancel":
-            await self.runtime.cancel(event.event_id)
         elif event.type == "session.close":
             await self.runtime.close("client_closed", event.event_id)
         else:

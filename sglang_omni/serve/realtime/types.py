@@ -50,7 +50,6 @@ class Capabilities:
     output_modalities: tuple[str, ...] = ("text",)
     native_unit_ms: int = 20
     tail_policy: TailPolicy = "flush"
-    cancel_is_noop: bool = False
     partial_style: PartialStyle = "append_only"
 
     def __post_init__(self) -> None:
@@ -84,7 +83,6 @@ class Capabilities:
             microturn_ms="variable",
             tail_policy=self.tail_policy,
             supports_server_interrupt=False,
-            cancel_is_noop=self.cancel_is_noop,
             supports_truncate=False,
             supports_resume=False,
             partial_style=self.partial_style,
@@ -105,9 +103,8 @@ class Unit:
 
 @dataclass(frozen=True)
 class Envelope:
-    epoch: int
     event: OutputEvent | ControlEvent
-    # Note (Junnan Li): Control acknowledgements and response terminals survive an epoch advance.
+    # Note (Junnan Li): Control acknowledgements and response terminals survive the purge at close.
     control: bool = False
     unit: Unit | None = None
     chunk_seq: int = 0
@@ -116,7 +113,7 @@ class Envelope:
 
 class OutputSink(Protocol):
     def __call__(
-        self, event: OutputEvent, epoch: int, unit: Unit | None = None
+        self, event: OutputEvent, unit: Unit | None = None
     ) -> Awaitable[None]: ...
 
 
@@ -131,14 +128,11 @@ class InteractionAdapter:
     ) -> None:
         raise NotImplementedError
 
-    async def process(self, unit: Unit, epoch: int) -> int | tuple[int, int]:
+    async def process(self, unit: Unit) -> int | tuple[int, int]:
         raise NotImplementedError
 
     async def clear(self) -> int:
         return 0
-
-    async def cancel(self) -> None:
-        raise NotImplementedError
 
     async def close(self) -> None:
         raise NotImplementedError

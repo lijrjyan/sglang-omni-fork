@@ -6,7 +6,6 @@ from typing import cast
 
 from sglang_omni.serve.realtime.control import (
     Accepted,
-    Cancelled,
     Cleared,
     Closed,
     ControlEvent,
@@ -161,11 +160,8 @@ def project_control(event: ControlEvent) -> JsonObject:
             Cleared: "input_audio_buffer.cleared",
             Ended: "sglang.input_audio.ended",
             Drained: "sglang.input_audio.drained",
-            Cancelled: "sglang.response.cancelled",
         }
         result = dict(type=names[type(event)], **asdict(event))
         if isinstance(event, Cleared):
             result["sglang"] = dict(discarded_ms=result.pop("discarded_ms"))
-        elif isinstance(event, Cancelled):
-            result["input_policy"] = "preserve"
         return result

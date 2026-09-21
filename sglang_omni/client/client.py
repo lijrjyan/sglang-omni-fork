@@ -67,9 +67,6 @@ class Client:
     def session_outputs(self, ref: SessionRef) -> AsyncIterator[OutputChunk]:
         return self._coordinator.session_outputs(ref)
 
-    async def abort_session(self, ref: SessionRef) -> SessionRef:
-        return await self._coordinator.abort_session(ref)
-
     async def close_session(self, ref: SessionRef) -> None:
         return await self._coordinator.close_session(ref)
 

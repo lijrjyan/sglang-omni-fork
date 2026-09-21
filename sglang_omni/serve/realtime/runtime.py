@@ -13,7 +13,6 @@ from typing import Literal, cast
 
 from sglang_omni.serve.realtime.control import (
     Accepted,
-    Cancelled,
     Cleared,
     Closed,
     ControlEvent,
@@ -59,7 +58,6 @@ class SessionRuntime:
         )
         self.adapter: InteractionAdapter | None = None
         self.state: Literal["CREATED", "OPEN", "CLOSING", "CLOSED"] = "CREATED"
-        self.epoch = 0
         self.config: SessionConfiguration = {}
         self.granted: GrantedCapabilities = {}
         self.next_seq = 0
@@ -81,7 +79,7 @@ class SessionRuntime:
         )
 
     def notify(self, event: ControlEvent) -> None:
-        self.output_buffer.enqueue(Envelope(self.epoch, event, True))
+        self.output_buffer.enqueue(Envelope(event, True))
 
     def created(self) -> None:
         self.notify(
@@ -104,15 +102,11 @@ class SessionRuntime:
                 self.output_buffer.output_wake.clear()
                 await self.output_buffer.output_wake.wait()
 
-    async def emit(
-        self, event: OutputEvent, epoch: int, unit: Unit | None = None
-    ) -> None:
+    async def emit(self, event: OutputEvent, unit: Unit | None = None) -> None:
         if self.state != "OPEN":
             return
         elif isinstance(event, TurnFailure):
             self.fail(event.message, event.code)
-        elif epoch != self.epoch:
-            return
         else:
             unit = unit or self.producer_unit.get()
             modalities = (
@@ -122,7 +116,7 @@ class SessionRuntime:
                     "output_modalities", self.capabilities.output_modalities
                 )
             )
-            self.output_buffer.emit(event, epoch, unit, modalities)
+            self.output_buffer.emit(event, unit, modalities)
 
     def ms(self, samples: int) -> float:
         return samples * 1000 / self.capabilities.input_rate
@@ -286,9 +280,8 @@ class SessionRuntime:
                         tuple(self.granted["output_modalities"]),
                     )
                     self.unit_seq += 1
-                    epoch = self.epoch
                 self.producer_unit.set(unit)
-                consumed = await self.adapter.process(unit, epoch)
+                consumed = await self.adapter.process(unit)
                 if isinstance(consumed, tuple):
                     consumed, discarded = consumed
                 else:
@@ -306,9 +299,9 @@ class SessionRuntime:
                     )
                 self.consumed_samples += consumed
                 self.discarded_samples += discarded
-                if self.close_task is None and epoch == self.epoch:
+                if self.close_task is None:
                     self.output_buffer.enqueue(
-                        Envelope(epoch, UnitCompleted(f"unit_{unit.seq}"), unit=unit)
+                        Envelope(UnitCompleted(f"unit_{unit.seq}"), unit=unit)
                     )
                 if eos:
                     if self.close_task is not None:
@@ -333,26 +326,12 @@ class SessionRuntime:
             logger.exception(f"Realtime session {self.session_id} input pump failed")
             self.fail(str(exc))
 
-    async def cancel(self, event_id: str | None) -> int:
-        async with self.lock:
-            self.require_open()
-            old = self.epoch
-            self.epoch += 1
-            assert self.adapter is not None
-            await asyncio.wait_for(self.adapter.cancel(), self.limits.cleanup_timeout_s)
-            affected = self.output_buffer.finish_responses(
-                old, "cancelled", "client_cancelled"
-            )
-            self.notify(Cancelled(old, self.epoch, tuple(affected), event_id))
-            return self.epoch
-
     def fail(
         self, message: str, code: str = "internal", event_id: str | None = None
     ) -> None:
         if self.close_task is None:
             self.output_buffer.terminal(
-                Failure(code, message[:MAX_FAILURE_MESSAGE_CHARS], True, event_id),
-                self.epoch,
+                Failure(code, message[:MAX_FAILURE_MESSAGE_CHARS], True, event_id)
             )
             self.close_task = asyncio.create_task(self.run_close(code))
 
@@ -369,8 +348,6 @@ class SessionRuntime:
         await self.close_state(reason, event_id)
 
     async def close_state(self, reason: str, event_id: str | None = None) -> None:
-        old_epoch = self.epoch
-        self.epoch += 1
         self.discarded_samples += len(self.pending) // 2
         self.pending.clear()
         self.wake.set()
@@ -397,8 +374,7 @@ class SessionRuntime:
                         str(cleanup_error)[:MAX_FAILURE_MESSAGE_CHARS],
                         True,
                         event_id,
-                    ),
-                    self.epoch,
+                    )
                 )
             else:
                 status: ResponseStatus = (
@@ -406,8 +382,8 @@ class SessionRuntime:
                     if reason in ("client_closed", "disconnect")
                     else "failed"
                 )
-                self.output_buffer.finish_responses(old_epoch, status, reason)
-                self.output_buffer.terminal(Closed(reason, event_id), self.epoch)
+                self.output_buffer.finish_responses(status, reason)
+                self.output_buffer.terminal(Closed(reason, event_id))
         finally:
             self.state = "CLOSED"
             self.output_buffer.output_wake.set()

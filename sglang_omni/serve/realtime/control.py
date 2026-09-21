@@ -56,14 +56,6 @@ class Drained:
 
 
 @dataclass(frozen=True)
-class Cancelled:
-    old_epoch: int
-    epoch: int
-    response_ids: tuple[str, ...]
-    client_event_id: str | None
-
-
-@dataclass(frozen=True)
 class Closed:
     reason: str
     client_event_id: str | None = None
@@ -90,7 +82,6 @@ ControlEvent = (
     | Cleared
     | Ended
     | Drained
-    | Cancelled
     | Closed
     | Failure
     | UnitCompleted

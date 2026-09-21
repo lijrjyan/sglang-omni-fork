@@ -86,7 +86,6 @@ class GrantedCapabilities(TypedDict, total=False):
     microturn_ms: str | float | None
     tail_policy: TailPolicy
     supports_server_interrupt: bool
-    cancel_is_noop: bool
     supports_truncate: bool
     supports_resume: bool
     partial_style: PartialStyle
@@ -134,7 +133,6 @@ class SessionCommandEvent(ClientEvent):
     type: Literal[
         "input_audio_buffer.clear",
         "sglang.input_audio.end",
-        "response.cancel",
         "session.close",
         "input_audio_buffer.commit",
         "response.create",

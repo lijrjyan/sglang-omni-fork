@@ -22,7 +22,6 @@ from sglang_omni.serve.realtime.types import Envelope, RuntimeLimits, Unit
 
 @dataclass(kw_only=True)
 class ResponseState:
-    epoch: int
     output_modalities: tuple[str, ...]
     terminal: bool
     visible: bool
@@ -58,7 +57,6 @@ class OutputBuffer:
     def emit(
         self,
         event: OutputEvent,
-        epoch: int,
         unit: Unit | None,
         output_modalities: tuple[str, ...],
     ) -> None:
@@ -76,7 +74,6 @@ class OutputBuffer:
             if rid in self.responses:
                 raise RuntimeError("duplicate response creation")
             self.responses[event.response_id] = ResponseState(
-                epoch=epoch,
                 output_modalities=modalities,
                 terminal=False,
                 visible=False,
@@ -116,7 +113,6 @@ class OutputBuffer:
                 state.terminal = True
         self.enqueue(
             Envelope(
-                epoch,
                 event,
                 unit=unit,
                 chunk_seq=self.output_seq,
@@ -125,17 +121,13 @@ class OutputBuffer:
         )
         self.output_seq += 1
 
-    def finish_responses(
-        self, old: int, status: ResponseStatus, reason: str
-    ) -> list[str]:
-        affected = []
+    def finish_responses(self, status: ResponseStatus, reason: str) -> None:
         for rid, state in list(self.responses.items()):
-            if state.epoch != old or state.terminal_sent:
+            if state.terminal_sent:
                 continue
             elif not state.visible:
                 del self.responses[rid]
                 continue
-            affected.append(rid)
             state.terminal = True
             item_id = state.item_id or "item_" + rid
             events: list[OutputEvent] = []
@@ -150,7 +142,6 @@ class OutputBuffer:
             )
             for event in events:
                 envelope = Envelope(
-                    old,
                     event,
                     True,
                     output_modalities=tuple(state.output_modalities),
@@ -159,10 +150,9 @@ class OutputBuffer:
                 self.output.append((envelope, size))
                 self.output_bytes += size
             self.output_wake.set()
-        return affected
 
     def before_send(self, envelope: Envelope) -> None:
-        """Cancellation must observe lifecycle visibility before the socket send yields."""
+        """Close must observe lifecycle visibility before the socket send yields."""
         event = envelope.event
         if isinstance(event, ResponseStarted):
             self.responses[event.response_id].visible = True
@@ -182,7 +172,7 @@ class OutputBuffer:
         elif isinstance(event, Closed):
             self.responses.clear()
 
-    def terminal(self, event: Failure | Closed, epoch: int) -> None:
+    def terminal(self, event: Failure | Closed) -> None:
         # Note (Junnan Li): Terminal notifications must remain deliverable after media overflow.
         terminals = [
             (env, size)
@@ -197,7 +187,7 @@ class OutputBuffer:
         ]
         self.output = deque(terminals)
         self.output_bytes = sum(size for _, size in self.output)
-        envelope = Envelope(epoch, event, True)
+        envelope = Envelope(event, True)
         size = len(repr(envelope).encode())
         self.output.append((envelope, size))
         self.output_bytes += size

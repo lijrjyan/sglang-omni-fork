@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class CoordinatorAdapter(InteractionAdapter):
-    """Publish output after unit success; cancel preserves its consumption receipt."""
+    """Publish output after unit success."""
 
     def __init__(
         self,
@@ -53,7 +53,6 @@ class CoordinatorAdapter(InteractionAdapter):
         self.buffer: list[OutputEvent] = []
         self.buffer_bytes = 0
         self.emit: OutputSink | None = None
-        self.epoch = 0
         self.reader_error: Exception | None = None
         self.closing = False
 
@@ -75,19 +74,17 @@ class CoordinatorAdapter(InteractionAdapter):
     async def read(self) -> None:
         assert self.ref is not None and self.emit is not None
         try:
-            # Note (Junnan Li): Keep the output iterator across abort; closing it closes the coordinator session.
             async for output in self.client.session_outputs(self.ref):
                 if self.active is None or output.input_seq != self.active.seq:
                     continue
                 if output.kind == "input_done":
-                    if output.ref.epoch == self.epoch:
-                        for event in self.buffer:
-                            await self.emit(event, self.epoch, self.active)
+                    for event in self.buffer:
+                        await self.emit(event, self.active)
                     self.buffer.clear()
                     self.buffer_bytes = 0
                     if self.future is not None and not self.future.done():
                         self.future.set_result(self.active.real_samples)
-                elif output.ref.epoch == self.epoch:
+                else:
                     for event in self.convert(output):
                         size = len(repr(event).encode())
                         if (
@@ -105,16 +102,13 @@ class CoordinatorAdapter(InteractionAdapter):
             if self.future is not None and not self.future.done():
                 self.future.set_exception(exc)
             else:
-                await self.emit(
-                    TurnFailure("server_error", "internal", str(exc)), self.epoch
-                )
+                await self.emit(TurnFailure("server_error", "internal", str(exc)))
 
-    async def process(self, unit: Unit, epoch: int) -> int:
+    async def process(self, unit: Unit) -> int:
         assert self.ref is not None
         if self.reader_error is not None:
             raise self.reader_error
         self.active = unit
-        self.epoch = epoch
         self.future = asyncio.get_running_loop().create_future()
         chunk = TimedChunk(
             "audio",
@@ -133,24 +127,6 @@ class CoordinatorAdapter(InteractionAdapter):
             self.future = None
             self.buffer.clear()
             self.buffer_bytes = 0
-
-    async def cancel(self) -> None:
-        assert self.ref is not None
-        # Note (Junnan Li): The coordinator still completes the unit and preserves its receipt.
-        future = self.future
-        self.ref = await self.client.abort_session(self.ref)
-        if future is not None:
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(future), self.local_cleanup_timeout
-                )
-            except asyncio.TimeoutError as exc:
-                raise RuntimeError(
-                    "completed unit consumption receipt is missing"
-                ) from exc
-        self.epoch = self.ref.epoch
-        self.buffer.clear()
-        self.buffer_bytes = 0
 
     async def close(self) -> None:
         self.closing = True
