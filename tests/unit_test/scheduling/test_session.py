@@ -3,7 +3,7 @@
 
 import queue
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 import msgpack
 import pytest
@@ -31,22 +31,29 @@ from tests.unit_test.fixtures.session_pipeline import (
 )
 
 
-class Hooks(SessionHooks):
-    def __init__(self, name, events):
-        self.name, self.events = name, events
+@dataclass
+class RecordedState:
+    session_id: str
+    byte_count: int = 0
 
-    def open(self, ref, request):
+
+class Hooks(SessionHooks[RecordedState]):
+    def __init__(self, name: str, events: queue.Queue[tuple[object, ...]]) -> None:
+        self.name = name
+        self.events = events
+
+    def open(self, ref: SessionRef, request: OmniRequest) -> RecordedState:
         self.events.put(("open", self.name, ref.session_id))
-        return {"id": ref.session_id}
+        return RecordedState(ref.session_id)
 
-    def close(self, state):
-        self.events.put(("close", self.name, state["id"]))
+    def close(self, state: RecordedState) -> None:
+        self.events.put(("close", self.name, state.session_id))
 
 
 def test_open_usage_failure_releases_state():
 
     class BrokenUsage(Hooks):
-        def usage(self, state):
+        def usage(self, state: RecordedState) -> ResourceUsage:
             raise RuntimeError("usage failed")
 
     events = queue.Queue()
@@ -63,11 +70,11 @@ def test_open_usage_failure_releases_state():
 def test_stage_capacity_is_aggregate():
 
     class SizedHooks(Hooks):
-        def open(self, ref, request):
-            return {"id": ref.session_id, "bytes": 2}
+        def open(self, ref: SessionRef, request: OmniRequest) -> RecordedState:
+            return RecordedState(ref.session_id, byte_count=2)
 
-        def usage(self, state):
-            return ResourceUsage(bytes=state["bytes"])
+        def usage(self, state: RecordedState) -> ResourceUsage:
+            return ResourceUsage(bytes=state.byte_count)
 
     events = queue.Queue()
     scheduler = SessionScheduler(SizedHooks("source", events), max_state_bytes=3)
@@ -114,7 +121,7 @@ def test_malformed_command_fails_inside_the_request_boundary():
 @pytest.mark.parametrize("configured", [False, True])
 def test_ordinary_request_uses_handler_or_reports_scoped_error(configured):
 
-    def compute(payload):
+    def compute(payload: StagePayload) -> StagePayload:
         payload.data = {"ordinary": True}
         return payload
 
@@ -179,7 +186,7 @@ class BlockingHooks(Hooks):
 
     def append(
         self,
-        state: object,
+        state: RecordedState,
         chunk: TimedChunk,
         payload: StagePayload,
         context: SessionContext,
@@ -303,8 +310,14 @@ def test_close_runs_after_its_request_is_aborted():
 def test_command_finished_by_abort_before_running_does_not_wait():
 
     class AppendHooks(Hooks):
-        def append(self, state, chunk, payload, context):
-            self.events.put(("append", self.name, state["id"]))
+        def append(
+            self,
+            state: RecordedState,
+            chunk: TimedChunk,
+            payload: StagePayload,
+            context: SessionContext,
+        ) -> StagePayload:
+            self.events.put(("append", self.name, state.session_id))
             return payload
 
     events = queue.Queue()

@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Multiprocess stage fixture with synthetic session hooks."""
+"""Multiprocess stage fixture with synthetic session hooks.
+
+Linear topologies are reused across tests. A test that stops a worker starts its own.
+"""
 
 from __future__ import annotations
 
@@ -7,13 +10,14 @@ import asyncio
 import logging
 import multiprocessing
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from multiprocessing.context import SpawnProcess
 from multiprocessing.queues import Queue
 from multiprocessing.synchronize import Event
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Literal, ParamSpec, Protocol, TypedDict, TypeVar
 
 import pytest
 
@@ -26,11 +30,13 @@ from sglang_omni.config.schema import (
 from sglang_omni.config.topology import compile_logical_processes
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.pipeline.replicas import expand_replica_stages
+from sglang_omni.pipeline.stage_workers import StageLaunchConfig
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     SESSION_METADATA_KEY,
     ResourceUsage,
     SessionCommand,
+    SessionCommandDict,
     SessionOp,
     SessionRef,
     TimedChunk,
@@ -42,10 +48,9 @@ from sglang_omni.scheduling.session import (
     SessionScheduler,
 )
 
-if TYPE_CHECKING:
-    from sglang_omni.pipeline.stage_workers import StageLaunchConfig
-
-State = dict[str, Any]
+CallParams = ParamSpec("CallParams")
+CallResult = TypeVar("CallResult")
+SchedulerStateT = TypeVar("SchedulerStateT")
 REPLICA_COUNT = 2
 EVENT_POLL_TIMEOUT_S = 1
 OwnerEvent = tuple[Literal["open", "close", "finished", "cancelled"], str, str]
@@ -53,70 +58,135 @@ AppendEvent = tuple[Literal["append"], str, str, int]
 StageEvent = OwnerEvent | AppendEvent
 
 
-class Hooks(SessionHooks):
-    def __init__(self, name: str, events: Queue) -> None:
-        self.name, self.events = name, events
+class SessionMetadata(TypedDict):
+    omni_session: SessionCommandDict
 
-    def open(self, ref: SessionRef, request: OmniRequest) -> State:
+
+@dataclass
+class HookState:
+    session_id: str
+    count: int
+    open_delay_s: float
+    fail_open_stage: str | None
+    emit_every: int
+    cadence: int
+    should_ignore_cancel: bool
+    delay_s: float
+    fail_close_once_stage: str | None
+
+
+def number_param(params: Mapping[str, object], key: str, default: float) -> float:
+    value = params.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{key} must be a number")
+    return float(value)
+
+
+def integer_param(params: Mapping[str, object], key: str, default: int) -> int:
+    value = params.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{key} must be an integer")
+    return value
+
+
+def text_param(params: Mapping[str, object], key: str) -> str | None:
+    value = params.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be a string")
+    return value
+
+
+def read_hook_state(ref: SessionRef, request: OmniRequest) -> HookState:
+    params: dict[str, object] = {}
+    for key, value in request.params.items():
+        if not isinstance(key, str):
+            raise TypeError("param names must be strings")
+        params[key] = value
+    should_ignore_cancel = params.get("ignore_cancel", False)
+    if not isinstance(should_ignore_cancel, bool):
+        raise TypeError("ignore_cancel must be a boolean")
+    return HookState(
+        session_id=ref.session_id,
+        count=0,
+        open_delay_s=number_param(params, "open_delay", 0),
+        fail_open_stage=text_param(params, "fail_open"),
+        emit_every=integer_param(params, "emit_every", 1),
+        cadence=integer_param(params, "cadence", 1),
+        should_ignore_cancel=should_ignore_cancel,
+        delay_s=number_param(params, "delay", 0),
+        fail_close_once_stage=text_param(params, "fail_close_once"),
+    )
+
+
+class Hooks(SessionHooks[HookState]):
+    def __init__(self, name: str, events: Queue[StageEvent]) -> None:
+        self.name = name
+        self.events = events
+
+    def open(self, ref: SessionRef, request: OmniRequest) -> HookState:
+        state = read_hook_state(ref, request)
         self.events.put(("open", self.name, ref.session_id))
-        time.sleep(request.params.get("open_delay", 0))
-        if request.params.get("fail_open") == self.name:
+        time.sleep(state.open_delay_s)
+        if state.fail_open_stage == self.name:
             raise RuntimeError("open failed")
-        return {"id": ref.session_id, "n": 0, "params": request.params}
+        return state
 
     def append(
         self,
-        state: State,
+        state: HookState,
         chunk: TimedChunk,
         payload: StagePayload,
         context: SessionContext,
     ) -> StagePayload:
         import torch
 
-        self.events.put(("append", self.name, state["id"], chunk.seq))
-        state["n"] += 1
+        self.events.put(("append", self.name, state.session_id, chunk.seq))
+        state.count += 1
         logical_name = self.name.partition(REPLICA_SEPARATOR)[0]
         if logical_name == "source":
-            payload.data = {"tensor": torch.tensor([state["n"]])}
+            payload.data = {"tensor": torch.tensor([state.count])}
         elif logical_name == "middle":
-            assert payload.data["tensor"].item() == state["n"]
+            assert payload.data["tensor"].item() == state.count
         else:
-            assert payload.data["tensor"].item() == state["n"]
-            if state["n"] % state["params"].get("emit_every", 1) and not chunk.eos:
-                payload.data = {"count": state["n"]}
+            assert payload.data["tensor"].item() == state.count
+            if state.count % state.emit_every and not chunk.eos:
+                payload.data = {"count": state.count}
                 return payload
-            cadence = state["params"].get("cadence", 1)
-            for i in range(cadence):
-                if state["params"].get("ignore_cancel"):
-                    time.sleep(state["params"].get("delay", 0))
-                    self.events.put(("finished", self.name, state["id"]))
-                elif context.cancelled.wait(state["params"].get("delay", 0)):
-                    self.events.put(("cancelled", self.name, state["id"]))
+            for index in range(state.cadence):
+                if state.should_ignore_cancel:
+                    time.sleep(state.delay_s)
+                    self.events.put(("finished", self.name, state.session_id))
+                elif context.cancelled.wait(state.delay_s):
+                    self.events.put(("cancelled", self.name, state.session_id))
                     break
                 context.emit(
                     TimedChunk(
                         "text",
                         chunk.t_start_ms,
                         0,
-                        i,
-                        {"count": state["n"], "index": i},
-                        eos=chunk.eos and i == cadence - 1,
+                        index,
+                        {"count": state.count, "index": index},
+                        eos=chunk.eos and index == state.cadence - 1,
                     )
                 )
-            payload.data = {"count": state["n"]}
+            payload.data = {"count": state.count}
         return payload
 
-    def close(self, state: State) -> None:
-        self.events.put(("close", self.name, state["id"]))
-        if state["params"].get("fail_close_once") == self.name:
-            state["params"]["fail_close_once"] = None
+    def close(self, state: HookState) -> None:
+        self.events.put(("close", self.name, state.session_id))
+        if state.fail_close_once_stage == self.name:
+            state.fail_close_once_stage = None
             raise RuntimeError("close rejected")
 
-    def usage(self, state: State) -> ResourceUsage:
-        return ResourceUsage(bytes=state["n"])
+    def usage(self, state: HookState) -> ResourceUsage:
+        return ResourceUsage(bytes=state.count)
 
 
-def make_session_scheduler(name: str, events: Queue) -> SessionScheduler:
+def make_session_scheduler(
+    name: str, events: Queue[StageEvent]
+) -> SessionScheduler[HookState]:
     return SessionScheduler(Hooks(name, events))
 
 
@@ -141,9 +211,7 @@ async def pipeline(
     replicated: bool = False,
     replicate_entry: bool = False,
     list_next: bool = False,
-) -> AsyncIterator[tuple[Coordinator, Queue, list[SpawnProcess]]]:
-    from sglang_omni.pipeline.stage_workers import StageLaunchConfig
-
+) -> AsyncIterator[tuple[Coordinator, Queue[StageEvent], list[SpawnProcess]]]:
     ctx = multiprocessing.get_context("spawn")
     names = ["source", "middle", "sink"] if stage_count == 3 else ["source", "sink"]
     stages = []
@@ -225,7 +293,7 @@ async def pipeline(
 
 def command_metadata(
     op: SessionOp, ref: SessionRef, chunk: TimedChunk | None = None
-) -> dict[str, Any]:
+) -> SessionMetadata:
     command = SessionCommand(
         op=op,
         ref=ref,
@@ -239,22 +307,37 @@ def chunk(seq: int, eos: bool = False) -> TimedChunk:
     return TimedChunk("audio", seq * 20, 20, seq, b"pcm", eos=eos)
 
 
-def event_log(events: Queue) -> list[StageEvent]:
+PipelineResources = tuple[Coordinator, Queue[StageEvent], list[SpawnProcess]]
+
+
+def event_log(events: Queue[StageEvent]) -> list[StageEvent]:
     stage_events: list[StageEvent] = []
     while not events.empty():
         stage_events.append(events.get(timeout=EVENT_POLL_TIMEOUT_S))
     return stage_events
 
 
+class AsyncCall(Protocol[CallParams, CallResult]):
+    def __call__(
+        self, *args: CallParams.args, **kwargs: CallParams.kwargs
+    ) -> Awaitable[CallResult]: ...
+
+
+class Condition(Protocol):
+    def __call__(self) -> bool: ...
+
+
 def block_async_call(
     monkeypatch: pytest.MonkeyPatch,
     obj: object,
     name: str,
-    original: Callable[..., Awaitable[Any]],
+    original: AsyncCall[CallParams, CallResult],
 ) -> tuple[asyncio.Event, asyncio.Event, asyncio.Event]:
     entered, release, completed = (asyncio.Event() for _ in range(3))
 
-    async def blocked(*args: Any, **kwargs: Any) -> Any:
+    async def blocked(
+        *args: CallParams.args, **kwargs: CallParams.kwargs
+    ) -> CallResult:
         entered.set()
         await release.wait()
         result = await original(*args, **kwargs)
@@ -265,7 +348,7 @@ def block_async_call(
     return entered, release, completed
 
 
-async def wait_until(condition: Callable[[], bool], timeout: float = 5) -> None:
+async def wait_until(condition: Condition, timeout: float = 5) -> None:
     """Poll until condition() holds; asyncio.timeout needs Python 3.11."""
 
     async def poll() -> None:
@@ -276,7 +359,7 @@ async def wait_until(condition: Callable[[], bool], timeout: float = 5) -> None:
 
 
 def compute_registered(
-    scheduler: SessionScheduler, payload: StagePayload
+    scheduler: SessionScheduler[SchedulerStateT], payload: StagePayload
 ) -> StagePayload:
     """Run one session command on an unstarted scheduler through its inbox registration."""
     scheduler.inbox.put(IncomingMessage(payload.request_id, "new_request", payload))

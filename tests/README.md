@@ -928,7 +928,9 @@ that happened to contain an older version of the test.
   rejection, partial open, slow close, worker failure,
   and scoped shutdown.
   These use `unit_test/fixtures/session_pipeline.py` for real spawned Stage workers,
-  ZMQ control messages and shared-memory tensor relay. Only model hooks are synthetic;
+  ZMQ control messages and shared-memory tensor relay. Tests on one linear
+  topology share those workers for the pytest session; a test that stops a
+  worker starts its own. Only model hooks are synthetic;
   they do not establish native-model or accelerator correctness.
 - `unit_test/scheduling/test_session.py`: Session value validation, stage usage
   accounting, exact binary chunk wire sizes and state cleanup without worker processes. Run the session suite with

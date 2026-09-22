@@ -6,7 +6,7 @@ from __future__ import annotations
 import queue
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Generic, Protocol, TypeVar
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -23,43 +23,56 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 DEFAULT_MAX_SESSIONS = 64
 DEFAULT_MAX_CONCURRENCY = 4
 DEFAULT_MAX_STATE_BYTES = 1 << 30
+SessionStateT = TypeVar("SessionStateT")
+
+
+class ChunkEmitter(Protocol):
+    def __call__(self, chunk: TimedChunk) -> None: ...
+
+
+class CommandRegistrar(Protocol):
+    def __call__(self, message: IncomingMessage) -> None: ...
+
+
+class StageCompute(Protocol):
+    def __call__(self, payload: StagePayload) -> StagePayload: ...
 
 
 @dataclass(kw_only=True)
 class SessionContext:
     ref: SessionRef
     cancelled: threading.Event
-    emit: Callable[[TimedChunk], None]
+    emit: ChunkEmitter
 
 
-class SessionHooks:
+class SessionHooks(Generic[SessionStateT]):
     """Hooks run serially per session; different sessions may run concurrently.
 
     Failed open releases allocations it has not returned. close is idempotent.
     """
 
-    def open(self, ref: SessionRef, request: OmniRequest) -> Any:
+    def open(self, ref: SessionRef, request: OmniRequest) -> SessionStateT:
         raise NotImplementedError
 
     def append(
         self,
-        state: Any,
+        state: SessionStateT,
         chunk: TimedChunk,
         payload: StagePayload,
         context: SessionContext,
     ) -> StagePayload:
         raise NotImplementedError
 
-    def close(self, state: Any) -> None:
+    def close(self, state: SessionStateT) -> None:
         raise NotImplementedError
 
-    def usage(self, state: Any) -> ResourceUsage:
+    def usage(self, state: SessionStateT) -> ResourceUsage:
         return ResourceUsage()
 
 
 @dataclass(kw_only=True)
-class StageSession:
-    state: Any
+class StageSession(Generic[SessionStateT]):
+    state: SessionStateT | None
     lock: threading.Lock = field(default_factory=threading.Lock)
     usage: ResourceUsage = field(default_factory=ResourceUsage)
 
@@ -73,8 +86,8 @@ class CommandOrder:
     finished: set[int] = field(default_factory=set)
 
 
-class SessionInbox(queue.Queue):
-    def __init__(self, register: Callable[[IncomingMessage], None]) -> None:
+class SessionInbox(queue.Queue[IncomingMessage]):
+    def __init__(self, register: CommandRegistrar) -> None:
         super().__init__()
         self.register = register
 
@@ -89,14 +102,14 @@ class SessionInbox(queue.Queue):
         super().put(message, block, timeout)
 
 
-class SessionScheduler(SimpleScheduler):
+class SessionScheduler(SimpleScheduler, Generic[SessionStateT]):
     """Opt-in scheduler for persistent hooks, with bounded stage admission."""
 
     def __init__(
         self,
-        hooks: SessionHooks,
+        hooks: SessionHooks[SessionStateT],
         *,
-        compute_fn: Callable[[StagePayload], StagePayload] | None = None,
+        compute_fn: StageCompute | None = None,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
         max_state_bytes: int = DEFAULT_MAX_STATE_BYTES,
@@ -105,7 +118,7 @@ class SessionScheduler(SimpleScheduler):
         self.ordinary_compute = compute_fn
         self.max_sessions = max_sessions
         self.max_state_bytes = max_state_bytes
-        self.sessions: dict[tuple[str, int], StageSession] = {}
+        self.sessions: dict[tuple[str, int], StageSession[SessionStateT]] = {}
         self.commands: dict[str, threading.Event] = {}
         self.session_lock = threading.Lock()
         self.is_closing = False
@@ -222,15 +235,20 @@ class SessionScheduler(SimpleScheduler):
         if errors:
             raise RuntimeError("session shutdown cleanup failed") from errors[0]
 
-    def close_session(self, key: tuple[str, int], session: StageSession) -> None:
-        if session.state is not None:
-            self.hooks.close(session.state)
+    def close_session(
+        self, key: tuple[str, int], session: StageSession[SessionStateT]
+    ) -> None:
+        state = session.state
+        if state is not None:
+            self.hooks.close(state)
             session.state = None
         with self.session_lock:
             self.sessions.pop(key, None)
 
-    def update_usage(self, session: StageSession) -> None:
-        usage = self.hooks.usage(session.state)
+    def update_usage(self, session: StageSession[SessionStateT]) -> None:
+        state = session.state
+        assert state is not None
+        usage = self.hooks.usage(state)
         with self.session_lock:
             session.usage = usage
             if (

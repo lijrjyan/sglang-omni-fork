@@ -92,9 +92,20 @@ speculative generality.
   into a third module.
 - Closed value sets → `Literal[...]` or `Enum`, not bare strings in comparisons.
 - No mutable function defaults: `def f(x=[])`/`= {}` are bugs. Use a `None` sentinel.
-- Use concrete types, including model and decoder types, rather than `any`/`Any`
-  or bare `dict`/`list`/`tuple`. Annotate structured values and resource handles
-  according to their actual contracts, including element types and optionality.
+- Use concrete types, including model and decoder types. Annotate structured
+  values and resource handles according to their actual contracts, including
+  element types and optionality. Bare `dict`/`list`/`tuple` are not annotations.
+- Do not annotate with `Any`. It disables checking for that value and every
+  field read from it. Name a dataclass, TypedDict, `Literal`, `TypeVar` on a
+  generic class, or a union of those. `object` is allowed only on an untrusted
+  boundary, and the next use must narrow it with `isinstance`. Do not write
+  `dict[str, Any]`, `list[Any]`, `tuple[Any, ...]`, or `Coroutine[Any, Any, T]`.
+  A coroutine that does not yield is `Coroutine[None, None, T]`.
+- Do not annotate with `Callable` or `Callable[...]`. Declare a `Protocol`
+  whose `__call__` names each parameter and the return type. Do not recover
+  an erased signature with `*args: Any` or `**kwargs: Any`. When one helper
+  wraps functions that do not share one parameter list, keep each signature
+  with `ParamSpec` on that Protocol.
 - Do not accept a parameter only to immediately delete it to silence type or lint
   checks, such as starting a function with `del request_id`. Remove unnecessary
   parameters and update callers. If an established interface requires an unused

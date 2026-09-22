@@ -7,7 +7,7 @@ import threading
 
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import SessionRef, TimedChunk
-from sglang_omni.scheduling.session import SessionHooks, SessionScheduler
+from sglang_omni.scheduling.session import SessionContext, SessionHooks, SessionScheduler
 from tests.unit_test.fixtures.session_pipeline import (
     command_metadata,
     compute_registered,
@@ -23,27 +23,33 @@ def command(op):
     return StagePayload(op, OmniRequest(None, metadata=metadata), {})
 
 
-class Hooks(SessionHooks):
-    def __init__(self, block=None):
+class Hooks(SessionHooks[object]):
+    def __init__(self, block: str | None = None) -> None:
         self.block = block
         self.entered = threading.Event()
         self.release = threading.Event()
-        self.closed = []
+        self.closed: list[object] = []
 
-    def open(self, ref, request):
+    def open(self, ref: SessionRef, request: OmniRequest) -> object:
         self.pause("open")
         return object()
 
-    def append(self, state, chunk, payload, context):
+    def append(
+        self,
+        state: object,
+        chunk: TimedChunk,
+        payload: StagePayload,
+        context: SessionContext,
+    ) -> StagePayload:
         self.pause("append")
         return payload
 
-    def pause(self, op):
+    def pause(self, op: str) -> None:
         if self.block == op:
             self.entered.set()
             assert self.release.wait(5)
 
-    def close(self, state):
+    def close(self, state: object) -> None:
         self.closed.append(state)
 
 

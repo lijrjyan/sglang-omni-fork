@@ -7,9 +7,9 @@ import asyncio
 import math
 import uuid
 from collections import deque
-from collections.abc import Coroutine
+from collections.abc import AsyncIterator, Coroutine
 from dataclasses import dataclass, field, replace
-from typing import Any, AsyncIterator, Callable, Literal, TypeVar
+from typing import Literal, Protocol
 
 import msgpack
 
@@ -27,7 +27,8 @@ from sglang_omni.proto.session import (
     wire_size,
 )
 
-TaskResult = TypeVar("TaskResult")
+class SessionStreamHandler(Protocol):
+    def __call__(self, message: StreamMessage) -> None: ...
 
 
 @dataclass(kw_only=True)
@@ -50,7 +51,7 @@ class Session:
     wake: asyncio.Event = field(default_factory=asyncio.Event)
     output_wake: asyncio.Event = field(default_factory=asyncio.Event)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    pump: asyncio.Task | None = None
+    pump: asyncio.Task[None] | None = None
     is_closing: bool = False
     is_closed: bool = False
     is_reading: bool = False
@@ -66,23 +67,23 @@ class CoordinatorSessions:
         self.next_incarnation = 1
         self.session_unavailable_stages: set[str] = set()
         self.sessions: dict[str, Session] = {}
-        self.session_stream_handlers: dict[str, Callable[[StreamMessage], None]] = {}
-        self.session_cleanup_tasks: set[asyncio.Task] = set()
+        self.session_stream_handlers: dict[str, SessionStreamHandler] = {}
+        self.session_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     def owned_session_task(
-        self, coroutine: Coroutine[Any, Any, TaskResult]
-    ) -> asyncio.Task[TaskResult]:
+        self, coroutine: Coroutine[None, None, None]
+    ) -> asyncio.Task[None]:
         task = asyncio.create_task(coroutine)
         self.session_cleanup_tasks.add(task)
         task.add_done_callback(self.session_task_done)
         return task
 
-    def session_task_done(self, task: asyncio.Task) -> None:
+    def session_task_done(self, task: asyncio.Task[None]) -> None:
         self.session_cleanup_tasks.discard(task)
         if not task.cancelled():
             task.exception()
 
-    def reject_session_metadata(self, request: OmniRequest | Any) -> None:
+    def reject_session_metadata(self, request: object) -> None:
         if (
             isinstance(request, OmniRequest)
             and SESSION_METADATA_KEY in request.metadata
@@ -397,7 +398,7 @@ class CoordinatorSessions:
         session.wake.set()
         session.output_wake.set()
 
-    def close_session_state(self, session: Session) -> Coroutine[Any, Any, None]:
+    def close_session_state(self, session: Session) -> Coroutine[None, None, None]:
         self.begin_session_close(session)
         return self.finish_session_close(session)
 

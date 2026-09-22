@@ -3,16 +3,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal, TypedDict
 
 import msgpack
 import msgspec
 
-SESSION_METADATA_KEY = "omni_session"
+SESSION_METADATA_KEY: Literal["omni_session"] = "omni_session"
 # Note (Junnan Li): msgspec encodes bytes as base64 text by default; keep them native on both sides.
 BUILTIN_TYPES = (bytes,)
 SessionOp = Literal["open", "append", "close"]
+ChunkPayload = bytes | dict[str, object] | None
 DEFAULT_MAX_MODALITIES = 8
 DEFAULT_MAX_PENDING_CHUNKS = 16
 DEFAULT_MAX_PENDING_BYTES = 4 * 1024 * 1024
@@ -28,10 +30,48 @@ MSGPACK_BIN16_HEADER_GROWTH = 1
 MSGPACK_BIN32_HEADER_GROWTH = 3
 
 
+class SessionRefDict(TypedDict):
+    session_id: str
+    incarnation: int
+
+
+class TimedChunkDict(TypedDict):
+    modality: str
+    t_start_ms: float
+    duration_ms: float
+    seq: int
+    payload: ChunkPayload
+    format: str | None
+    eos: bool
+
+
+class OutputChunkDict(TypedDict):
+    ref: SessionRefDict
+    seq: int
+    input_seq: int
+    modality: str
+    t_start_ms: float
+    duration_ms: float
+    payload: ChunkPayload
+    format: str | None
+    eos: bool
+    kind: Literal["data", "input_done"]
+
+
+class SessionCommandDict(TypedDict):
+    op: SessionOp
+    ref: SessionRefDict
+    stages: list[str]
+    chunk: TimedChunkDict | None
+
+
 @dataclass(frozen=True)
 class SessionRef:
     session_id: str
     incarnation: int = 1
+
+    def to_dict(self) -> SessionRefDict:
+        return {"session_id": self.session_id, "incarnation": self.incarnation}
 
 
 @dataclass(frozen=True)
@@ -42,15 +82,25 @@ class TimedChunk:
     t_start_ms: float
     duration_ms: float
     seq: int
-    payload: bytes | dict[str, Any] | None
+    payload: ChunkPayload
     format: str | None = None
     eos: bool = False
 
-    def to_dict(self) -> dict[str, Any]:
-        return msgspec.to_builtins(self, builtin_types=BUILTIN_TYPES)
+    def to_dict(self) -> TimedChunkDict:
+        return {
+            "modality": self.modality,
+            "t_start_ms": self.t_start_ms,
+            "duration_ms": self.duration_ms,
+            "seq": self.seq,
+            "payload": self.payload,
+            "format": self.format,
+            "eos": self.eos,
+        }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> TimedChunk:
+    def from_dict(cls, data: object) -> TimedChunk:
+        if not isinstance(data, dict):
+            raise ValueError("timed chunk must be an object")
         return msgspec.convert(data, type=cls, strict=True, builtin_types=BUILTIN_TYPES)
 
 
@@ -64,16 +114,29 @@ class OutputChunk:
     modality: str
     t_start_ms: float
     duration_ms: float
-    payload: bytes | dict[str, Any] | None
+    payload: ChunkPayload
     format: str | None = None
     eos: bool = False
     kind: Literal["data", "input_done"] = "data"
 
-    def to_dict(self) -> dict[str, Any]:
-        return msgspec.to_builtins(self, builtin_types=BUILTIN_TYPES)
+    def to_dict(self) -> OutputChunkDict:
+        return {
+            "ref": self.ref.to_dict(),
+            "seq": self.seq,
+            "input_seq": self.input_seq,
+            "modality": self.modality,
+            "t_start_ms": self.t_start_ms,
+            "duration_ms": self.duration_ms,
+            "payload": self.payload,
+            "format": self.format,
+            "eos": self.eos,
+            "kind": self.kind,
+        }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> OutputChunk:
+    def from_dict(cls, data: object) -> OutputChunk:
+        if not isinstance(data, dict):
+            raise ValueError("output chunk must be an object")
         return msgspec.convert(data, type=cls, strict=True, builtin_types=BUILTIN_TYPES)
 
 
@@ -105,15 +168,22 @@ class SessionCommand:
     stages: tuple[str, ...]
     chunk: TimedChunk | None = None
 
-    def to_dict(self) -> dict[str, Any]:
-        return msgspec.to_builtins(self, builtin_types=BUILTIN_TYPES)
+    def to_dict(self) -> SessionCommandDict:
+        return {
+            "op": self.op,
+            "ref": self.ref.to_dict(),
+            "stages": list(self.stages),
+            "chunk": None if self.chunk is None else self.chunk.to_dict(),
+        }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SessionCommand:
+    def from_dict(cls, data: object) -> SessionCommand:
+        if not isinstance(data, dict):
+            raise ValueError("session command must be an object")
         return msgspec.convert(data, type=cls, strict=True, builtin_types=BUILTIN_TYPES)
 
 
-def find_session_command(metadata: dict[str, Any]) -> SessionCommand | None:
+def find_session_command(metadata: Mapping[str, object]) -> SessionCommand | None:
     """Return the command in request metadata, or None for an ordinary request."""
     command_fields = metadata.get(SESSION_METADATA_KEY)
     if command_fields is None:
@@ -121,7 +191,7 @@ def find_session_command(metadata: dict[str, Any]) -> SessionCommand | None:
     return SessionCommand.from_dict(command_fields)
 
 
-def wire_size(chunk_fields: dict[str, Any]) -> int:
+def wire_size(chunk_fields: TimedChunkDict | OutputChunkDict) -> int:
     """Return the msgpack wire size of a chunk dict without copying a binary payload."""
     payload = chunk_fields["payload"]
     if isinstance(payload, bytes):
