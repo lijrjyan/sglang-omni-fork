@@ -159,6 +159,44 @@ QWEN3_TTS_VC_STREAM_THRESHOLDS = apply_slack(
     _QWEN3_TTS_VC_STREAM_P95, THRESHOLD_SLACK_HIGHER, THRESHOLD_SLACK_LOWER
 )
 
+# Fun-CosyVoice3 0.5B.
+#
+# note(ratish): placeholder references until the H100 calibration fills them,
+# so the preset keeps gate_thresholds off until then.
+COSYVOICE3_VC_WER_MAX_CORPUS = 1.0
+COSYVOICE3_VC_WER_CORPUS_THRESHOLD = apply_wer_slack(COSYVOICE3_VC_WER_MAX_CORPUS)
+COSYVOICE3_VC_STREAM_WER_MAX_CORPUS = 1.0
+COSYVOICE3_VC_STREAM_WER_CORPUS_THRESHOLD = apply_wer_slack(
+    COSYVOICE3_VC_STREAM_WER_MAX_CORPUS
+)
+COSYVOICE3_VC_SIMILARITY_MEAN_MIN = 1.0
+COSYVOICE3_VC_UTMOS_MEAN_REFERENCE = 1.0
+COSYVOICE3_VC_UTMOS_MEAN_MIN = apply_mos_slack(COSYVOICE3_VC_UTMOS_MEAN_REFERENCE)
+
+_COSYVOICE3_VC_NON_STREAM_P95 = {
+    16: {
+        "throughput_qps": 1.0,
+        "output_tok_per_req_s": 1.0,
+        "latency_mean_s": 1.0,
+        "rtf_mean": 1.0,
+    }
+}
+
+_COSYVOICE3_VC_STREAM_P95 = {
+    16: {
+        "throughput_qps": 1.0,
+        "latency_mean_s": 1.0,
+        "rtf_mean": 1.0,
+    }
+}
+
+COSYVOICE3_VC_NON_STREAM_THRESHOLDS = apply_slack(
+    _COSYVOICE3_VC_NON_STREAM_P95, THRESHOLD_SLACK_HIGHER, THRESHOLD_SLACK_LOWER
+)
+COSYVOICE3_VC_STREAM_THRESHOLDS = apply_slack(
+    _COSYVOICE3_VC_STREAM_P95, THRESHOLD_SLACK_HIGHER, THRESHOLD_SLACK_LOWER
+)
+
 
 TTS_CI_PRESETS: dict[str, TtsCiPreset] = {
     "higgs": TtsCiPreset(
@@ -182,13 +220,10 @@ TTS_CI_PRESETS: dict[str, TtsCiPreset] = {
         model=TtsCiModelPreset(
             model_path="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
             ref_format="references",
-            # Note: (Jiaxin Deng) the shipped defaults cap the AR engine at 16
-            # running requests and colocate every stage in one process; both are
-            # what kept this variant behind, so CI measures the tuned point.
+            # Note: (Jiaxin Deng) the shipped defaults colocate every stage in one
+            # process, which is what kept this variant behind, so CI splits the
+            # vocoder out and measures the tuned point.
             worker_extra_args=(
-                "--tts_engine.engine.max_running_requests 64 "
-                "--tts_engine.engine.cuda_graph_max_bs 64 "
-                "--tts_engine.engine.torch_compile_max_bs 64 "
                 "--vocoder.process vocoder "
                 "--tts_engine.gpu_memory_fraction 0.85 "
                 "--vocoder.gpu_memory_fraction 0.10"
@@ -219,6 +254,21 @@ TTS_CI_PRESETS: dict[str, TtsCiPreset] = {
             stream_wer_corpus=MOSS_VC_STREAM_WER_CORPUS_THRESHOLD,
             similarity_mean_min=MOSS_VC_SIMILARITY_MEAN_MIN,
             utmos_mean_min=MOSS_VC_UTMOS_MEAN_MIN,
+        ),
+    ),
+    "cosyvoice3": TtsCiPreset(
+        model=TtsCiModelPreset(
+            model_path="FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+            gate_thresholds=False,
+        ),
+        thresholds=TtsCiThresholdPreset(
+            non_stream_speed=COSYVOICE3_VC_NON_STREAM_THRESHOLDS,
+            stream_speed=COSYVOICE3_VC_STREAM_THRESHOLDS,
+            wer_corpus=COSYVOICE3_VC_WER_CORPUS_THRESHOLD,
+            stream_wer_corpus=COSYVOICE3_VC_STREAM_WER_CORPUS_THRESHOLD,
+            similarity_mean_min=COSYVOICE3_VC_SIMILARITY_MEAN_MIN,
+            utmos_mean_min=COSYVOICE3_VC_UTMOS_MEAN_MIN,
+            calibrated=False,
         ),
     ),
 }
