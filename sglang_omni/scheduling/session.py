@@ -255,19 +255,15 @@ class SessionScheduler(SimpleScheduler):
                         ref = session_operation.ref
                 return self.compute_session(payload, session_operation)
             finally:
-                try:
-                    # Note (Junnan Li): stop skips a session whose hook is running; it is closed here.
-                    with self.session_table_lock:
-                        session = (
-                            self.open_sessions.get(ref)
-                            if self.is_shutting_down
-                            else None
-                        )
-                    if session is not None:
-                        with session.lock:
-                            self.close_session(ref, session)
-                finally:
-                    self.finish_operation(payload.request_id)
+                # Note (Junnan Li): stop skips a session whose hook is running; it is closed here.
+                with self.session_table_lock:
+                    session = (
+                        self.open_sessions.get(ref) if self.is_shutting_down else None
+                    )
+                if session is not None:
+                    with session.lock:
+                        self.close_session(ref, session)
+                self.finish_operation(payload.request_id)
 
     def cancel_operation(self, request_id: str) -> None:
         with self.session_table_lock:
