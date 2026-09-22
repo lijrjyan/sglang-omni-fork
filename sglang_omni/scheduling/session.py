@@ -148,6 +148,7 @@ class SessionScheduler(SimpleScheduler):
             session_operation = find_session_operation(message.data.request.metadata)
         except ValueError:
             # Note (Junnan Li): put() runs on the stage loop; compute reports the malformed operation.
+            # TODO (chenyang): This error handling is a bit rough here.
             return
         if session_operation is None:
             return
