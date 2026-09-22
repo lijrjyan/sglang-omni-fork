@@ -7,7 +7,7 @@ import pytest
 
 from sglang_omni.proto import OmniRequest
 from sglang_omni.proto.session import TimedChunk, find_session_command
-from tests.unit_test.fixtures.session_pipeline import chunk, pipeline
+from tests.unit_test.fixtures.session_pipeline import chunk, event_log, pipeline
 
 
 @pytest.mark.asyncio
@@ -137,3 +137,100 @@ async def test_accepted_input_snapshots_mutable_payload(tmp_path, monkeypatch):
         finally:
             await outputs.aclose()
             await coordinator.close_session(ref)
+
+
+@pytest.mark.asyncio
+async def test_next_input_is_accepted_while_one_unit_is_in_flight(
+    tmp_path, monkeypatch
+):
+    async with pipeline(tmp_path) as (coordinator, _, _):
+        ref = await coordinator.open_session(
+            OmniRequest(None), stages=["source", "sink"]
+        )
+        entered, release = asyncio.Event(), asyncio.Event()
+        append_seqs = []
+        original = coordinator.session_command
+
+        async def session_command(session, op, *, owner=None, chunk=None):
+            if op == "append" and chunk is not None:
+                append_seqs.append(chunk.seq)
+                if chunk.seq == 0:
+                    entered.set()
+                    await release.wait()
+            return await original(session, op, owner=owner, chunk=chunk)
+
+        monkeypatch.setattr(coordinator, "session_command", session_command)
+        outputs = coordinator.session_outputs(ref)
+        try:
+            assert await coordinator.append_session(ref, chunk(0)) == 0
+            await asyncio.wait_for(entered.wait(), 5)
+            assert (
+                await asyncio.wait_for(coordinator.append_session(ref, chunk(1)), 1)
+                == 1
+            )
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert append_seqs == [0]
+        finally:
+            release.set()
+            await outputs.aclose()
+
+
+@pytest.mark.asyncio
+async def test_append_visits_owners_in_route_order(tmp_path):
+    async with pipeline(tmp_path, stage_count=3) as (coordinator, events, _):
+        ref = await coordinator.open_session(
+            OmniRequest(None), stages=["source", "middle", "sink"]
+        )
+        outputs = coordinator.session_outputs(ref)
+        await coordinator.append_session(ref, chunk(0, eos=True))
+        data = await asyncio.wait_for(anext(outputs), 5)
+        assert data.kind == "data"
+        await outputs.aclose()
+        appends = [event[1] for event in event_log(events) if event[0] == "append"]
+        assert appends == ["source", "middle", "sink"]
+
+
+@pytest.mark.asyncio
+async def test_mismatched_route_fails_before_leaving_the_session_route(tmp_path):
+    async with pipeline(tmp_path, stage_count=3) as (coordinator, events, _):
+        ref = await coordinator.open_session(
+            OmniRequest(None), stages=["source", "sink"]
+        )
+        outputs = coordinator.session_outputs(ref)
+        await coordinator.append_session(ref, chunk(0, eos=True))
+        with pytest.raises(RuntimeError, match="session route"):
+            await asyncio.wait_for(anext(outputs), 5)
+        appends = [event[1] for event in event_log(events) if event[0] == "append"]
+        assert appends == ["source"]
+
+
+@pytest.mark.asyncio
+async def test_later_commands_do_not_carry_the_opening_inputs(tmp_path, monkeypatch):
+    async with pipeline(tmp_path) as (coordinator, _, _):
+        seen = []
+        original = coordinator.control_plane.submit_to_stage
+
+        async def submit(stage, endpoint, message):
+            command = find_session_command(message.data.request.metadata)
+            if command is not None and command.op != "open":
+                seen.append(
+                    (
+                        command.op,
+                        message.data.request.inputs,
+                        message.data.data.get("raw_inputs"),
+                    )
+                )
+            return await original(stage, endpoint, message)
+
+        monkeypatch.setattr(coordinator.control_plane, "submit_to_stage", submit)
+        request = OmniRequest(inputs={"media": b"secret-audio"})
+        ref = await coordinator.open_session(request, stages=["source", "sink"])
+        outputs = coordinator.session_outputs(ref)
+        try:
+            await coordinator.append_session(ref, chunk(0, eos=True))
+            await asyncio.wait_for(anext(outputs), 5)
+        finally:
+            await outputs.aclose()
+        assert {op for op, _, _ in seen} >= {"append", "close"}
+        assert all(inputs is None and raw is None for _, inputs, raw in seen)

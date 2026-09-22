@@ -220,6 +220,62 @@ def test_session_commands_run_in_arrival_order_even_when_one_is_aborted():
     assert not scheduler.orders and not scheduler.tickets
 
 
+def test_later_command_does_not_start_before_the_session_lock():
+
+    class BlockingHooks(Hooks):
+        def __init__(self):
+            super().__init__("source", queue.Queue())
+            self.entered, self.release = threading.Event(), threading.Event()
+
+        def append(self, state, chunk, payload, context):
+            if payload.request_id == "first":
+                self.entered.set()
+                self.release.wait(5)
+            return payload
+
+    hooks = BlockingHooks()
+    scheduler = SessionScheduler(hooks, max_concurrency=3)
+    started = []
+    original = scheduler.compute_session
+
+    def compute_session(payload, command):
+        started.append(payload.request_id)
+        return original(payload, command)
+
+    scheduler.compute_session = compute_session
+
+    def command(rid, op):
+        return StagePayload(
+            rid,
+            OmniRequest(
+                None,
+                metadata=command_metadata(
+                    op, SessionRef("s"), TimedChunk("audio", 0, 20, 0, b"x")
+                ),
+            ),
+            {},
+        )
+
+    compute_registered(scheduler, command("open", "open"))
+    payloads = [command(rid, "append") for rid in ("first", "second", "third")]
+    for payload in payloads:
+        scheduler.inbox.put(IncomingMessage(payload.request_id, "new_request", payload))
+    messages = [scheduler.inbox.get_nowait() for _ in payloads]
+    first = threading.Thread(target=scheduler.compute, args=(messages[0].data,))
+    first.start()
+    assert hooks.entered.wait(5)
+    scheduler.abort("second")
+    assert scheduler.consume_if_aborted("second")
+    third = threading.Thread(target=scheduler.compute, args=(messages[2].data,))
+    third.start()
+    third.join(0.2)
+    assert started == ["open", "first"]
+    hooks.release.set()
+    for thread in (first, third):
+        thread.join(5)
+    assert started == ["open", "first", "third"]
+
+
 def test_close_runs_after_its_request_is_aborted():
 
     events = queue.Queue()

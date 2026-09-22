@@ -64,9 +64,10 @@ class Hooks(SessionHooks):
 
         self.events.put(("append", self.name, state["id"], chunk.seq))
         state["n"] += 1
-        if self.name == "source":
+        logical_name = self.name.split("@r")[0]
+        if logical_name == "source":
             payload.data = {"tensor": torch.tensor([state["n"]])}
-        elif self.name.split("@r")[0] == "middle":
+        elif logical_name == "middle":
             assert payload.data["tensor"].item() == state["n"]
         else:
             assert payload.data["tensor"].item() == state["n"]
@@ -127,6 +128,7 @@ async def pipeline(
     *,
     stage_count: int = 2,
     replicated: bool = False,
+    replicate_entry: bool = False,
     list_next: bool = False,
 ) -> AsyncIterator[tuple[Coordinator, Queue, list[SpawnProcess]]]:
     from sglang_omni.pipeline.stage_workers import StageLaunchConfig
@@ -145,11 +147,16 @@ async def pipeline(
                 factory_path=f"{__name__}.make_session_scheduler",
             )
         )
+    processes = {}
+    if replicated:
+        processes["sink"] = ProcessConfig(num_replicas=2)
+    if replicate_entry:
+        processes["source"] = ProcessConfig(num_replicas=2)
     config = PipelineConfig(
         model_path="mock",
         entry_stage="source",
         stages=stages,
-        processes={"sink": ProcessConfig(num_replicas=2)} if replicated else {},
+        processes=processes,
     )
     plan, stages = compile_logical_processes(config)
     expanded, topology = expand_replica_stages(stages, plan)
@@ -219,6 +226,13 @@ def command_metadata(
 
 def chunk(seq: int, eos: bool = False) -> TimedChunk:
     return TimedChunk("audio", seq * 20, 20, seq, b"pcm", eos=eos)
+
+
+def event_log(events: Queue) -> list[tuple]:
+    log = []
+    while not events.empty():
+        log.append(events.get(timeout=1))
+    return log
 
 
 def block_async_call(

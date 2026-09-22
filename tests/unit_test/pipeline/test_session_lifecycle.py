@@ -11,6 +11,7 @@ from sglang_omni.proto.session import SessionLimits, TimedChunk
 from tests.unit_test.fixtures.session_pipeline import (
     block_async_call,
     chunk,
+    event_log,
     pipeline,
     wait_until,
 )
@@ -314,3 +315,73 @@ async def test_close_fences_queued_outputs(tmp_path):
         assert not session.outputs and session.output_bytes == 0
         with pytest.raises(StopAsyncIteration):
             await asyncio.wait_for(anext(output), 5)
+
+
+@pytest.mark.asyncio
+async def test_stale_incarnation_cannot_address_the_reopened_session(tmp_path):
+    async with pipeline(tmp_path) as (coordinator, _, _):
+        ref = await coordinator.open_session(
+            OmniRequest(None), stages=["source", "sink"], session_id="again"
+        )
+        await coordinator.close_session(ref)
+        reopened = await coordinator.open_session(
+            OmniRequest(None), stages=["source", "sink"], session_id="again"
+        )
+        assert reopened.incarnation != ref.incarnation
+        with pytest.raises(ValueError, match="stale"):
+            await coordinator.append_session(ref, chunk(0))
+        with pytest.raises(ValueError, match="stale"):
+            await coordinator.close_session(ref)
+        assert "again" in coordinator.sessions
+        await coordinator.close_session(reopened)
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_downstream_owner_is_not_quarantined(tmp_path):
+    async with pipeline(tmp_path, stage_count=3) as (coordinator, _, _):
+        ref = await coordinator.open_session(
+            OmniRequest(None, {"fail_close_once": "middle"}),
+            stages=["source", "middle", "sink"],
+            session_id="held",
+        )
+        with pytest.raises(RuntimeError, match="cleanup incomplete"):
+            await coordinator.close_session(ref)
+        unavailable = coordinator.session_unavailable_stages
+        assert unavailable.issuperset({"source", "middle"})
+        assert "sink" not in unavailable
+        with pytest.raises(ValueError, match="unavailable owner"):
+            await coordinator.open_session(
+                OmniRequest(None), stages=["source", "middle", "sink"]
+            )
+
+
+@pytest.mark.asyncio
+async def test_healthy_replica_accepts_a_new_session_after_unconfirmed_close(tmp_path):
+    async with pipeline(tmp_path, replicated=True, replicate_entry=True) as (
+        coordinator,
+        events,
+        _,
+    ):
+        failed = await coordinator.open_session(
+            OmniRequest(None, {"fail_close_once": "sink@r0"}),
+            stages=["source", "sink"],
+            session_id="failed",
+        )
+        with pytest.raises(RuntimeError, match="cleanup incomplete"):
+            await coordinator.close_session(failed)
+        opens = [
+            event[1]
+            for event in event_log(events)
+            if event[0] == "open" and event[2] == "failed"
+        ]
+        assert opens == ["source@r0", "sink@r0"]
+        healthy = await coordinator.open_session(
+            OmniRequest(None), stages=["source", "sink"], session_id="healthy"
+        )
+        outputs = coordinator.session_outputs(healthy)
+        await coordinator.append_session(healthy, chunk(0, eos=True))
+        data = await asyncio.wait_for(anext(outputs), 5)
+        assert data.kind == "data"
+        await outputs.aclose()
+        with pytest.raises(ValueError, match="unavailable owner"):
+            await coordinator.open_session(OmniRequest(None), stages=["source", "sink"])
