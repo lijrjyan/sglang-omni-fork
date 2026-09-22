@@ -13,7 +13,7 @@ import msgspec
 SESSION_METADATA_KEY: Literal["omni_session"] = "omni_session"
 # Note (Junnan Li): msgspec encodes bytes as base64 text by default; keep them native on both sides.
 BUILTIN_TYPES = (bytes,)
-SessionOp = Literal["open", "append", "close"]
+SessionOperation = Literal["open", "append", "close"]
 ChunkPayload = bytes | dict[str, object] | None
 DEFAULT_MAX_MODALITIES = 8
 DEFAULT_MAX_PENDING_CHUNKS = 16
@@ -59,7 +59,7 @@ class OutputChunkDict(TypedDict):
 
 
 class SessionCommandDict(TypedDict):
-    op: SessionOp
+    operation: SessionOperation
     ref: SessionRefDict
     stages: list[str]
     chunk: TimedChunkDict | None
@@ -163,14 +163,14 @@ class SessionLimits:
 class SessionCommand:
     """Coordinator-to-stage session command, carried in request metadata."""
 
-    op: SessionOp
+    operation: SessionOperation
     ref: SessionRef
     stages: tuple[str, ...]
     chunk: TimedChunk | None = None
 
     def to_dict(self) -> SessionCommandDict:
         return {
-            "op": self.op,
+            "operation": self.operation,
             "ref": self.ref.to_dict(),
             "stages": list(self.stages),
             "chunk": None if self.chunk is None else self.chunk.to_dict(),

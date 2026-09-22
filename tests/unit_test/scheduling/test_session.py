@@ -14,7 +14,7 @@ from sglang_omni.proto.session import (
     OutputChunk,
     ResourceUsage,
     SessionCommand,
-    SessionOp,
+    SessionOperation,
     SessionRef,
     TimedChunk,
     wire_size,
@@ -81,9 +81,11 @@ def test_stage_capacity_is_aggregate():
     events = queue.Queue()
     scheduler = SessionScheduler(SizedHooks("source", events), max_state_bytes=3)
 
-    def invoke(sid, op):
-        request = OmniRequest(None, metadata=command_metadata(op, SessionRef(sid)))
-        return compute_registered(scheduler, StagePayload(sid + op, request, {}))
+    def invoke(sid, operation):
+        request = OmniRequest(
+            None, metadata=command_metadata(operation, SessionRef(sid))
+        )
+        return compute_registered(scheduler, StagePayload(sid + operation, request, {}))
 
     invoke("one", "open")
     with pytest.raises(QueueFullError):
@@ -102,7 +104,7 @@ def test_malformed_command_fails_inside_the_request_boundary():
     worker = threading.Thread(target=scheduler.start)
     worker.start()
     try:
-        request = OmniRequest(None, metadata={"omni_session": {"op": "append"}})
+        request = OmniRequest(None, metadata={"omni_session": {"operation": "append"}})
         scheduler.inbox.put(
             IncomingMessage("bad", "new_request", StagePayload("bad", request, {}))
         )
@@ -199,13 +201,13 @@ class BlockingHooks(Hooks):
         return payload
 
 
-def session_stage_payload(request_id: str, op: SessionOp) -> StagePayload:
+def session_stage_payload(request_id: str, operation: SessionOperation) -> StagePayload:
     return StagePayload(
         request_id,
         OmniRequest(
             None,
             metadata=command_metadata(
-                op,
+                operation,
                 SessionRef("session"),
                 TimedChunk("audio", 0, 20, 0, b"x"),
             ),
@@ -250,13 +252,13 @@ def test_session_commands_run_in_arrival_order_even_when_one_is_aborted():
 def test_later_command_does_not_start_before_the_session_lock() -> None:
     hooks = BlockingHooks()
     scheduler = SessionScheduler(hooks, max_concurrency=3)
-    started: list[tuple[str, SessionOp]] = []
+    started: list[tuple[str, SessionOperation]] = []
     compute_session = scheduler.compute_session
 
     def record_compute_session(
         payload: StagePayload, command: SessionCommand
     ) -> StagePayload:
-        started.append((payload.request_id, command.op))
+        started.append((payload.request_id, command.operation))
         return compute_session(payload, command)
 
     scheduler.compute_session = record_compute_session
@@ -288,8 +290,10 @@ def test_close_runs_after_its_request_is_aborted():
     events = queue.Queue()
     scheduler = SessionScheduler(Hooks("source", events))
 
-    def message(rid, op):
-        request = OmniRequest(None, metadata=command_metadata(op, SessionRef("s")))
+    def message(rid, operation):
+        request = OmniRequest(
+            None, metadata=command_metadata(operation, SessionRef("s"))
+        )
         return IncomingMessage(rid, "new_request", StagePayload(rid, request, {}))
 
     scheduler.inbox.put(message("open", "open"))
@@ -305,7 +309,6 @@ def test_close_runs_after_its_request_is_aborted():
         worker.join(timeout=5)
     assert not worker.is_alive()
     assert not scheduler.open_sessions and not scheduler.arrivals_by_request_id
-    assert not scheduler.close_request_ids
 
 
 def test_command_finished_by_abort_before_running_does_not_wait():

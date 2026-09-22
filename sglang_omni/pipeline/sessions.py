@@ -21,7 +21,7 @@ from sglang_omni.proto.session import (
     OutputChunk,
     SessionCommand,
     SessionLimits,
-    SessionOp,
+    SessionOperation,
     SessionRef,
     TimedChunk,
     wire_size,
@@ -310,14 +310,14 @@ class CoordinatorSessions:
     async def session_command(
         self,
         session: Session,
-        op: SessionOp,
+        operation: SessionOperation,
         *,
         owner: str | None = None,
         chunk: TimedChunk | None = None,
     ) -> None:
         ref = session.ref
         command = SessionCommand(
-            op=op,
+            operation=operation,
             ref=ref,
             stages=session.stages,
             chunk=chunk,
@@ -355,18 +355,18 @@ class CoordinatorSessions:
                     else {self._replica_topology.logical_name(session.stages[-1])}
                 ),
                 replica_bindings=session.bindings,
-                should_bypass_admission=op == "close",
+                should_bypass_admission=operation == "close",
             )
             await self._completion_futures[request_id]
 
         try:
-            if op == "close":
+            if operation == "close":
                 await run()
             else:
                 await asyncio.wait_for(run(), session.limits.command_timeout_s)
         except asyncio.TimeoutError as exc:
             self.begin_session_close(session)
-            raise TimeoutError(f"session {op} timed out") from exc
+            raise TimeoutError(f"session {operation} timed out") from exc
         except BaseException:
             # Note (Junnan Li): Request abort can yield before the pump sees this fatal failure.
             self.begin_session_close(session)

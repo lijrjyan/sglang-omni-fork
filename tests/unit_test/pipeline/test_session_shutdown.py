@@ -18,13 +18,13 @@ from tests.unit_test.fixtures.session_pipeline import (
 )
 
 
-def command(op):
+def command(operation):
     metadata = command_metadata(
-        op,
+        operation,
         SessionRef("session"),
         TimedChunk("audio", 0, 20, 0, b"pcm"),
     )
-    return StagePayload(op, OmniRequest(None, metadata=metadata), {})
+    return StagePayload(operation, OmniRequest(None, metadata=metadata), {})
 
 
 class Hooks(SessionHooks):
@@ -49,8 +49,8 @@ class Hooks(SessionHooks):
         self.pause("append")
         return payload
 
-    def pause(self, op: str) -> None:
-        if self.block == op:
+    def pause(self, operation: str) -> None:
+        if self.block == operation:
             self.entered.set()
             assert self.release.wait(5)
 
@@ -59,13 +59,13 @@ class Hooks(SessionHooks):
         self.closed.append(ref)
 
 
-def run_command(scheduler, op, profile=None):
+def run_command(scheduler, operation, profile=None):
     errors = []
 
     def run():
         sys.setprofile(profile)
         try:
-            compute_registered(scheduler, command(op))
+            compute_registered(scheduler, command(operation))
         except BaseException as exc:
             errors.append(exc)
         finally:

@@ -38,7 +38,7 @@ from sglang_omni.proto.session import (
     ResourceUsage,
     SessionCommand,
     SessionCommandDict,
-    SessionOp,
+    SessionOperation,
     SessionRef,
     TimedChunk,
 )
@@ -293,10 +293,10 @@ async def pipeline(
 
 
 def command_metadata(
-    op: SessionOp, ref: SessionRef, chunk: TimedChunk | None = None
+    operation: SessionOperation, ref: SessionRef, chunk: TimedChunk | None = None
 ) -> SessionMetadata:
     command = SessionCommand(
-        op=op,
+        operation=operation,
         ref=ref,
         stages=("source",),
         chunk=chunk,

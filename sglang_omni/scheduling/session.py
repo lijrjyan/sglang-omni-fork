@@ -13,6 +13,7 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     ResourceUsage,
     SessionCommand,
+    SessionOperation,
     SessionRef,
     TimedChunk,
     find_session_command,
@@ -81,6 +82,7 @@ class CommandArrival:
     """Arrival position of one accepted command inside its session."""
 
     ref: SessionRef
+    operation: SessionOperation
     sequence: int
 
 
@@ -130,7 +132,6 @@ class SessionScheduler(SimpleScheduler):
         self.session_table_lock = threading.Lock()
         self.is_shutting_down = False
         self.arrivals_by_request_id: dict[str, CommandArrival] = {}
-        self.close_request_ids: set[str] = set()
         self.cursors_by_session: dict[SessionRef, SessionCommandCursor] = {}
         self.command_finished: threading.Condition = threading.Condition(
             self.session_table_lock
@@ -156,15 +157,13 @@ class SessionScheduler(SimpleScheduler):
             cursor = self.cursors_by_session.setdefault(ref, SessionCommandCursor())
             self.arrivals_by_request_id[message.request_id] = CommandArrival(
                 ref=ref,
+                operation=command.operation,
                 sequence=cursor.next_sequence,
             )
             cursor.next_sequence += 1
-            if command.op == "close":
-                self.close_request_ids.add(message.request_id)
 
     def finish_command(self, request_id: str) -> None:
         with self.command_finished:
-            self.close_request_ids.discard(request_id)
             arrival = self.arrivals_by_request_id.pop(request_id, None)
             if arrival is None:
                 return
@@ -183,7 +182,8 @@ class SessionScheduler(SimpleScheduler):
     def consume_if_aborted(self, request_id: str) -> bool:
         aborted = super().consume_if_aborted(request_id)
         with self.session_table_lock:
-            is_close_command = request_id in self.close_request_ids
+            arrival = self.arrivals_by_request_id.get(request_id)
+            is_close_command = arrival is not None and arrival.operation == "close"
         if aborted and is_close_command:
             # Note (Junnan Li): A timed-out close is request-aborted; skipping it would leak the state.
             return False
@@ -299,8 +299,8 @@ class SessionScheduler(SimpleScheduler):
         self, payload: StagePayload, command: SessionCommand
     ) -> StagePayload:
         ref = command.ref
-        op = command.op
-        if op == "open":
+        operation = command.operation
+        if operation == "open":
             self.open_session(ref, payload.request)
             payload.data = {"opened": True}
             return payload
@@ -308,13 +308,13 @@ class SessionScheduler(SimpleScheduler):
         with self.session_table_lock:
             session = self.open_sessions.get(ref)
         if session is None:
-            if op == "close":
+            if operation == "close":
                 payload.data = {"closed": True}
                 return payload
             else:
                 raise ValueError("unknown session incarnation")
         with session.lock:
-            if op == "close":
+            if operation == "close":
                 self.close_session(ref, session)
                 payload.data = {"closed": True}
                 return payload

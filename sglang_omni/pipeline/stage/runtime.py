@@ -1276,7 +1276,7 @@ class Stage:
             if isinstance(result, StagePayload)
             else None
         )
-        if command is not None and command.op != "append":
+        if command is not None and command.operation != "append":
             await self.control_plane.send_complete(
                 CompleteMessage(
                     request_id=request_id,

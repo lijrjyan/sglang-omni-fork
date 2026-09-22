@@ -8,7 +8,7 @@ import pytest
 
 from sglang_omni.pipeline.sessions import Session
 from sglang_omni.proto import OmniRequest
-from sglang_omni.proto.session import SessionOp, TimedChunk, find_session_command
+from sglang_omni.proto.session import SessionOperation, TimedChunk, find_session_command
 from tests.unit_test.fixtures.session_pipeline import chunk, event_log, pipeline
 
 IN_FLIGHT_ACCEPT_TIMEOUT_S = 1
@@ -120,7 +120,7 @@ async def test_accepted_input_snapshots_mutable_payload(linear_pair, monkeypatch
 
     async def submit(stage, endpoint, message):
         command = find_session_command(message.data.request.metadata)
-        if command is not None and command.op == "append":
+        if command is not None and command.operation == "append":
             submitted.append(command.chunk.payload)
         return await original(stage, endpoint, message)
 
@@ -158,17 +158,17 @@ async def test_next_input_is_accepted_while_one_unit_is_in_flight(
 
     async def hold_first_append(
         session: Session,
-        op: SessionOp,
+        operation: SessionOperation,
         *,
         owner: str | None = None,
         chunk: TimedChunk | None = None,
     ) -> None:
-        if op == "append" and chunk is not None:
+        if operation == "append" and chunk is not None:
             append_seqs.append(chunk.seq)
             if chunk.seq == 0:
                 entered.set()
                 await release.wait()
-        return await original(session, op, owner=owner, chunk=chunk)
+        return await original(session, operation, owner=owner, chunk=chunk)
 
     monkeypatch.setattr(coordinator, "session_command", hold_first_append)
     outputs = coordinator.session_outputs(ref)
@@ -219,15 +219,15 @@ async def test_later_commands_do_not_carry_the_opening_inputs(
     linear_pair, monkeypatch
 ) -> None:
     coordinator, _, _ = linear_pair
-    submitted: list[tuple[SessionOp, object | None, object | None]] = []
+    submitted: list[tuple[SessionOperation, object | None, object | None]] = []
     original = coordinator.control_plane.submit_to_stage
 
     async def submit(stage, endpoint, message):
         command = find_session_command(message.data.request.metadata)
-        if command is not None and command.op != "open":
+        if command is not None and command.operation != "open":
             submitted.append(
                 (
-                    command.op,
+                    command.operation,
                     message.data.request.inputs,
                     message.data.data["raw_inputs"],
                 )
