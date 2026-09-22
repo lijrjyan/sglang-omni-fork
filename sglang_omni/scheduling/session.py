@@ -212,7 +212,7 @@ class SessionScheduler(SimpleScheduler):
                         cursor.completed_sequences.discard(cursor.runnable_sequence)
                         cursor.runnable_sequence += 1
                     if cursor.runnable_sequence == cursor.next_sequence:
-                        del self.cursors_by_session[arrival.ref]
+                        self.cursors_by_session.pop(arrival.ref)
                     self.operation_finished.notify_all()
 
     def consume_if_aborted(self, request_id: str) -> bool:

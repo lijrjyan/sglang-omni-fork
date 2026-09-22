@@ -142,6 +142,9 @@ speculative generality.
 - Cross-boundary schemas (API req/resp, untrusted input, needs validation): `pydantic.BaseModel`.
   Don't hand-roll validators pydantic gives free.
 - Don't mix the two for one concept. Pick per role, not per mood.
+- Remove a mapping entry with `mapping.pop(key)`. Do not write `del mapping[key]`.
+  `del` also deletes names and attributes, so the statement does not say that
+  an entry is leaving a mapping. `pop` names the mapping and the key.
 
 ## FILE STRUCTURE
 
