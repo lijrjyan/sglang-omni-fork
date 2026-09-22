@@ -27,6 +27,7 @@ from sglang_omni.proto.session import (
     wire_size,
 )
 
+
 class SessionStreamHandler(Protocol):
     def __call__(self, message: StreamMessage) -> None: ...
 
