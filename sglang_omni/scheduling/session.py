@@ -170,7 +170,7 @@ class SessionScheduler(SimpleScheduler):
             self.compute,
             max_concurrency=max_concurrency,
             abort_callback=self.cancel_operation,
-            shutdown_callback=self.shutdown_sessions,
+            shutdown_callback=self.release_sessions_on_scheduler_stop,
         )
         self.inbox = SessionInbox(self.register_operation)
 
@@ -262,7 +262,7 @@ class SessionScheduler(SimpleScheduler):
                     )
                 if session is not None:
                     with session.lock:
-                        self.close_session(ref, session)
+                        self.release_session_state(ref, session)
                 self.finish_operation(payload.request_id)
 
     def cancel_operation(self, request_id: str) -> None:
@@ -271,7 +271,7 @@ class SessionScheduler(SimpleScheduler):
             if cancel_event is not None:
                 cancel_event.set()
 
-    def shutdown_sessions(self) -> None:
+    def release_sessions_on_scheduler_stop(self) -> None:
         with self.session_table_lock:
             self.is_shutting_down = True
             for cancel_event in self.append_cancel_events.values():
@@ -281,7 +281,7 @@ class SessionScheduler(SimpleScheduler):
         for ref, session in open_sessions:
             if session.lock.acquire(blocking=False):
                 try:
-                    self.close_session(ref, session)
+                    self.release_session_state(ref, session)
                 except Exception as exc:
                     errors.append(exc)
                 finally:
@@ -289,7 +289,7 @@ class SessionScheduler(SimpleScheduler):
         if errors:
             raise RuntimeError("session shutdown cleanup failed") from errors[0]
 
-    def close_session(self, ref: SessionRef, session: StageSession) -> None:
+    def release_session_state(self, ref: SessionRef, session: StageSession) -> None:
         if session.is_open:
             self.session_hooks.close(ref)
             session.is_open = False
@@ -331,7 +331,7 @@ class SessionScheduler(SimpleScheduler):
             if self.is_shutting_down:
                 raise RuntimeError("session scheduler is stopping")
         except BaseException:
-            self.close_session(ref, session)
+            self.release_session_state(ref, session)
             raise
         finally:
             session.lock.release()
@@ -357,7 +357,7 @@ class SessionScheduler(SimpleScheduler):
             else:
                 with session.lock:
                     if operation == "close":
-                        self.close_session(ref, session)
+                        self.release_session_state(ref, session)
                         payload.data = {"closed": True}
                         return payload
                     elif self.is_shutting_down:
