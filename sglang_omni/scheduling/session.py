@@ -48,7 +48,7 @@ from sglang_omni.proto.session import (
     TimedChunk,
     find_session_operation,
 )
-from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
 DEFAULT_MAX_OPEN_SESSIONS = 64
@@ -76,11 +76,7 @@ class SessionContext:
 
 
 class SessionHooks:
-    """Hooks run serially per session; different sessions may run concurrently.
-
-    Each hook keeps the state it created. The scheduler only passes SessionIdentity.
-    Failed open releases allocations it has not returned. close is idempotent.
-    """
+    """A stage's callbacks for one session: open, append, close, and usage."""
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
         raise NotImplementedError

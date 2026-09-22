@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Any, Awaitable, Callable
 
-from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
 
