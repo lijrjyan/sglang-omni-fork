@@ -43,8 +43,8 @@ from sglang_omni.admission import QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     ResourceUsage,
+    SessionIdentity,
     SessionOperation,
-    SessionRef,
     TimedChunk,
     find_session_operation,
 )
@@ -70,7 +70,7 @@ class StageCompute(Protocol):
 
 @dataclass(kw_only=True)
 class SessionContext:
-    ref: SessionRef
+    session_identity: SessionIdentity
     cancelled: threading.Event
     emit: ChunkEmitter
 
@@ -78,11 +78,11 @@ class SessionContext:
 class SessionHooks:
     """Hooks run serially per session; different sessions may run concurrently.
 
-    Each hook keeps the state it created. The scheduler only passes SessionRef.
+    Each hook keeps the state it created. The scheduler only passes SessionIdentity.
     Failed open releases allocations it has not returned. close is idempotent.
     """
 
-    def open(self, ref: SessionRef, request: OmniRequest) -> None:
+    def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
         raise NotImplementedError
 
     def append(
@@ -93,10 +93,10 @@ class SessionHooks:
     ) -> StagePayload:
         raise NotImplementedError
 
-    def close(self, ref: SessionRef) -> None:
+    def close(self, session_identity: SessionIdentity) -> None:
         raise NotImplementedError
 
-    def usage(self, ref: SessionRef) -> ResourceUsage:
+    def usage(self, session_identity: SessionIdentity) -> ResourceUsage:
         return ResourceUsage()
 
 
@@ -111,7 +111,7 @@ class StageSession:
 class OperationArrival:
     """Arrival position of one accepted operation inside its session."""
 
-    ref: SessionRef
+    session_identity: SessionIdentity
     operation: Literal["open", "append", "close"]
     sequence: int
 
@@ -157,12 +157,12 @@ class SessionScheduler(SimpleScheduler):
         self.request_compute = compute_fn
         self.max_open_sessions = max_open_sessions
         self.max_state_bytes = max_state_bytes
-        self.open_sessions: dict[SessionRef, StageSession] = {}
+        self.open_sessions: dict[SessionIdentity, StageSession] = {}
         self.append_cancel_events: dict[str, threading.Event] = {}
         self.session_table_lock = threading.Lock()
         self.is_shutting_down = False
         self.arrivals_by_request_id: dict[str, OperationArrival] = {}
-        self.cursors_by_session: dict[SessionRef, SessionOperationCursor] = {}
+        self.cursors_by_session: dict[SessionIdentity, SessionOperationCursor] = {}
         self.operation_finished: threading.Condition = threading.Condition(
             self.session_table_lock
         )
@@ -184,13 +184,13 @@ class SessionScheduler(SimpleScheduler):
         if session_operation is None:
             return
         else:
-            ref = session_operation.ref
+            session_identity = session_operation.session_identity
             with self.session_table_lock:
                 cursor = self.cursors_by_session.setdefault(
-                    ref, SessionOperationCursor()
+                    session_identity, SessionOperationCursor()
                 )
                 self.arrivals_by_request_id[message.request_id] = OperationArrival(
-                    ref=ref,
+                    session_identity=session_identity,
                     operation=session_operation.operation,
                     sequence=cursor.next_sequence,
                 )
@@ -202,7 +202,7 @@ class SessionScheduler(SimpleScheduler):
             if arrival is None:
                 return
             else:
-                cursor = self.cursors_by_session.get(arrival.ref)
+                cursor = self.cursors_by_session.get(arrival.session_identity)
                 if cursor is None:
                     return
                 else:
@@ -212,7 +212,7 @@ class SessionScheduler(SimpleScheduler):
                         cursor.completed_sequences.discard(cursor.runnable_sequence)
                         cursor.runnable_sequence += 1
                     if cursor.runnable_sequence == cursor.next_sequence:
-                        self.cursors_by_session.pop(arrival.ref)
+                        self.cursors_by_session.pop(arrival.session_identity)
                     self.operation_finished.notify_all()
 
     def consume_if_aborted(self, request_id: str) -> bool:
@@ -237,32 +237,39 @@ class SessionScheduler(SimpleScheduler):
             else:
                 return self.request_compute(payload)
         else:
-            ref = session_operation.ref
+            session_identity = session_operation.session_identity
             try:
                 with self.operation_finished:
                     # Note (Junnan Li): A request-level abort may already have consumed the arrival.
                     arrival = self.arrivals_by_request_id.get(payload.request_id)
                     if arrival is not None:
-                        ref = arrival.ref
+                        session_identity = arrival.session_identity
                         sequence = arrival.sequence
                         self.operation_finished.wait_for(
                             lambda: (
-                                (cursor := self.cursors_by_session.get(ref)) is None
+                                (
+                                    cursor := self.cursors_by_session.get(
+                                        session_identity
+                                    )
+                                )
+                                is None
                                 or cursor.runnable_sequence >= sequence
                             )
                         )
                     else:
-                        ref = session_operation.ref
+                        session_identity = session_operation.session_identity
                 return self.compute_session(payload, session_operation)
             finally:
                 # Note (Junnan Li): stop skips a session whose hook is running; it is closed here.
                 with self.session_table_lock:
                     session = (
-                        self.open_sessions.get(ref) if self.is_shutting_down else None
+                        self.open_sessions.get(session_identity)
+                        if self.is_shutting_down
+                        else None
                     )
                 if session is not None:
                     with session.lock:
-                        self.close_session(ref, session)
+                        self.close_session(session_identity, session)
                 self.finish_operation(payload.request_id)
 
     def cancel_operation(self, request_id: str) -> None:
@@ -285,10 +292,10 @@ class SessionScheduler(SimpleScheduler):
                 cancel_event.set()
             open_sessions = list(self.open_sessions.items())
         errors: list[Exception] = []
-        for ref, session in open_sessions:
+        for session_identity, session in open_sessions:
             if session.lock.acquire(blocking=False):
                 try:
-                    self.close_session(ref, session)
+                    self.close_session(session_identity, session)
                 except Exception as exc:
                     errors.append(exc)
                 finally:
@@ -296,7 +303,9 @@ class SessionScheduler(SimpleScheduler):
         if errors:
             raise RuntimeError("session shutdown cleanup failed") from errors[0]
 
-    def close_session(self, ref: SessionRef, session: StageSession) -> None:
+    def close_session(
+        self, session_identity: SessionIdentity, session: StageSession
+    ) -> None:
         """Release one session's state on this stage.
 
         Note (chenyang):
@@ -305,13 +314,15 @@ class SessionScheduler(SimpleScheduler):
         on the stage/scheduler should not be affected.
         """
         if session.is_open:
-            self.session_hooks.close(ref)
+            self.session_hooks.close(session_identity)
             session.is_open = False
         with self.session_table_lock:
-            self.open_sessions.pop(ref, None)
+            self.open_sessions.pop(session_identity, None)
 
-    def update_usage(self, session: StageSession, ref: SessionRef) -> None:
-        usage = self.session_hooks.usage(ref)
+    def update_usage(
+        self, session: StageSession, session_identity: SessionIdentity
+    ) -> None:
+        usage = self.session_hooks.usage(session_identity)
         with self.session_table_lock:
             session.usage = usage
             if (
@@ -323,29 +334,31 @@ class SessionScheduler(SimpleScheduler):
             ):
                 raise QueueFullError()
 
-    def open_session(self, ref: SessionRef, request: OmniRequest) -> None:
+    def open_session(
+        self, session_identity: SessionIdentity, request: OmniRequest
+    ) -> None:
         session = StageSession()
         session.lock.acquire()
         with self.session_table_lock:
             if self.is_shutting_down:
                 session.lock.release()
                 raise RuntimeError("session scheduler is stopping")
-            elif ref in self.open_sessions:
+            elif session_identity in self.open_sessions:
                 session.lock.release()
                 raise ValueError("session already opened")
             elif len(self.open_sessions) >= self.max_open_sessions:
                 session.lock.release()
                 raise QueueFullError()
             else:
-                self.open_sessions[ref] = session
+                self.open_sessions[session_identity] = session
         try:
-            self.session_hooks.open(ref, request)
+            self.session_hooks.open(session_identity, request)
             session.is_open = True
-            self.update_usage(session, ref)
+            self.update_usage(session, session_identity)
             if self.is_shutting_down:
                 raise RuntimeError("session scheduler is stopping")
         except BaseException:
-            self.close_session(ref, session)
+            self.close_session(session_identity, session)
             raise
         finally:
             session.lock.release()
@@ -353,15 +366,15 @@ class SessionScheduler(SimpleScheduler):
     def compute_session(
         self, payload: StagePayload, session_operation: SessionOperation
     ) -> StagePayload:
-        ref = session_operation.ref
+        session_identity = session_operation.session_identity
         operation = session_operation.operation
         if operation == "open":
-            self.open_session(ref, payload.request)
+            self.open_session(session_identity, payload.request)
             payload.data = {"opened": True}
             return payload
         else:
             with self.session_table_lock:
-                session = self.open_sessions.get(ref)
+                session = self.open_sessions.get(session_identity)
             if session is None:
                 if operation == "close":
                     payload.data = {"closed": True}
@@ -371,7 +384,7 @@ class SessionScheduler(SimpleScheduler):
             else:
                 with session.lock:
                     if operation == "close":
-                        self.close_session(ref, session)
+                        self.close_session(session_identity, session)
                         payload.data = {"closed": True}
                         return payload
                     elif self.is_shutting_down:
@@ -404,10 +417,12 @@ class SessionScheduler(SimpleScheduler):
                                 input_chunk,
                                 payload,
                                 SessionContext(
-                                    ref=ref, cancelled=cancel_event, emit=emit
+                                    session_identity=session_identity,
+                                    cancelled=cancel_event,
+                                    emit=emit,
                                 ),
                             )
-                            self.update_usage(session, ref)
+                            self.update_usage(session, session_identity)
                             return updated_payload
                         finally:
                             with self.session_table_lock:

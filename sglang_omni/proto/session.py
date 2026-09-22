@@ -29,7 +29,7 @@ MSGPACK_BIN16_HEADER_GROWTH = 1
 MSGPACK_BIN32_HEADER_GROWTH = 3
 
 
-class SessionRefDict(TypedDict):
+class SessionIdentityDict(TypedDict):
     session_id: str
     incarnation: int
 
@@ -45,7 +45,7 @@ class TimedChunkDict(TypedDict):
 
 
 class OutputChunkDict(TypedDict):
-    ref: SessionRefDict
+    session_identity: SessionIdentityDict
     seq: int
     input_seq: int
     modality: str
@@ -59,17 +59,19 @@ class OutputChunkDict(TypedDict):
 
 class SessionOperationDict(TypedDict):
     operation: Literal["open", "append", "close"]
-    ref: SessionRefDict
+    session_identity: SessionIdentityDict
     stages: list[str]
     chunk: TimedChunkDict | None
 
 
 @dataclass(frozen=True)
-class SessionRef:
+class SessionIdentity:
+    """One generation of a session: session_id plus incarnation."""
+
     session_id: str
     incarnation: int = 1
 
-    def to_dict(self) -> SessionRefDict:
+    def to_dict(self) -> SessionIdentityDict:
         return {"session_id": self.session_id, "incarnation": self.incarnation}
 
 
@@ -110,7 +112,7 @@ class TimedChunk:
 class OutputChunk:
     """input_seq identifies the originating pipeline input, not a stream seq."""
 
-    ref: SessionRef
+    session_identity: SessionIdentity
     seq: int
     input_seq: int
     modality: str
@@ -123,7 +125,7 @@ class OutputChunk:
 
     def to_dict(self) -> OutputChunkDict:
         return {
-            "ref": self.ref.to_dict(),
+            "session_identity": self.session_identity.to_dict(),
             "seq": self.seq,
             "input_seq": self.input_seq,
             "modality": self.modality,
@@ -169,14 +171,14 @@ class SessionOperation:
     """Coordinator-to-stage session operation, carried in request metadata."""
 
     operation: Literal["open", "append", "close"]
-    ref: SessionRef
+    session_identity: SessionIdentity
     stages: tuple[str, ...]
     chunk: TimedChunk | None = None
 
     def to_dict(self) -> SessionOperationDict:
         return {
             "operation": self.operation,
-            "ref": self.ref.to_dict(),
+            "session_identity": self.session_identity.to_dict(),
             "stages": list(self.stages),
             "chunk": None if self.chunk is None else self.chunk.to_dict(),
         }

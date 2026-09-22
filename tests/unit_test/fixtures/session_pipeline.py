@@ -36,9 +36,9 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     SESSION_METADATA_KEY,
     ResourceUsage,
+    SessionIdentity,
     SessionOperation,
     SessionOperationDict,
-    SessionRef,
     TimedChunk,
 )
 from sglang_omni.scheduling.messages import IncomingMessage
@@ -96,7 +96,9 @@ def text_param(params: Mapping[str, object], key: str) -> str | None:
     return value
 
 
-def read_hook_state(ref: SessionRef, request: OmniRequest) -> HookState:
+def read_hook_state(
+    session_identity: SessionIdentity, request: OmniRequest
+) -> HookState:
     params: dict[str, object] = {}
     for key, value in request.params.items():
         if not isinstance(key, str):
@@ -106,7 +108,7 @@ def read_hook_state(ref: SessionRef, request: OmniRequest) -> HookState:
     if not isinstance(should_ignore_cancel, bool):
         raise TypeError("ignore_cancel must be a boolean")
     return HookState(
-        session_id=ref.session_id,
+        session_id=session_identity.session_id,
         count=0,
         open_delay_s=number_param(params, "open_delay", 0),
         fail_open_stage=text_param(params, "fail_open"),
@@ -122,15 +124,15 @@ class Hooks(SessionHooks):
     def __init__(self, name: str, events: Queue[StageEvent]) -> None:
         self.name = name
         self.events = events
-        self.states: dict[SessionRef, HookState] = {}
+        self.states: dict[SessionIdentity, HookState] = {}
 
-    def open(self, ref: SessionRef, request: OmniRequest) -> None:
-        state = read_hook_state(ref, request)
-        self.events.put(("open", self.name, ref.session_id))
+    def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+        state = read_hook_state(session_identity, request)
+        self.events.put(("open", self.name, session_identity.session_id))
         time.sleep(state.open_delay_s)
         if state.fail_open_stage == self.name:
             raise RuntimeError("open failed")
-        self.states[ref] = state
+        self.states[session_identity] = state
 
     def append(
         self,
@@ -140,7 +142,7 @@ class Hooks(SessionHooks):
     ) -> StagePayload:
         import torch
 
-        state = self.states[context.ref]
+        state = self.states[context.session_identity]
         self.events.put(("append", self.name, state.session_id, chunk.seq))
         state.count += 1
         logical_name = self.name.partition(REPLICA_SEPARATOR)[0]
@@ -173,17 +175,17 @@ class Hooks(SessionHooks):
             payload.data = {"count": state.count}
         return payload
 
-    def close(self, ref: SessionRef) -> None:
-        state = self.states.get(ref)
+    def close(self, session_identity: SessionIdentity) -> None:
+        state = self.states.get(session_identity)
         assert state is not None
         self.events.put(("close", self.name, state.session_id))
         if state.fail_close_once_stage == self.name:
             state.fail_close_once_stage = None
             raise RuntimeError("close rejected")
-        del self.states[ref]
+        del self.states[session_identity]
 
-    def usage(self, ref: SessionRef) -> ResourceUsage:
-        return ResourceUsage(bytes=self.states[ref].count)
+    def usage(self, session_identity: SessionIdentity) -> ResourceUsage:
+        return ResourceUsage(bytes=self.states[session_identity].count)
 
 
 def make_session_scheduler(name: str, events: Queue[StageEvent]) -> SessionScheduler:
@@ -293,12 +295,12 @@ async def pipeline(
 
 def operation_metadata(
     operation: Literal["open", "append", "close"],
-    ref: SessionRef,
+    session_identity: SessionIdentity,
     chunk: TimedChunk | None = None,
 ) -> SessionMetadata:
     session_operation = SessionOperation(
         operation=operation,
-        ref=ref,
+        session_identity=session_identity,
         stages=("source",),
         chunk=chunk,
     )

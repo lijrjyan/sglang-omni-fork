@@ -6,7 +6,7 @@ import sys
 import threading
 
 from sglang_omni.proto import OmniRequest, StagePayload
-from sglang_omni.proto.session import SessionRef, TimedChunk
+from sglang_omni.proto.session import SessionIdentity, TimedChunk
 from sglang_omni.scheduling.session import (
     SessionContext,
     SessionHooks,
@@ -21,7 +21,7 @@ from tests.unit_test.fixtures.session_pipeline import (
 def operation_payload(operation):
     metadata = operation_metadata(
         operation,
-        SessionRef("session"),
+        SessionIdentity("session"),
         TimedChunk("audio", 0, 20, 0, b"pcm"),
     )
     return StagePayload(operation, OmniRequest(None, metadata=metadata), {})
@@ -32,12 +32,12 @@ class Hooks(SessionHooks):
         self.block = block
         self.entered = threading.Event()
         self.release = threading.Event()
-        self.opened: set[SessionRef] = set()
-        self.closed: list[SessionRef] = []
+        self.opened: set[SessionIdentity] = set()
+        self.closed: list[SessionIdentity] = []
 
-    def open(self, ref: SessionRef, request: OmniRequest) -> None:
+    def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
         self.pause("open")
-        self.opened.add(ref)
+        self.opened.add(session_identity)
 
     def append(
         self,
@@ -45,7 +45,7 @@ class Hooks(SessionHooks):
         payload: StagePayload,
         context: SessionContext,
     ) -> StagePayload:
-        assert context.ref in self.opened
+        assert context.session_identity in self.opened
         self.pause("append")
         return payload
 
@@ -54,9 +54,9 @@ class Hooks(SessionHooks):
             self.entered.set()
             assert self.release.wait(5)
 
-    def close(self, ref: SessionRef) -> None:
-        self.opened.remove(ref)
-        self.closed.append(ref)
+    def close(self, session_identity: SessionIdentity) -> None:
+        self.opened.remove(session_identity)
+        self.closed.append(session_identity)
 
 
 def run_operation(scheduler, operation, profile=None):

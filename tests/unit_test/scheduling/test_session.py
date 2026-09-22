@@ -14,8 +14,8 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     OutputChunk,
     ResourceUsage,
+    SessionIdentity,
     SessionOperation,
-    SessionRef,
     TimedChunk,
     wire_size,
 )
@@ -41,26 +41,28 @@ class Hooks(SessionHooks):
     def __init__(self, name: str, events: queue.Queue[tuple[object, ...]]) -> None:
         self.name = name
         self.events = events
-        self.states: dict[SessionRef, RecordedState] = {}
+        self.states: dict[SessionIdentity, RecordedState] = {}
 
-    def open(self, ref: SessionRef, request: OmniRequest) -> None:
-        self.events.put(("open", self.name, ref.session_id))
-        self.states[ref] = RecordedState(ref.session_id)
+    def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+        self.events.put(("open", self.name, session_identity.session_id))
+        self.states[session_identity] = RecordedState(session_identity.session_id)
 
-    def close(self, ref: SessionRef) -> None:
-        state = self.states.pop(ref)
+    def close(self, session_identity: SessionIdentity) -> None:
+        state = self.states.pop(session_identity)
         self.events.put(("close", self.name, state.session_id))
 
 
 def test_open_usage_failure_releases_state():
 
     class BrokenUsage(Hooks):
-        def usage(self, ref: SessionRef) -> ResourceUsage:
+        def usage(self, session_identity: SessionIdentity) -> ResourceUsage:
             raise RuntimeError("usage failed")
 
     events = queue.Queue()
     scheduler = SessionScheduler(BrokenUsage("source", events))
-    request = OmniRequest(None, metadata=operation_metadata("open", SessionRef("one")))
+    request = OmniRequest(
+        None, metadata=operation_metadata("open", SessionIdentity("one"))
+    )
     with pytest.raises(RuntimeError, match="usage failed"):
         compute_registered(scheduler, StagePayload("one-open", request, {}))
     assert events.get_nowait()[0] == "open"
@@ -72,18 +74,20 @@ def test_open_usage_failure_releases_state():
 def test_stage_capacity_is_aggregate():
 
     class SizedHooks(Hooks):
-        def open(self, ref: SessionRef, request: OmniRequest) -> None:
-            self.states[ref] = RecordedState(ref.session_id, byte_count=2)
+        def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+            self.states[session_identity] = RecordedState(
+                session_identity.session_id, byte_count=2
+            )
 
-        def usage(self, ref: SessionRef) -> ResourceUsage:
-            return ResourceUsage(bytes=self.states[ref].byte_count)
+        def usage(self, session_identity: SessionIdentity) -> ResourceUsage:
+            return ResourceUsage(bytes=self.states[session_identity].byte_count)
 
     events = queue.Queue()
     scheduler = SessionScheduler(SizedHooks("source", events), max_state_bytes=3)
 
     def invoke(sid, operation):
         request = OmniRequest(
-            None, metadata=operation_metadata(operation, SessionRef(sid))
+            None, metadata=operation_metadata(operation, SessionIdentity(sid))
         )
         return compute_registered(scheduler, StagePayload(sid + operation, request, {}))
 
@@ -113,7 +117,7 @@ def test_malformed_operation_fails_inside_the_request_boundary():
         assert output.type == "error"
         assert isinstance(output.data, ValueError)
         request = OmniRequest(
-            None, metadata=operation_metadata("open", SessionRef("ok"))
+            None, metadata=operation_metadata("open", SessionIdentity("ok"))
         )
         scheduler.inbox.put(
             IncomingMessage("open", "new_request", StagePayload("open", request, {}))
@@ -148,7 +152,7 @@ def test_ordinary_request_uses_handler_or_reports_scoped_error(configured):
             assert isinstance(output.data, ValueError)
             assert "ordinary requests" in str(output.data)
         request = OmniRequest(
-            None, metadata=operation_metadata("open", SessionRef("after-ordinary"))
+            None, metadata=operation_metadata("open", SessionIdentity("after-ordinary"))
         )
         scheduler.inbox.put(
             IncomingMessage("open", "new_request", StagePayload("open", request, {}))
@@ -165,7 +169,7 @@ def test_binary_chunk_wire_size_matches_msgpack(size, monkeypatch):
 
     chunk = TimedChunk("audio", 0, 80, 0, b"x" * size, format="pcm16")
     output = OutputChunk(
-        SessionRef("session"),
+        SessionIdentity("session"),
         0,
         0,
         **{key: value for key, value in asdict(chunk).items() if key != "seq"},
@@ -212,7 +216,7 @@ def session_stage_payload(
             None,
             metadata=operation_metadata(
                 operation,
-                SessionRef("session"),
+                SessionIdentity("session"),
                 TimedChunk("audio", 0, 20, 0, b"x"),
             ),
         ),
@@ -296,7 +300,7 @@ def test_close_runs_after_its_request_is_aborted():
 
     def message(rid, operation):
         request = OmniRequest(
-            None, metadata=operation_metadata(operation, SessionRef("s"))
+            None, metadata=operation_metadata(operation, SessionIdentity("s"))
         )
         return IncomingMessage(rid, "new_request", StagePayload(rid, request, {}))
 
@@ -324,7 +328,7 @@ def test_operation_finished_by_abort_before_running_does_not_wait():
             payload: StagePayload,
             context: SessionContext,
         ) -> StagePayload:
-            state = self.states[context.ref]
+            state = self.states[context.session_identity]
             self.events.put(("append", self.name, state.session_id))
             return payload
 

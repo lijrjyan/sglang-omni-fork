@@ -31,7 +31,7 @@ async def reuse_pipeline(
         for session in list(coordinator.sessions.values()):
             if session.is_closed:
                 continue
-            await coordinator.close_session(session.ref)
+            await coordinator.close_session(session.session_identity)
         coordinator.sessions.clear()
         coordinator.session_unavailable_stages.clear()
         event_log(events)

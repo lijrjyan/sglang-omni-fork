@@ -60,11 +60,11 @@ async def test_configured_singleton_list_route_with_three_stages(tmp_path):
         events,
         processes,
     ):
-        ref = await coordinator.open_session(
+        session_identity = await coordinator.open_session(
             OmniRequest(None), stages=["source", "middle", "sink"]
         )
-        output = coordinator.session_outputs(ref)
-        await coordinator.append_session(ref, chunk(0, eos=True))
+        output = coordinator.session_outputs(session_identity)
+        await coordinator.append_session(session_identity, chunk(0, eos=True))
         data = await asyncio.wait_for(anext(output), 5)
         assert data.kind == "data" and data.payload == {"count": 1, "index": 0}
         receipt = await asyncio.wait_for(anext(output), 5)
@@ -84,8 +84,8 @@ async def test_replica_owner_survives_units_abort_and_scoped_shutdown(tmp_path):
         first_output = coordinator.session_outputs(first)
         second_output = coordinator.session_outputs(second)
 
-        async def unit(ref, output, seq):
-            await coordinator.append_session(ref, chunk(seq))
+        async def unit(session_identity, output, seq):
+            await coordinator.append_session(session_identity, chunk(seq))
             data = await asyncio.wait_for(anext(output), 5)
             receipt = await asyncio.wait_for(anext(output), 5)
             assert data.kind == "data" and receipt.kind == "input_done"
@@ -126,12 +126,14 @@ async def test_accepted_input_snapshots_mutable_payload(linear_pair, monkeypatch
         return await original(stage, endpoint, message)
 
     monkeypatch.setattr(coordinator.control_plane, "submit_to_stage", submit)
-    ref = await coordinator.open_session(OmniRequest(None), stages=["source", "sink"])
-    outputs = coordinator.session_outputs(ref)
+    session_identity = await coordinator.open_session(
+        OmniRequest(None), stages=["source", "sink"]
+    )
+    outputs = coordinator.session_outputs(session_identity)
     payload = {"values": [1]}
     try:
         await coordinator.append_session(
-            ref, TimedChunk("audio", 0, 20, 0, payload, eos=True)
+            session_identity, TimedChunk("audio", 0, 20, 0, payload, eos=True)
         )
         payload["values"].append(2)
 
@@ -144,7 +146,7 @@ async def test_accepted_input_snapshots_mutable_payload(linear_pair, monkeypatch
         assert submitted and all(value == {"values": [1]} for value in submitted)
     finally:
         await outputs.aclose()
-        await coordinator.close_session(ref)
+        await coordinator.close_session(session_identity)
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -152,7 +154,9 @@ async def test_next_input_is_accepted_while_one_unit_is_in_flight(
     linear_pair, monkeypatch
 ) -> None:
     coordinator, _, _ = linear_pair
-    ref = await coordinator.open_session(OmniRequest(None), stages=["source", "sink"])
+    session_identity = await coordinator.open_session(
+        OmniRequest(None), stages=["source", "sink"]
+    )
     entered, release = asyncio.Event(), asyncio.Event()
     append_seqs: list[int] = []
     original = coordinator.session_operation
@@ -172,12 +176,12 @@ async def test_next_input_is_accepted_while_one_unit_is_in_flight(
         return await original(session, operation, owner=owner, chunk=chunk)
 
     monkeypatch.setattr(coordinator, "session_operation", hold_first_append)
-    outputs = coordinator.session_outputs(ref)
+    outputs = coordinator.session_outputs(session_identity)
     try:
-        assert await coordinator.append_session(ref, chunk(0)) == 0
+        assert await coordinator.append_session(session_identity, chunk(0)) == 0
         await asyncio.wait_for(entered.wait(), STAGE_REPLY_TIMEOUT_S)
         accepted_seq = await asyncio.wait_for(
-            coordinator.append_session(ref, chunk(1)),
+            coordinator.append_session(session_identity, chunk(1)),
             IN_FLIGHT_ACCEPT_TIMEOUT_S,
         )
         assert accepted_seq == 1
@@ -191,11 +195,11 @@ async def test_next_input_is_accepted_while_one_unit_is_in_flight(
 @pytest.mark.asyncio(loop_scope="session")
 async def test_append_visits_owners_in_route_order(linear_triple) -> None:
     coordinator, events, _ = linear_triple
-    ref = await coordinator.open_session(
+    session_identity = await coordinator.open_session(
         OmniRequest(None), stages=["source", "middle", "sink"]
     )
-    outputs = coordinator.session_outputs(ref)
-    await coordinator.append_session(ref, chunk(0, eos=True))
+    outputs = coordinator.session_outputs(session_identity)
+    await coordinator.append_session(session_identity, chunk(0, eos=True))
     output_chunk = await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S)
     assert output_chunk.kind == "data"
     await outputs.aclose()
@@ -207,9 +211,11 @@ async def test_mismatched_route_fails_before_leaving_the_session_route(
     linear_triple,
 ) -> None:
     coordinator, events, _ = linear_triple
-    ref = await coordinator.open_session(OmniRequest(None), stages=["source", "sink"])
-    outputs = coordinator.session_outputs(ref)
-    await coordinator.append_session(ref, chunk(0, eos=True))
+    session_identity = await coordinator.open_session(
+        OmniRequest(None), stages=["source", "sink"]
+    )
+    outputs = coordinator.session_outputs(session_identity)
+    await coordinator.append_session(session_identity, chunk(0, eos=True))
     with pytest.raises(RuntimeError, match="session route"):
         await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S)
     assert append_owners(events) == ["source"]
@@ -239,10 +245,12 @@ async def test_later_operations_do_not_carry_the_opening_inputs(
 
     monkeypatch.setattr(coordinator.control_plane, "submit_to_stage", submit)
     request = OmniRequest(inputs={"media": b"secret-audio"})
-    ref = await coordinator.open_session(request, stages=["source", "sink"])
-    outputs = coordinator.session_outputs(ref)
+    session_identity = await coordinator.open_session(
+        request, stages=["source", "sink"]
+    )
+    outputs = coordinator.session_outputs(session_identity)
     try:
-        await coordinator.append_session(ref, chunk(0, eos=True))
+        await coordinator.append_session(session_identity, chunk(0, eos=True))
         await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S)
     finally:
         await outputs.aclose()

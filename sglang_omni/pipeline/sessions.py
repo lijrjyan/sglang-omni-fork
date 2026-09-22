@@ -19,9 +19,9 @@ from sglang_omni.proto import OmniRequest, StreamMessage
 from sglang_omni.proto.session import (
     SESSION_METADATA_KEY,
     OutputChunk,
+    SessionIdentity,
     SessionLimits,
     SessionOperation,
-    SessionRef,
     TimedChunk,
     wire_size,
 )
@@ -33,7 +33,7 @@ class SessionStreamHandler(Protocol):
 
 @dataclass(kw_only=True)
 class Session:
-    ref: SessionRef
+    session_identity: SessionIdentity
     request: OmniRequest
     stages: tuple[str, ...]
     bindings: dict[str, int]
@@ -92,9 +92,9 @@ class CoordinatorSessions:
                 f"request metadata key {SESSION_METADATA_KEY!r} is reserved"
             )
 
-    def get_session(self, ref: SessionRef) -> Session:
-        session = self.sessions.get(ref.session_id)
-        if session is None or session.ref != ref:
+    def get_session(self, session_identity: SessionIdentity) -> Session:
+        session = self.sessions.get(session_identity.session_id)
+        if session is None or session.session_identity != session_identity:
             raise ValueError("unknown or stale session reference")
         return session
 
@@ -105,7 +105,7 @@ class CoordinatorSessions:
         stages: list[str],
         limits: SessionLimits | None = None,
         session_id: str | None = None,
-    ) -> SessionRef:
+    ) -> SessionIdentity:
         """Open a fixed linear route, upstream to downstream, before accepting input."""
         if (
             self.is_sessions_stopping
@@ -143,7 +143,7 @@ class CoordinatorSessions:
                 "session route contains an unregistered owner or unavailable owner"
             )
         session = Session(
-            ref=SessionRef(session_id, self.next_incarnation),
+            session_identity=SessionIdentity(session_id, self.next_incarnation),
             request=request,
             stages=owners,
             bindings=bindings,
@@ -169,14 +169,16 @@ class CoordinatorSessions:
             raise
         session.request = replace(request, inputs=None)
         session.pump = asyncio.create_task(self.pump_session(session))
-        return session.ref
+        return session.session_identity
 
-    async def append_session(self, ref: SessionRef, chunk: TimedChunk) -> int:
+    async def append_session(
+        self, session_identity: SessionIdentity, chunk: TimedChunk
+    ) -> int:
         """Accept input in global seq order, independently of output consumption.
 
         Rejected input keeps its seq for retry; accepted input must not be resubmitted.
         """
-        session = self.get_session(ref)
+        session = self.get_session(session_identity)
         if session.is_closing or session.is_closed:
             raise RuntimeError("session is closing")
         if chunk.seq != session.next_input:
@@ -224,9 +226,11 @@ class CoordinatorSessions:
         session.wake.set()
         return chunk.seq
 
-    async def session_outputs(self, ref: SessionRef) -> AsyncIterator[OutputChunk]:
+    async def session_outputs(
+        self, session_identity: SessionIdentity
+    ) -> AsyncIterator[OutputChunk]:
         """One output consumer; disconnect closes the owned session."""
-        session = self.get_session(ref)
+        session = self.get_session(session_identity)
         if session.is_reading:
             raise RuntimeError("session already has an output consumer")
         session.is_reading = True
@@ -259,7 +263,7 @@ class CoordinatorSessions:
         if session.is_closing:
             return
         output = OutputChunk(
-            ref=session.ref,
+            session_identity=session.session_identity,
             seq=session.next_output,
             input_seq=input_seq,
             modality=chunk.modality,
@@ -314,10 +318,10 @@ class CoordinatorSessions:
         owner: str | None = None,
         chunk: TimedChunk | None = None,
     ) -> None:
-        ref = session.ref
+        session_identity = session.session_identity
         session_operation = SessionOperation(
             operation=operation,
-            ref=ref,
+            session_identity=session_identity,
             stages=session.stages,
             chunk=chunk,
         )
@@ -378,11 +382,11 @@ class CoordinatorSessions:
             if future is not None and not future.done():
                 future.cancel()
 
-    async def close_session(self, ref: SessionRef) -> None:
-        session = self.sessions.get(ref.session_id)
+    async def close_session(self, session_identity: SessionIdentity) -> None:
+        session = self.sessions.get(session_identity.session_id)
         if session is None:
             return
-        if session.ref != ref:
+        if session.session_identity != session_identity:
             raise ValueError("stale session reference")
         await asyncio.shield(self.owned_session_task(self.close_session_state(session)))
         if session.cleanup_error is not None:
@@ -440,7 +444,7 @@ class CoordinatorSessions:
         session.output_wake.set()
         # Note (Junnan Li): An unacknowledged owner may still hold buffers; keep its capacity reserved.
         if session.cleanup_error is None:
-            del self.sessions[session.ref.session_id]
+            del self.sessions[session.session_identity.session_id]
 
     async def shutdown_stage_sessions(self, selected: set[str] | None) -> None:
         affected = set(self._stages) if selected is None else selected
