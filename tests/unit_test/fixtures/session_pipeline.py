@@ -332,20 +332,18 @@ def block_async_call(
     obj: object,
     name: str,
     original: AsyncCall[CallParams, CallResult],
-) -> tuple[asyncio.Event, asyncio.Event, asyncio.Event]:
-    entered, release, completed = (asyncio.Event() for _ in range(3))
+) -> tuple[asyncio.Event, asyncio.Event]:
+    entered, release = asyncio.Event(), asyncio.Event()
 
     async def blocked(
         *args: CallParams.args, **kwargs: CallParams.kwargs
     ) -> CallResult:
         entered.set()
         await release.wait()
-        result = await original(*args, **kwargs)
-        completed.set()
-        return result
+        return await original(*args, **kwargs)
 
     monkeypatch.setattr(obj, name, blocked)
-    return entered, release, completed
+    return entered, release
 
 
 async def wait_until(condition: Condition, timeout: float = 5) -> None:

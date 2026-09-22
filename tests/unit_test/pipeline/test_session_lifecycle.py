@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Literal
 
 import pytest
@@ -12,6 +13,7 @@ from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.proto import OmniRequest
 from sglang_omni.proto.session import SessionLimits, TimedChunk
 from tests.unit_test.fixtures.session_pipeline import (
+    PipelineResources,
     block_async_call,
     chunk,
     event_log,
@@ -40,7 +42,9 @@ async def test_timeout_cancel_noop_waits_before_close(linear_pair):
     closed = [(i, e[1]) for i, e in enumerate(log) if e[0] == "close"]
     assert [owner for _, owner in closed] == ["sink", "source"]
     assert closed[0][0] > finished
-    second = await coordinator.open_session(OmniRequest(None), stages=["source", "sink"])
+    second = await coordinator.open_session(
+        OmniRequest(None), stages=["source", "sink"]
+    )
     await coordinator.close_session(second)
 
 
@@ -105,7 +109,7 @@ async def test_worker_failure_wakes_output_and_fails_session(tmp_path, monkeypat
         futures = list(coordinator._completion_futures.values())
         assert futures and not any(future.done() for future in futures)
         # Note (Junnan Li): Cleanup waits for the pump, which waits on this future; fail the waiters first.
-        entered, release, _ = block_async_call(
+        entered, release = block_async_call(
             monkeypatch, coordinator, "cleanup_session", coordinator.cleanup_session
         )
         failing = asyncio.create_task(
@@ -238,11 +242,11 @@ async def assert_closing_rejects_new_input(
     monkeypatch: pytest.MonkeyPatch,
     trigger: Literal["close", "shutdown", "idle", "command_timeout"],
 ) -> None:
-    params = (
+    request_params = (
         {"ignore_cancel": True, "delay": 0.3} if trigger == "command_timeout" else {}
     )
     ref = await coordinator.open_session(
-        OmniRequest(None, params),
+        OmniRequest(None, request_params),
         stages=["source", "sink"],
         limits=SessionLimits(
             idle_timeout_s=0.2 if trigger == "idle" else 300,
@@ -251,40 +255,49 @@ async def assert_closing_rejects_new_input(
     )
     # Note (Junnan Li): A failed command aborts its request before the pump cleans up; admission is closed by then.
     if trigger == "command_timeout":
-        seam, original = "abort", coordinator.abort
+        method_name, original_method = "abort", coordinator.abort
     else:
-        seam, original = "cleanup_session", coordinator.cleanup_session
-    entered, release, _ = block_async_call(monkeypatch, coordinator, seam, original)
-    task = None
+        method_name, original_method = "cleanup_session", coordinator.cleanup_session
+    entered, release = block_async_call(
+        monkeypatch, coordinator, method_name, original_method
+    )
     if trigger == "close":
-        task = asyncio.create_task(coordinator.close_session(ref))
+        close_task = asyncio.create_task(coordinator.close_session(ref))
     elif trigger == "shutdown":
-        task = asyncio.create_task(coordinator.shutdown_stages(["sink"]))
+        close_task = asyncio.create_task(coordinator.shutdown_stages(["sink"]))
     elif trigger == "command_timeout":
         await coordinator.append_session(ref, chunk(0))
+        close_task = None
     else:
         assert trigger == "idle"
+        close_task = None
     try:
         await asyncio.wait_for(entered.wait(), 5)
         with pytest.raises(RuntimeError, match="closing"):
             await coordinator.append_session(ref, chunk(1))
     finally:
         release.set()
-        if task is not None:
-            await asyncio.wait_for(task, 5)
+        if close_task is not None:
+            await asyncio.wait_for(close_task, 5)
         else:
             await asyncio.wait_for(coordinator.close_session(ref), 5)
 
 
 @pytest.mark.asyncio(loop_scope="session")
 @pytest.mark.parametrize("trigger", ["close", "idle", "command_timeout"])
-async def test_closing_rejects_input_before_cleanup(linear_pair, monkeypatch, trigger):
+async def test_closing_rejects_input_before_cleanup(
+    linear_pair: PipelineResources,
+    monkeypatch: pytest.MonkeyPatch,
+    trigger: Literal["close", "idle", "command_timeout"],
+) -> None:
     coordinator, _, _ = linear_pair
     await assert_closing_rejects_new_input(coordinator, monkeypatch, trigger)
 
 
 @pytest.mark.asyncio
-async def test_shutdown_rejects_input_before_cleanup(tmp_path, monkeypatch):
+async def test_shutdown_rejects_input_before_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     async with pipeline(tmp_path) as (coordinator, _, _):
         await assert_closing_rejects_new_input(coordinator, monkeypatch, "shutdown")
 
