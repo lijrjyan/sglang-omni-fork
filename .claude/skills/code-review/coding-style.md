@@ -78,13 +78,12 @@ speculative generality.
 
 ## TYPING & SIGNATURES
 
-- Full type hints, modern syntax: `X | Y`, `list[...]`, `dict[str, int]`, `X | None`.
-  Annotate return types.
-- ONE typing style per repo. Don't mix `Optional[X]`/`Union[X,Y]` with `X | Y`. Modern
-  preferred; if the repo uses `Optional`, match it.
+- Full type hints on every function, method, and attribute. Annotate parameters
+  and return types. One syntax only: `X | Y`, `list[int]`, `dict[str, int]`,
+  `X | None`. Do not introduce `Optional` or `Union`.
 - Either `requires-python >= 3.10` (native `X | Y`) or `from __future__ import annotations`.
-  Don't use `Optional` to work around forward refs — use quoted annotations
-  (`"ModelConfig"`).
+  A quoted annotation is only a forward reference inside the same class
+  (`"ModelConfig"`). Do not quote a name to avoid importing it.
 - Do not use `if TYPE_CHECKING:`. It hides imports from runtime and from
   pre-commit. Import the name at module level, or write the concrete type in
   the annotation (`tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]`
@@ -92,24 +91,36 @@ speculative generality.
   into a third module.
 - Closed value sets → `Literal[...]` or `Enum`, not bare strings in comparisons.
 - No mutable function defaults: `def f(x=[])`/`= {}` are bugs. Use a `None` sentinel.
-- Use concrete types, including model and decoder types. Annotate structured
-  values and resource handles according to their actual contracts, including
-  element types and optionality. Bare `dict`/`list`/`tuple` are not annotations.
-- Do not annotate with `Any`. It disables checking for that value and every
-  field read from it. Name a dataclass, TypedDict, `Literal`, or a union of
-  those. Do not use `TypeVar` or `Generic`. Do not annotate a value as
-  `object` because the current function does not read its fields. Name the
-  type the caller actually passes. If callers do not share one type, the
-  code that creates the value keeps it, instead of putting it on a shared
-  signature. On an untrusted boundary, `object` is allowed, and the next
-  use must narrow it with `isinstance`. Do not write
-  `dict[str, Any]`, `list[Any]`, `tuple[Any, ...]`, or `Coroutine[Any, Any, T]`.
-  A coroutine that does not yield is `Coroutine[None, None, T]`.
-- Do not annotate with `Callable` or `Callable[...]`. Declare a `Protocol`
-  whose `__call__` names each parameter and the return type. Do not use
-  `ParamSpec`. Do not recover an erased signature with `*args` or `**kwargs`.
+- Every annotation names a concrete type: a dataclass, TypedDict, NamedTuple,
+  Enum, `Literal`, or a union of those. A reader must be able to see the
+  fields, the element types, and the return type. Parameterize every
+  container (`dict[str, int]`, `list[TokenId]`, `tuple[torch.Tensor, torch.Tensor]`).
+  This includes model and decoder types, structured values, and resource handles.
+- Vague types are banned in annotations, aliases, and casts. They disable
+  checking and hide the real contract. Do not write any of these, including
+  under `typing` or `collections.abc`:
+  `Any`, `AnyStr`, `object`, `Callable`, `TypeVar`, `Generic`, `ParamSpec`,
+  `Concatenate`, `TypeVarTuple`, `cast`, `Optional`, `Union`,
+  `dict[str, Any]`, `list[Any]`, `tuple[Any, ...]`, `Sequence[Any]`,
+  `Mapping[str, Any]`, `Iterable[Any]`, `Coroutine[Any, Any, T]`, `type[Any]`.
+  Bare `dict`, `list`, `tuple`, `set`, `Mapping`, `Sequence`, `Iterable`,
+  `Iterator`, and `Collection` are the same failure. A coroutine that does
+  not yield is `Coroutine[None, None, Concrete]`, with `Concrete` named.
+  Wrong: `def append(self, state: object, emit: Callable[[TimedChunk], None]) -> Any`.
+  Right: `emit` is a `ChunkEmitter` Protocol whose `__call__` takes `TimedChunk`
+  and returns `None`, and `append` returns `StagePayload`.
+- A callback is a `Protocol` whose `__call__` names each parameter and the
+  return type. Do not recover an erased signature with `*args` or `**kwargs`.
   If two wrapped functions do not share one parameter list, write each one
-  separately and name its parameters.
+  separately and name its parameters. Do not use `TypeVar` to connect a
+  stored value to a later parameter. If callers do not share one type, the
+  code that creates the value keeps it and names that type. The shared
+  signature does not accept it.
+- The only `object` exception is an untrusted boundary: decoded JSON, a wire
+  dict, or a raw request body. That parameter may be `object` or
+  `Mapping[str, object]`. The next use narrows it with `isinstance` before
+  reading a field, and does not pass the `object` onward. Do not use `cast`
+  or `# type: ignore` in place of that narrowing.
 - Do not accept a parameter only to immediately delete it to silence type or lint
   checks, such as starting a function with `del request_id`. Remove unnecessary
   parameters and update callers. If an established interface requires an unused

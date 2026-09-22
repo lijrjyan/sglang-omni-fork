@@ -244,7 +244,7 @@ def test_session_commands_run_in_arrival_order_even_when_one_is_aborted():
         if event[0] == "append":
             order.append(event[1])
     assert order == ["first", "third"]
-    assert not scheduler.orders and not scheduler.tickets
+    assert not scheduler.cursors_by_session and not scheduler.arrivals_by_request_id
 
 
 def test_later_command_does_not_start_before_the_session_lock() -> None:
@@ -304,8 +304,8 @@ def test_close_runs_after_its_request_is_aborted():
         scheduler.stop()
         worker.join(timeout=5)
     assert not worker.is_alive()
-    assert not scheduler.sessions and not scheduler.tickets
-    assert not scheduler.close_requests
+    assert not scheduler.open_sessions and not scheduler.arrivals_by_request_id
+    assert not scheduler.close_request_ids
 
 
 def test_command_finished_by_abort_before_running_does_not_wait():
@@ -348,4 +348,4 @@ def test_command_finished_by_abort_before_running_does_not_wait():
     while not events.empty():
         seen.append(events.get_nowait()[0])
     assert seen == ["open", "append"]
-    assert not scheduler.orders and not scheduler.tickets
+    assert not scheduler.cursors_by_session and not scheduler.arrivals_by_request_id

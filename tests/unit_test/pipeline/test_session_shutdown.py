@@ -90,7 +90,7 @@ def test_stop_hands_cleanup_to_active_hook_completion():
         thread.join(5)
     assert not thread.is_alive() and not errors
     assert len(hooks.closed) == 1
-    assert not scheduler.sessions
+    assert not scheduler.open_sessions
     scheduler.stop()
     assert len(hooks.closed) == 1
 
@@ -109,7 +109,7 @@ def test_stop_during_open_rejects_the_session():
     assert not thread.is_alive()
     assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
     assert len(hooks.closed) == 1
-    assert not scheduler.sessions
+    assert not scheduler.open_sessions
 
 
 def test_stop_after_open_checks_before_owner_unlock():
@@ -137,4 +137,4 @@ def test_stop_after_open_checks_before_owner_unlock():
         thread.join(5)
     assert not thread.is_alive() and not errors
     assert len(hooks.closed) == 1
-    assert not scheduler.sessions
+    assert not scheduler.open_sessions

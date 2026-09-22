@@ -199,7 +199,7 @@ def worker(spec: StageLaunchConfig, ready: Event) -> None:
         await stage.start()
         ready.set()
         await stage.run()
-        assert not stage.scheduler.sessions
+        assert not stage.scheduler.open_sessions
 
     asyncio.run(run())
 
