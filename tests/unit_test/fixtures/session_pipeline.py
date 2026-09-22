@@ -119,7 +119,7 @@ def read_hook_state(ref: SessionRef, request: OmniRequest) -> HookState:
     )
 
 
-class Hooks(SessionHooks[HookState]):
+class Hooks(SessionHooks):
     def __init__(self, name: str, events: Queue[StageEvent]) -> None:
         self.name = name
         self.events = events
@@ -183,9 +183,7 @@ class Hooks(SessionHooks[HookState]):
         return ResourceUsage(bytes=state.count)
 
 
-def make_session_scheduler(
-    name: str, events: Queue[StageEvent]
-) -> SessionScheduler[HookState]:
+def make_session_scheduler(name: str, events: Queue[StageEvent]) -> SessionScheduler:
     return SessionScheduler(Hooks(name, events))
 
 

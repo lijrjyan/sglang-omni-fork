@@ -6,7 +6,7 @@ from __future__ import annotations
 import queue
 import threading
 from dataclasses import dataclass, field
-from typing import Generic, Protocol, TypeVar
+from typing import Protocol
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -23,7 +23,6 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 DEFAULT_MAX_SESSIONS = 64
 DEFAULT_MAX_CONCURRENCY = 4
 DEFAULT_MAX_STATE_BYTES = 1 << 30
-SessionStateT = TypeVar("SessionStateT")
 
 
 class ChunkEmitter(Protocol):
@@ -45,34 +44,35 @@ class SessionContext:
     emit: ChunkEmitter
 
 
-class SessionHooks(Generic[SessionStateT]):
+class SessionHooks:
     """Hooks run serially per session; different sessions may run concurrently.
 
     Failed open releases allocations it has not returned. close is idempotent.
+    The scheduler stores the open() result and passes it back without reading it.
     """
 
-    def open(self, ref: SessionRef, request: OmniRequest) -> SessionStateT:
+    def open(self, ref: SessionRef, request: OmniRequest) -> object:
         raise NotImplementedError
 
     def append(
         self,
-        state: SessionStateT,
+        state: object,
         chunk: TimedChunk,
         payload: StagePayload,
         context: SessionContext,
     ) -> StagePayload:
         raise NotImplementedError
 
-    def close(self, state: SessionStateT) -> None:
+    def close(self, state: object) -> None:
         raise NotImplementedError
 
-    def usage(self, state: SessionStateT) -> ResourceUsage:
+    def usage(self, state: object) -> ResourceUsage:
         return ResourceUsage()
 
 
 @dataclass(kw_only=True)
-class StageSession(Generic[SessionStateT]):
-    state: SessionStateT | None
+class StageSession:
+    state: object | None
     lock: threading.Lock = field(default_factory=threading.Lock)
     usage: ResourceUsage = field(default_factory=ResourceUsage)
 
@@ -102,12 +102,12 @@ class SessionInbox(queue.Queue[IncomingMessage]):
         super().put(message, block, timeout)
 
 
-class SessionScheduler(SimpleScheduler, Generic[SessionStateT]):
+class SessionScheduler(SimpleScheduler):
     """Opt-in scheduler for persistent hooks, with bounded stage admission."""
 
     def __init__(
         self,
-        hooks: SessionHooks[SessionStateT],
+        hooks: SessionHooks,
         *,
         compute_fn: StageCompute | None = None,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
@@ -118,7 +118,7 @@ class SessionScheduler(SimpleScheduler, Generic[SessionStateT]):
         self.ordinary_compute = compute_fn
         self.max_sessions = max_sessions
         self.max_state_bytes = max_state_bytes
-        self.sessions: dict[tuple[str, int], StageSession[SessionStateT]] = {}
+        self.sessions: dict[tuple[str, int], StageSession] = {}
         self.commands: dict[str, threading.Event] = {}
         self.session_lock = threading.Lock()
         self.is_closing = False
@@ -235,9 +235,7 @@ class SessionScheduler(SimpleScheduler, Generic[SessionStateT]):
         if errors:
             raise RuntimeError("session shutdown cleanup failed") from errors[0]
 
-    def close_session(
-        self, key: tuple[str, int], session: StageSession[SessionStateT]
-    ) -> None:
+    def close_session(self, key: tuple[str, int], session: StageSession) -> None:
         state = session.state
         if state is not None:
             self.hooks.close(state)
@@ -245,7 +243,7 @@ class SessionScheduler(SimpleScheduler, Generic[SessionStateT]):
         with self.session_lock:
             self.sessions.pop(key, None)
 
-    def update_usage(self, session: StageSession[SessionStateT]) -> None:
+    def update_usage(self, session: StageSession) -> None:
         state = session.state
         assert state is not None
         usage = self.hooks.usage(state)
@@ -315,6 +313,8 @@ class SessionScheduler(SimpleScheduler, Generic[SessionStateT]):
             else:
                 input_chunk = command.chunk
                 assert input_chunk is not None, "append command carries no chunk"
+                state = session.state
+                assert state is not None
                 event = threading.Event()
                 with self.session_lock:
                     self.commands[payload.request_id] = event
@@ -335,7 +335,7 @@ class SessionScheduler(SimpleScheduler, Generic[SessionStateT]):
 
                 try:
                     updated_payload = self.hooks.append(
-                        session.state,
+                        state,
                         input_chunk,
                         payload,
                         SessionContext(ref=ref, cancelled=event, emit=emit),

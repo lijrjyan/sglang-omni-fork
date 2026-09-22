@@ -37,7 +37,7 @@ class RecordedState:
     byte_count: int = 0
 
 
-class Hooks(SessionHooks[RecordedState]):
+class Hooks(SessionHooks):
     def __init__(self, name: str, events: queue.Queue[tuple[object, ...]]) -> None:
         self.name = name
         self.events = events

@@ -7,7 +7,11 @@ import threading
 
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import SessionRef, TimedChunk
-from sglang_omni.scheduling.session import SessionContext, SessionHooks, SessionScheduler
+from sglang_omni.scheduling.session import (
+    SessionContext,
+    SessionHooks,
+    SessionScheduler,
+)
 from tests.unit_test.fixtures.session_pipeline import (
     command_metadata,
     compute_registered,
@@ -23,7 +27,7 @@ def command(op):
     return StagePayload(op, OmniRequest(None, metadata=metadata), {})
 
 
-class Hooks(SessionHooks[object]):
+class Hooks(SessionHooks):
     def __init__(self, block: str | None = None) -> None:
         self.block = block
         self.entered = threading.Event()

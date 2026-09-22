@@ -96,17 +96,18 @@ speculative generality.
   values and resource handles according to their actual contracts, including
   element types and optionality. Bare `dict`/`list`/`tuple` are not annotations.
 - Do not annotate with `Any`. It disables checking for that value and every
-  field read from it. Name a dataclass, TypedDict, `Literal`, `TypeVar` on a
-  generic class, or a union of those. `object` is allowed only on an untrusted
-  boundary, and the next use must narrow it with `isinstance`. Do not write
+  field read from it. Name a dataclass, TypedDict, `Literal`, or a union of
+  those. Do not use `TypeVar` or `Generic`. A value the holder stores and
+  passes on without reading its fields is `object`; the code that creates
+  the value names its real type. On an untrusted boundary, `object` is also
+  allowed, and the next use must narrow it with `isinstance`. Do not write
   `dict[str, Any]`, `list[Any]`, `tuple[Any, ...]`, or `Coroutine[Any, Any, T]`.
   A coroutine that does not yield is `Coroutine[None, None, T]`.
 - Do not annotate with `Callable` or `Callable[...]`. Declare a `Protocol`
   whose `__call__` names each parameter and the return type. Do not use
   `ParamSpec`. Do not recover an erased signature with `*args` or `**kwargs`.
   If two wrapped functions do not share one parameter list, write each one
-  separately and name its parameters. Do not add a `TypeVar` only to fill a
-  generic slot the function never reads; annotate the methods it actually calls.
+  separately and name its parameters.
 - Do not accept a parameter only to immediately delete it to silence type or lint
   checks, such as starting a function with `del request_id`. Remove unnecessary
   parameters and update callers. If an established interface requires an unused
