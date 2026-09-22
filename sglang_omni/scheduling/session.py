@@ -152,32 +152,37 @@ class SessionScheduler(SimpleScheduler):
             return
         if session_operation is None:
             return
-        ref = session_operation.ref
-        with self.session_table_lock:
-            cursor = self.cursors_by_session.setdefault(ref, SessionOperationCursor())
-            self.arrivals_by_request_id[message.request_id] = OperationArrival(
-                ref=ref,
-                operation=session_operation.operation,
-                sequence=cursor.next_sequence,
-            )
-            cursor.next_sequence += 1
+        else:
+            ref = session_operation.ref
+            with self.session_table_lock:
+                cursor = self.cursors_by_session.setdefault(
+                    ref, SessionOperationCursor()
+                )
+                self.arrivals_by_request_id[message.request_id] = OperationArrival(
+                    ref=ref,
+                    operation=session_operation.operation,
+                    sequence=cursor.next_sequence,
+                )
+                cursor.next_sequence += 1
 
     def finish_operation(self, request_id: str) -> None:
         with self.operation_finished:
             arrival = self.arrivals_by_request_id.pop(request_id, None)
             if arrival is None:
                 return
-            cursor = self.cursors_by_session.get(arrival.ref)
-            if cursor is None:
-                return
-            # Note (Junnan Li): An aborted operation can finish before its predecessors ran.
-            cursor.completed_sequences.add(arrival.sequence)
-            while cursor.runnable_sequence in cursor.completed_sequences:
-                cursor.completed_sequences.discard(cursor.runnable_sequence)
-                cursor.runnable_sequence += 1
-            if cursor.runnable_sequence == cursor.next_sequence:
-                del self.cursors_by_session[arrival.ref]
-            self.operation_finished.notify_all()
+            else:
+                cursor = self.cursors_by_session.get(arrival.ref)
+                if cursor is None:
+                    return
+                else:
+                    # Note (Junnan Li): An aborted operation can finish before its predecessors ran.
+                    cursor.completed_sequences.add(arrival.sequence)
+                    while cursor.runnable_sequence in cursor.completed_sequences:
+                        cursor.completed_sequences.discard(cursor.runnable_sequence)
+                        cursor.runnable_sequence += 1
+                    if cursor.runnable_sequence == cursor.next_sequence:
+                        del self.cursors_by_session[arrival.ref]
+                    self.operation_finished.notify_all()
 
     def consume_if_aborted(self, request_id: str) -> bool:
         aborted = super().consume_if_aborted(request_id)
@@ -187,43 +192,51 @@ class SessionScheduler(SimpleScheduler):
         if aborted and is_close_operation:
             # Note (Junnan Li): A timed-out close is request-aborted; skipping it would leak the state.
             return False
-        if aborted:
+        elif aborted:
             self.finish_operation(request_id)
-        return aborted
+            return aborted
+        else:
+            return aborted
 
     def compute(self, payload: StagePayload) -> StagePayload:
         session_operation = find_session_operation(payload.request.metadata)
         if session_operation is None:
             if self.request_compute is None:
                 raise ValueError("this stage has no compute_fn for ordinary requests")
-            return self.request_compute(payload)
-        ref = session_operation.ref
-        try:
-            with self.operation_finished:
-                # Note (Junnan Li): A request-level abort may already have consumed the arrival.
-                arrival = self.arrivals_by_request_id.get(payload.request_id)
-                if arrival is not None:
-                    ref = arrival.ref
-                    sequence = arrival.sequence
-                    self.operation_finished.wait_for(
-                        lambda: (
-                            (cursor := self.cursors_by_session.get(ref)) is None
-                            or cursor.runnable_sequence >= sequence
-                        )
-                    )
-            return self.compute_session(payload, session_operation)
-        finally:
+            else:
+                return self.request_compute(payload)
+        else:
+            ref = session_operation.ref
             try:
-                # Note (Junnan Li): stop skips a session whose hook is running; it is closed here.
-                with self.session_table_lock:
-                    session = (
-                        self.open_sessions.get(ref) if self.is_shutting_down else None
-                    )
-                if session is not None:
-                    with session.lock:
-                        self.close_session(ref, session)
+                with self.operation_finished:
+                    # Note (Junnan Li): A request-level abort may already have consumed the arrival.
+                    arrival = self.arrivals_by_request_id.get(payload.request_id)
+                    if arrival is not None:
+                        ref = arrival.ref
+                        sequence = arrival.sequence
+                        self.operation_finished.wait_for(
+                            lambda: (
+                                (cursor := self.cursors_by_session.get(ref)) is None
+                                or cursor.runnable_sequence >= sequence
+                            )
+                        )
+                    else:
+                        ref = session_operation.ref
+                return self.compute_session(payload, session_operation)
             finally:
-                self.finish_operation(payload.request_id)
+                try:
+                    # Note (Junnan Li): stop skips a session whose hook is running; it is closed here.
+                    with self.session_table_lock:
+                        session = (
+                            self.open_sessions.get(ref)
+                            if self.is_shutting_down
+                            else None
+                        )
+                    if session is not None:
+                        with session.lock:
+                            self.close_session(ref, session)
+                finally:
+                    self.finish_operation(payload.request_id)
 
     def cancel_operation(self, request_id: str) -> None:
         with self.session_table_lock:
@@ -276,13 +289,14 @@ class SessionScheduler(SimpleScheduler):
             if self.is_shutting_down:
                 session.lock.release()
                 raise RuntimeError("session scheduler is stopping")
-            if ref in self.open_sessions:
+            elif ref in self.open_sessions:
                 session.lock.release()
                 raise ValueError("session already opened")
-            if len(self.open_sessions) >= self.max_open_sessions:
+            elif len(self.open_sessions) >= self.max_open_sessions:
                 session.lock.release()
                 raise QueueFullError()
-            self.open_sessions[ref] = session
+            else:
+                self.open_sessions[ref] = session
         try:
             self.session_hooks.open(ref, request)
             session.is_open = True
@@ -304,51 +318,56 @@ class SessionScheduler(SimpleScheduler):
             self.open_session(ref, payload.request)
             payload.data = {"opened": True}
             return payload
-
-        with self.session_table_lock:
-            session = self.open_sessions.get(ref)
-        if session is None:
-            if operation == "close":
-                payload.data = {"closed": True}
-                return payload
+        else:
+            with self.session_table_lock:
+                session = self.open_sessions.get(ref)
+            if session is None:
+                if operation == "close":
+                    payload.data = {"closed": True}
+                    return payload
+                else:
+                    raise ValueError("unknown session incarnation")
             else:
-                raise ValueError("unknown session incarnation")
-        with session.lock:
-            if operation == "close":
-                self.close_session(ref, session)
-                payload.data = {"closed": True}
-                return payload
-            elif self.is_shutting_down:
-                raise RuntimeError("session scheduler is stopping")
-            else:
-                input_chunk = session_operation.chunk
-                assert input_chunk is not None, "append operation carries no chunk"
-                cancel_event = threading.Event()
-                with self.session_table_lock:
-                    self.append_cancel_events[payload.request_id] = cancel_event
-                with self._abort_lock:
-                    if payload.request_id in self._aborted:
-                        cancel_event.set()
+                with session.lock:
+                    if operation == "close":
+                        self.close_session(ref, session)
+                        payload.data = {"closed": True}
+                        return payload
+                    elif self.is_shutting_down:
+                        raise RuntimeError("session scheduler is stopping")
+                    else:
+                        input_chunk = session_operation.chunk
+                        assert (
+                            input_chunk is not None
+                        ), "append operation carries no chunk"
+                        cancel_event = threading.Event()
+                        with self.session_table_lock:
+                            self.append_cancel_events[payload.request_id] = cancel_event
+                        with self._abort_lock:
+                            if payload.request_id in self._aborted:
+                                cancel_event.set()
 
-                def emit(chunk: TimedChunk) -> None:
-                    if not cancel_event.is_set():
-                        self.outbox.put(
-                            OutgoingMessage(
-                                request_id=payload.request_id,
-                                type="stream",
-                                data=chunk.to_dict(),
-                                metadata={"modality": chunk.modality},
+                        def emit(chunk: TimedChunk) -> None:
+                            if not cancel_event.is_set():
+                                self.outbox.put(
+                                    OutgoingMessage(
+                                        request_id=payload.request_id,
+                                        type="stream",
+                                        data=chunk.to_dict(),
+                                        metadata={"modality": chunk.modality},
+                                    )
+                                )
+
+                        try:
+                            updated_payload = self.session_hooks.append(
+                                input_chunk,
+                                payload,
+                                SessionContext(
+                                    ref=ref, cancelled=cancel_event, emit=emit
+                                ),
                             )
-                        )
-
-                try:
-                    updated_payload = self.session_hooks.append(
-                        input_chunk,
-                        payload,
-                        SessionContext(ref=ref, cancelled=cancel_event, emit=emit),
-                    )
-                    self.update_usage(session, ref)
-                    return updated_payload
-                finally:
-                    with self.session_table_lock:
-                        self.append_cancel_events.pop(payload.request_id, None)
+                            self.update_usage(session, ref)
+                            return updated_payload
+                        finally:
+                            with self.session_table_lock:
+                                self.append_cancel_events.pop(payload.request_id, None)

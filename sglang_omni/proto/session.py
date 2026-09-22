@@ -100,7 +100,10 @@ class TimedChunk:
     def from_dict(cls, data: object) -> TimedChunk:
         if not isinstance(data, dict):
             raise ValueError("timed chunk must be an object")
-        return msgspec.convert(data, type=cls, strict=True, builtin_types=BUILTIN_TYPES)
+        else:
+            return msgspec.convert(
+                data, type=cls, strict=True, builtin_types=BUILTIN_TYPES
+            )
 
 
 @dataclass(frozen=True)
@@ -136,7 +139,10 @@ class OutputChunk:
     def from_dict(cls, data: object) -> OutputChunk:
         if not isinstance(data, dict):
             raise ValueError("output chunk must be an object")
-        return msgspec.convert(data, type=cls, strict=True, builtin_types=BUILTIN_TYPES)
+        else:
+            return msgspec.convert(
+                data, type=cls, strict=True, builtin_types=BUILTIN_TYPES
+            )
 
 
 @dataclass(frozen=True)
@@ -179,7 +185,10 @@ class SessionOperation:
     def from_dict(cls, data: object) -> SessionOperation:
         if not isinstance(data, dict):
             raise ValueError("session operation must be an object")
-        return msgspec.convert(data, type=cls, strict=True, builtin_types=BUILTIN_TYPES)
+        else:
+            return msgspec.convert(
+                data, type=cls, strict=True, builtin_types=BUILTIN_TYPES
+            )
 
 
 def find_session_operation(
@@ -189,7 +198,8 @@ def find_session_operation(
     operation_fields = metadata.get(SESSION_METADATA_KEY)
     if operation_fields is None:
         return None
-    return SessionOperation.from_dict(operation_fields)
+    else:
+        return SessionOperation.from_dict(operation_fields)
 
 
 def wire_size(chunk_fields: TimedChunkDict | OutputChunkDict) -> int:
