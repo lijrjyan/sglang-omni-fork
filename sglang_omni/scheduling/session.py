@@ -262,7 +262,7 @@ class SessionScheduler(SimpleScheduler):
                     )
                 if session is not None:
                     with session.lock:
-                        self.release_session_state(ref, session)
+                        self.close_session(ref, session)
                 self.finish_operation(payload.request_id)
 
     def cancel_operation(self, request_id: str) -> None:
@@ -272,6 +272,13 @@ class SessionScheduler(SimpleScheduler):
                 cancel_event.set()
 
     def release_sessions_on_scheduler_stop(self) -> None:
+        """Release every session still open when this stage's scheduler stops.
+
+        Note (chenyang):
+
+        release_sessions_on_scheduler_stop is used when a stage/scheduler stops.
+        In this time, all the sessions that are still open should be closed.
+        """
         with self.session_table_lock:
             self.is_shutting_down = True
             for cancel_event in self.append_cancel_events.values():
@@ -281,7 +288,7 @@ class SessionScheduler(SimpleScheduler):
         for ref, session in open_sessions:
             if session.lock.acquire(blocking=False):
                 try:
-                    self.release_session_state(ref, session)
+                    self.close_session(ref, session)
                 except Exception as exc:
                     errors.append(exc)
                 finally:
@@ -289,7 +296,14 @@ class SessionScheduler(SimpleScheduler):
         if errors:
             raise RuntimeError("session shutdown cleanup failed") from errors[0]
 
-    def release_session_state(self, ref: SessionRef, session: StageSession) -> None:
+    def close_session(self, ref: SessionRef, session: StageSession) -> None:
+        """Release one session's state on this stage.
+
+        Note (chenyang):
+
+        close_session is used when a session is closed. The other sessions
+        on the stage/scheduler should not be affected.
+        """
         if session.is_open:
             self.session_hooks.close(ref)
             session.is_open = False
@@ -331,7 +345,7 @@ class SessionScheduler(SimpleScheduler):
             if self.is_shutting_down:
                 raise RuntimeError("session scheduler is stopping")
         except BaseException:
-            self.release_session_state(ref, session)
+            self.close_session(ref, session)
             raise
         finally:
             session.lock.release()
@@ -357,7 +371,7 @@ class SessionScheduler(SimpleScheduler):
             else:
                 with session.lock:
                     if operation == "close":
-                        self.release_session_state(ref, session)
+                        self.close_session(ref, session)
                         payload.data = {"closed": True}
                         return payload
                     elif self.is_shutting_down:
