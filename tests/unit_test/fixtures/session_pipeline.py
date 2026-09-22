@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Multiprocess stage fixture with synthetic session hooks."""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,11 +13,16 @@ from multiprocessing.context import SpawnProcess
 from multiprocessing.queues import Queue
 from multiprocessing.synchronize import Event
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
 
-from sglang_omni.config.schema import PipelineConfig, ProcessConfig, StageConfig
+from sglang_omni.config.schema import (
+    REPLICA_SEPARATOR,
+    PipelineConfig,
+    ProcessConfig,
+    StageConfig,
+)
 from sglang_omni.config.topology import compile_logical_processes
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.pipeline.replicas import expand_replica_stages
@@ -40,6 +46,11 @@ if TYPE_CHECKING:
     from sglang_omni.pipeline.stage_workers import StageLaunchConfig
 
 State = dict[str, Any]
+REPLICA_COUNT = 2
+EVENT_POLL_TIMEOUT_S = 1
+OwnerEvent = tuple[Literal["open", "close", "finished", "cancelled"], str, str]
+AppendEvent = tuple[Literal["append"], str, str, int]
+StageEvent = OwnerEvent | AppendEvent
 
 
 class Hooks(SessionHooks):
@@ -64,7 +75,7 @@ class Hooks(SessionHooks):
 
         self.events.put(("append", self.name, state["id"], chunk.seq))
         state["n"] += 1
-        logical_name = self.name.split("@r")[0]
+        logical_name = self.name.partition(REPLICA_SEPARATOR)[0]
         if logical_name == "source":
             payload.data = {"tensor": torch.tensor([state["n"]])}
         elif logical_name == "middle":
@@ -147,16 +158,16 @@ async def pipeline(
                 factory_path=f"{__name__}.make_session_scheduler",
             )
         )
-    processes = {}
+    process_configs: dict[str, ProcessConfig] = {}
     if replicated:
-        processes["sink"] = ProcessConfig(num_replicas=2)
+        process_configs["sink"] = ProcessConfig(num_replicas=REPLICA_COUNT)
     if replicate_entry:
-        processes["source"] = ProcessConfig(num_replicas=2)
+        process_configs["source"] = ProcessConfig(num_replicas=REPLICA_COUNT)
     config = PipelineConfig(
         model_path="mock",
         entry_stage="source",
         stages=stages,
-        processes=processes,
+        processes=process_configs,
     )
     plan, stages = compile_logical_processes(config)
     expanded, topology = expand_replica_stages(stages, plan)
@@ -228,11 +239,11 @@ def chunk(seq: int, eos: bool = False) -> TimedChunk:
     return TimedChunk("audio", seq * 20, 20, seq, b"pcm", eos=eos)
 
 
-def event_log(events: Queue) -> list[tuple]:
-    log = []
+def event_log(events: Queue) -> list[StageEvent]:
+    stage_events: list[StageEvent] = []
     while not events.empty():
-        log.append(events.get(timeout=1))
-    return log
+        stage_events.append(events.get(timeout=EVENT_POLL_TIMEOUT_S))
+    return stage_events
 
 
 def block_async_call(

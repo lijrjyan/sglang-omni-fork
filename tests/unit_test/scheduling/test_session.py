@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Session value validation and stage state ownership without worker processes."""
+
 import queue
 import threading
 from dataclasses import asdict
@@ -12,12 +13,18 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     OutputChunk,
     ResourceUsage,
+    SessionCommand,
+    SessionOp,
     SessionRef,
     TimedChunk,
     wire_size,
 )
 from sglang_omni.scheduling.messages import IncomingMessage
-from sglang_omni.scheduling.session import SessionHooks, SessionScheduler
+from sglang_omni.scheduling.session import (
+    SessionContext,
+    SessionHooks,
+    SessionScheduler,
+)
 from tests.unit_test.fixtures.session_pipeline import (
     command_metadata,
     compute_registered,
@@ -164,37 +171,49 @@ def test_binary_chunk_wire_size_matches_msgpack(size, monkeypatch):
     assert all(size == 0 for size in encoded_payloads)
 
 
+class BlockingHooks(Hooks):
+    def __init__(self) -> None:
+        super().__init__("source", queue.Queue())
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def append(
+        self,
+        state: object,
+        chunk: TimedChunk,
+        payload: StagePayload,
+        context: SessionContext,
+    ) -> StagePayload:
+        self.events.put(("append", payload.request_id))
+        if payload.request_id == "first":
+            self.entered.set()
+            self.release.wait(5)
+        return payload
+
+
+def session_stage_payload(request_id: str, op: SessionOp) -> StagePayload:
+    return StagePayload(
+        request_id,
+        OmniRequest(
+            None,
+            metadata=command_metadata(
+                op,
+                SessionRef("session"),
+                TimedChunk("audio", 0, 20, 0, b"x"),
+            ),
+        ),
+        {},
+    )
+
+
 def test_session_commands_run_in_arrival_order_even_when_one_is_aborted():
-
-    class BlockingHooks(Hooks):
-        def __init__(self):
-            super().__init__("source", queue.Queue())
-            self.entered, self.release = threading.Event(), threading.Event()
-
-        def append(self, state, chunk, payload, context):
-            self.events.put(("append", payload.request_id))
-            if payload.request_id == "first":
-                self.entered.set()
-                self.release.wait(5)
-            return payload
-
     hooks = BlockingHooks()
     scheduler = SessionScheduler(hooks, max_concurrency=3)
-
-    def command(rid, op):
-        return StagePayload(
-            rid,
-            OmniRequest(
-                None,
-                metadata=command_metadata(
-                    op, SessionRef("s"), TimedChunk("audio", 0, 20, 0, b"x")
-                ),
-            ),
-            {},
-        )
-
-    compute_registered(scheduler, command("open", "open"))
-    payloads = [command(rid, "append") for rid in ("first", "second", "third")]
+    compute_registered(scheduler, session_stage_payload("open", "open"))
+    payloads = [
+        session_stage_payload(request_id, "append")
+        for request_id in ("first", "second", "third")
+    ]
     for payload in payloads:
         scheduler.inbox.put(IncomingMessage(payload.request_id, "new_request", payload))
     messages = [scheduler.inbox.get_nowait() for _ in payloads]
@@ -220,44 +239,24 @@ def test_session_commands_run_in_arrival_order_even_when_one_is_aborted():
     assert not scheduler.orders and not scheduler.tickets
 
 
-def test_later_command_does_not_start_before_the_session_lock():
-
-    class BlockingHooks(Hooks):
-        def __init__(self):
-            super().__init__("source", queue.Queue())
-            self.entered, self.release = threading.Event(), threading.Event()
-
-        def append(self, state, chunk, payload, context):
-            if payload.request_id == "first":
-                self.entered.set()
-                self.release.wait(5)
-            return payload
-
+def test_later_command_does_not_start_before_the_session_lock() -> None:
     hooks = BlockingHooks()
     scheduler = SessionScheduler(hooks, max_concurrency=3)
-    started = []
-    original = scheduler.compute_session
+    started: list[tuple[str, SessionOp]] = []
+    compute_session = scheduler.compute_session
 
-    def compute_session(payload, command):
-        started.append(payload.request_id)
-        return original(payload, command)
+    def record_compute_session(
+        payload: StagePayload, command: SessionCommand
+    ) -> StagePayload:
+        started.append((payload.request_id, command.op))
+        return compute_session(payload, command)
 
-    scheduler.compute_session = compute_session
-
-    def command(rid, op):
-        return StagePayload(
-            rid,
-            OmniRequest(
-                None,
-                metadata=command_metadata(
-                    op, SessionRef("s"), TimedChunk("audio", 0, 20, 0, b"x")
-                ),
-            ),
-            {},
-        )
-
-    compute_registered(scheduler, command("open", "open"))
-    payloads = [command(rid, "append") for rid in ("first", "second", "third")]
+    scheduler.compute_session = record_compute_session
+    compute_registered(scheduler, session_stage_payload("open", "open"))
+    payloads = [
+        session_stage_payload(request_id, "append")
+        for request_id in ("first", "second", "third")
+    ]
     for payload in payloads:
         scheduler.inbox.put(IncomingMessage(payload.request_id, "new_request", payload))
     messages = [scheduler.inbox.get_nowait() for _ in payloads]
@@ -269,11 +268,11 @@ def test_later_command_does_not_start_before_the_session_lock():
     third = threading.Thread(target=scheduler.compute, args=(messages[2].data,))
     third.start()
     third.join(0.2)
-    assert started == ["open", "first"]
+    assert started == [("open", "open"), ("first", "append")]
     hooks.release.set()
     for thread in (first, third):
         thread.join(5)
-    assert started == ["open", "first", "third"]
+    assert started == [("open", "open"), ("first", "append"), ("third", "append")]
 
 
 def test_close_runs_after_its_request_is_aborted():
@@ -311,20 +310,8 @@ def test_command_finished_by_abort_before_running_does_not_wait():
     events = queue.Queue()
     scheduler = SessionScheduler(AppendHooks("source", events), max_concurrency=2)
 
-    def command(rid, op):
-        return StagePayload(
-            rid,
-            OmniRequest(
-                None,
-                metadata=command_metadata(
-                    op, SessionRef("s"), TimedChunk("audio", 0, 20, 0, b"x")
-                ),
-            ),
-            {},
-        )
-
-    compute_registered(scheduler, command("open", "open"))
-    payload = command("late", "append")
+    compute_registered(scheduler, session_stage_payload("open", "open"))
+    payload = session_stage_payload("late", "append")
     scheduler.inbox.put(IncomingMessage("late", "new_request", payload))
     message = scheduler.inbox.get_nowait()
     # Note (Junnan Li): A request-level abort consumed the ticket first; the command still runs.

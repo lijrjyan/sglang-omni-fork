@@ -6,6 +6,7 @@ import asyncio
 import pytest
 
 from sglang_omni.admission import QueueFullError
+from sglang_omni.config.schema import replica_instance_name
 from sglang_omni.proto import OmniRequest
 from sglang_omni.proto.session import SessionLimits, TimedChunk
 from tests.unit_test.fixtures.session_pipeline import (
@@ -15,13 +16,6 @@ from tests.unit_test.fixtures.session_pipeline import (
     pipeline,
     wait_until,
 )
-
-
-def drain(events):
-    log = []
-    while not events.empty():
-        log.append(events.get(timeout=1))
-    return log
 
 
 @pytest.mark.asyncio
@@ -40,7 +34,7 @@ async def test_timeout_cancel_noop_waits_before_close(tmp_path):
             await asyncio.wait_for(anext(output), 5)
         await asyncio.wait_for(coordinator.close_session(ref), 5)
         assert ref.session_id not in coordinator.sessions
-        log = drain(events)
+        log = event_log(events)
         finished = next(i for i, e in enumerate(log) if e[:2] == ("finished", "sink"))
         # Note (Junnan Li): Close waits for the hook that outlived the command timeout, then closes upstream.
         closed = [(i, e[1]) for i, e in enumerate(log) if e[0] == "close"]
@@ -63,7 +57,7 @@ async def test_open_timeout_closes_the_opened_owner(tmp_path):
                 limits=SessionLimits(command_timeout_s=0.08),
             )
         assert "slow-open" not in coordinator.sessions
-        assert [e[1] for e in drain(events) if e[0] == "close"] == ["source"]
+        assert [e[1] for e in event_log(events) if e[0] == "close"] == ["source"]
         second = await coordinator.open_session(
             OmniRequest(None), stages=["source", "sink"], session_id="slow-open"
         )
@@ -90,7 +84,7 @@ async def test_unconfirmed_owner_release_blocks_new_sessions(tmp_path):
         with pytest.raises(RuntimeError, match="capacity remains reserved"):
             await coordinator.close_session(ref)
         # Note (Junnan Li): Owners close downstream first; the rejected owner and those upstream stay unconfirmed.
-        closed = [e[1] for e in drain(events) if e[0] == "close"]
+        closed = [e[1] for e in event_log(events) if e[0] == "close"]
         assert closed == ["sink", "source"]
 
 
@@ -104,7 +98,7 @@ async def test_worker_failure_wakes_output_and_fails_session(tmp_path, monkeypat
         waiting = asyncio.create_task(anext(output))
         await coordinator.append_session(ref, chunk(0))
         for _ in range(100):
-            if any(e[:2] == ("append", "sink") for e in drain(events)):
+            if any(e[:2] == ("append", "sink") for e in event_log(events)):
                 break
             await asyncio.sleep(0.05)
         processes[-1].kill()
@@ -318,7 +312,7 @@ async def test_close_fences_queued_outputs(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_stale_incarnation_cannot_address_the_reopened_session(tmp_path):
+async def test_stale_incarnation_cannot_address_the_reopened_session(tmp_path) -> None:
     async with pipeline(tmp_path) as (coordinator, _, _):
         ref = await coordinator.open_session(
             OmniRequest(None), stages=["source", "sink"], session_id="again"
@@ -337,7 +331,7 @@ async def test_stale_incarnation_cannot_address_the_reopened_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_acknowledged_downstream_owner_is_not_quarantined(tmp_path):
+async def test_acknowledged_downstream_owner_is_not_quarantined(tmp_path) -> None:
     async with pipeline(tmp_path, stage_count=3) as (coordinator, _, _):
         ref = await coordinator.open_session(
             OmniRequest(None, {"fail_close_once": "middle"}),
@@ -356,32 +350,36 @@ async def test_acknowledged_downstream_owner_is_not_quarantined(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_healthy_replica_accepts_a_new_session_after_unconfirmed_close(tmp_path):
+async def test_healthy_replica_accepts_a_new_session_after_unconfirmed_close(
+    tmp_path,
+) -> None:
+    source_owner = replica_instance_name("source", 0)
+    sink_owner = replica_instance_name("sink", 0)
     async with pipeline(tmp_path, replicated=True, replicate_entry=True) as (
         coordinator,
         events,
         _,
     ):
-        failed = await coordinator.open_session(
-            OmniRequest(None, {"fail_close_once": "sink@r0"}),
+        failed_ref = await coordinator.open_session(
+            OmniRequest(None, {"fail_close_once": sink_owner}),
             stages=["source", "sink"],
             session_id="failed",
         )
         with pytest.raises(RuntimeError, match="cleanup incomplete"):
-            await coordinator.close_session(failed)
-        opens = [
+            await coordinator.close_session(failed_ref)
+        opened_owners = [
             event[1]
             for event in event_log(events)
             if event[0] == "open" and event[2] == "failed"
         ]
-        assert opens == ["source@r0", "sink@r0"]
-        healthy = await coordinator.open_session(
+        assert opened_owners == [source_owner, sink_owner]
+        healthy_ref = await coordinator.open_session(
             OmniRequest(None), stages=["source", "sink"], session_id="healthy"
         )
-        outputs = coordinator.session_outputs(healthy)
-        await coordinator.append_session(healthy, chunk(0, eos=True))
-        data = await asyncio.wait_for(anext(outputs), 5)
-        assert data.kind == "data"
+        outputs = coordinator.session_outputs(healthy_ref)
+        await coordinator.append_session(healthy_ref, chunk(0, eos=True))
+        output_chunk = await asyncio.wait_for(anext(outputs), 5)
+        assert output_chunk.kind == "data"
         await outputs.aclose()
         with pytest.raises(ValueError, match="unavailable owner"):
             await coordinator.open_session(OmniRequest(None), stages=["source", "sink"])

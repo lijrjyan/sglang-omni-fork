@@ -2,12 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+from multiprocessing.queues import Queue
 
 import pytest
 
+from sglang_omni.pipeline.sessions import Session
 from sglang_omni.proto import OmniRequest
-from sglang_omni.proto.session import TimedChunk, find_session_command
+from sglang_omni.proto.session import SessionOp, TimedChunk, find_session_command
 from tests.unit_test.fixtures.session_pipeline import chunk, event_log, pipeline
+
+IN_FLIGHT_ACCEPT_TIMEOUT_S = 1
+STAGE_REPLY_TIMEOUT_S = 5
+
+
+def append_owners(events: Queue) -> list[str]:
+    return [event[1] for event in event_log(events) if event[0] == "append"]
 
 
 @pytest.mark.asyncio
@@ -142,16 +151,22 @@ async def test_accepted_input_snapshots_mutable_payload(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_next_input_is_accepted_while_one_unit_is_in_flight(
     tmp_path, monkeypatch
-):
+) -> None:
     async with pipeline(tmp_path) as (coordinator, _, _):
         ref = await coordinator.open_session(
             OmniRequest(None), stages=["source", "sink"]
         )
         entered, release = asyncio.Event(), asyncio.Event()
-        append_seqs = []
+        append_seqs: list[int] = []
         original = coordinator.session_command
 
-        async def session_command(session, op, *, owner=None, chunk=None):
+        async def hold_first_append(
+            session: Session,
+            op: SessionOp,
+            *,
+            owner: str | None = None,
+            chunk: TimedChunk | None = None,
+        ) -> None:
             if op == "append" and chunk is not None:
                 append_seqs.append(chunk.seq)
                 if chunk.seq == 0:
@@ -159,17 +174,17 @@ async def test_next_input_is_accepted_while_one_unit_is_in_flight(
                     await release.wait()
             return await original(session, op, owner=owner, chunk=chunk)
 
-        monkeypatch.setattr(coordinator, "session_command", session_command)
+        monkeypatch.setattr(coordinator, "session_command", hold_first_append)
         outputs = coordinator.session_outputs(ref)
         try:
             assert await coordinator.append_session(ref, chunk(0)) == 0
-            await asyncio.wait_for(entered.wait(), 5)
-            assert (
-                await asyncio.wait_for(coordinator.append_session(ref, chunk(1)), 1)
-                == 1
+            await asyncio.wait_for(entered.wait(), STAGE_REPLY_TIMEOUT_S)
+            accepted_seq = await asyncio.wait_for(
+                coordinator.append_session(ref, chunk(1)),
+                IN_FLIGHT_ACCEPT_TIMEOUT_S,
             )
-            for _ in range(5):
-                await asyncio.sleep(0)
+            assert accepted_seq == 1
+            await asyncio.sleep(0)
             assert append_seqs == [0]
         finally:
             release.set()
@@ -177,22 +192,23 @@ async def test_next_input_is_accepted_while_one_unit_is_in_flight(
 
 
 @pytest.mark.asyncio
-async def test_append_visits_owners_in_route_order(tmp_path):
+async def test_append_visits_owners_in_route_order(tmp_path) -> None:
     async with pipeline(tmp_path, stage_count=3) as (coordinator, events, _):
         ref = await coordinator.open_session(
             OmniRequest(None), stages=["source", "middle", "sink"]
         )
         outputs = coordinator.session_outputs(ref)
         await coordinator.append_session(ref, chunk(0, eos=True))
-        data = await asyncio.wait_for(anext(outputs), 5)
-        assert data.kind == "data"
+        output_chunk = await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S)
+        assert output_chunk.kind == "data"
         await outputs.aclose()
-        appends = [event[1] for event in event_log(events) if event[0] == "append"]
-        assert appends == ["source", "middle", "sink"]
+        assert append_owners(events) == ["source", "middle", "sink"]
 
 
 @pytest.mark.asyncio
-async def test_mismatched_route_fails_before_leaving_the_session_route(tmp_path):
+async def test_mismatched_route_fails_before_leaving_the_session_route(
+    tmp_path,
+) -> None:
     async with pipeline(tmp_path, stage_count=3) as (coordinator, events, _):
         ref = await coordinator.open_session(
             OmniRequest(None), stages=["source", "sink"]
@@ -200,25 +216,26 @@ async def test_mismatched_route_fails_before_leaving_the_session_route(tmp_path)
         outputs = coordinator.session_outputs(ref)
         await coordinator.append_session(ref, chunk(0, eos=True))
         with pytest.raises(RuntimeError, match="session route"):
-            await asyncio.wait_for(anext(outputs), 5)
-        appends = [event[1] for event in event_log(events) if event[0] == "append"]
-        assert appends == ["source"]
+            await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S)
+        assert append_owners(events) == ["source"]
 
 
 @pytest.mark.asyncio
-async def test_later_commands_do_not_carry_the_opening_inputs(tmp_path, monkeypatch):
+async def test_later_commands_do_not_carry_the_opening_inputs(
+    tmp_path, monkeypatch
+) -> None:
     async with pipeline(tmp_path) as (coordinator, _, _):
-        seen = []
+        submitted: list[tuple[SessionOp, object | None, object | None]] = []
         original = coordinator.control_plane.submit_to_stage
 
         async def submit(stage, endpoint, message):
             command = find_session_command(message.data.request.metadata)
             if command is not None and command.op != "open":
-                seen.append(
+                submitted.append(
                     (
                         command.op,
                         message.data.request.inputs,
-                        message.data.data.get("raw_inputs"),
+                        message.data.data["raw_inputs"],
                     )
                 )
             return await original(stage, endpoint, message)
@@ -229,8 +246,12 @@ async def test_later_commands_do_not_carry_the_opening_inputs(tmp_path, monkeypa
         outputs = coordinator.session_outputs(ref)
         try:
             await coordinator.append_session(ref, chunk(0, eos=True))
-            await asyncio.wait_for(anext(outputs), 5)
+            await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S)
         finally:
             await outputs.aclose()
-        assert {op for op, _, _ in seen} >= {"append", "close"}
-        assert all(inputs is None and raw is None for _, inputs, raw in seen)
+        command_ops = {command_op for command_op, _, _ in submitted}
+        assert command_ops >= {"append", "close"}
+        assert all(
+            request_inputs is None and raw_inputs is None
+            for _, request_inputs, raw_inputs in submitted
+        )
