@@ -14,7 +14,8 @@ from sglang_omni.proto import OmniRequest
 from sglang_omni.proto.session import SessionLimits, TimedChunk
 from tests.unit_test.fixtures.session_pipeline import (
     PipelineResources,
-    block_async_call,
+    block_request_abort,
+    block_session_cleanup,
     chunk,
     event_log,
     pipeline,
@@ -109,9 +110,7 @@ async def test_worker_failure_wakes_output_and_fails_session(tmp_path, monkeypat
         futures = list(coordinator._completion_futures.values())
         assert futures and not any(future.done() for future in futures)
         # Note (Junnan Li): Cleanup waits for the pump, which waits on this future; fail the waiters first.
-        entered, release = block_async_call(
-            monkeypatch, coordinator, "cleanup_session", coordinator.cleanup_session
-        )
+        entered, release = block_session_cleanup(monkeypatch, coordinator)
         failing = asyncio.create_task(
             coordinator.fail_pending_requests("session worker exited")
         )
@@ -255,12 +254,9 @@ async def assert_closing_rejects_new_input(
     )
     # Note (Junnan Li): A failed command aborts its request before the pump cleans up; admission is closed by then.
     if trigger == "command_timeout":
-        method_name, original_method = "abort", coordinator.abort
+        entered, release = block_request_abort(monkeypatch, coordinator)
     else:
-        method_name, original_method = "cleanup_session", coordinator.cleanup_session
-    entered, release = block_async_call(
-        monkeypatch, coordinator, method_name, original_method
-    )
+        entered, release = block_session_cleanup(monkeypatch, coordinator)
     if trigger == "close":
         close_task = asyncio.create_task(coordinator.close_session(ref))
     elif trigger == "shutdown":

@@ -10,14 +10,14 @@ import asyncio
 import logging
 import multiprocessing
 import time
-from collections.abc import AsyncIterator, Awaitable, Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from multiprocessing.context import SpawnProcess
 from multiprocessing.queues import Queue
 from multiprocessing.synchronize import Event
 from pathlib import Path
-from typing import Literal, ParamSpec, Protocol, TypedDict, TypeVar
+from typing import Literal, Protocol, TypedDict
 
 import pytest
 
@@ -30,6 +30,7 @@ from sglang_omni.config.schema import (
 from sglang_omni.config.topology import compile_logical_processes
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.pipeline.replicas import expand_replica_stages
+from sglang_omni.pipeline.sessions import Session
 from sglang_omni.pipeline.stage_workers import StageLaunchConfig
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
@@ -45,12 +46,10 @@ from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.session import (
     SessionContext,
     SessionHooks,
+    SessionInbox,
     SessionScheduler,
 )
 
-CallParams = ParamSpec("CallParams")
-CallResult = TypeVar("CallResult")
-SchedulerStateT = TypeVar("SchedulerStateT")
 REPLICA_COUNT = 2
 EVENT_POLL_TIMEOUT_S = 1
 OwnerEvent = tuple[Literal["open", "close", "finished", "cancelled"], str, str]
@@ -317,32 +316,43 @@ def event_log(events: Queue[StageEvent]) -> list[StageEvent]:
     return stage_events
 
 
-class AsyncCall(Protocol[CallParams, CallResult]):
-    def __call__(
-        self, *args: CallParams.args, **kwargs: CallParams.kwargs
-    ) -> Awaitable[CallResult]: ...
-
-
 class Condition(Protocol):
     def __call__(self) -> bool: ...
 
 
-def block_async_call(
-    monkeypatch: pytest.MonkeyPatch,
-    obj: object,
-    name: str,
-    original: AsyncCall[CallParams, CallResult],
+class RegisteredScheduler(Protocol):
+    inbox: SessionInbox
+
+    def compute(self, payload: StagePayload) -> StagePayload: ...
+
+
+def block_session_cleanup(
+    monkeypatch: pytest.MonkeyPatch, coordinator: Coordinator
 ) -> tuple[asyncio.Event, asyncio.Event]:
     entered, release = asyncio.Event(), asyncio.Event()
+    cleanup_session = coordinator.cleanup_session
 
-    async def blocked(
-        *args: CallParams.args, **kwargs: CallParams.kwargs
-    ) -> CallResult:
+    async def blocked(session: Session) -> None:
         entered.set()
         await release.wait()
-        return await original(*args, **kwargs)
+        await cleanup_session(session)
 
-    monkeypatch.setattr(obj, name, blocked)
+    monkeypatch.setattr(coordinator, "cleanup_session", blocked)
+    return entered, release
+
+
+def block_request_abort(
+    monkeypatch: pytest.MonkeyPatch, coordinator: Coordinator
+) -> tuple[asyncio.Event, asyncio.Event]:
+    entered, release = asyncio.Event(), asyncio.Event()
+    abort_request = coordinator.abort
+
+    async def blocked(request_id: str) -> bool:
+        entered.set()
+        await release.wait()
+        return await abort_request(request_id)
+
+    monkeypatch.setattr(coordinator, "abort", blocked)
     return entered, release
 
 
@@ -357,7 +367,7 @@ async def wait_until(condition: Condition, timeout: float = 5) -> None:
 
 
 def compute_registered(
-    scheduler: SessionScheduler[SchedulerStateT], payload: StagePayload
+    scheduler: RegisteredScheduler, payload: StagePayload
 ) -> StagePayload:
     """Run one session command on an unstarted scheduler through its inbox registration."""
     scheduler.inbox.put(IncomingMessage(payload.request_id, "new_request", payload))

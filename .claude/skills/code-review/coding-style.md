@@ -102,10 +102,11 @@ speculative generality.
   `dict[str, Any]`, `list[Any]`, `tuple[Any, ...]`, or `Coroutine[Any, Any, T]`.
   A coroutine that does not yield is `Coroutine[None, None, T]`.
 - Do not annotate with `Callable` or `Callable[...]`. Declare a `Protocol`
-  whose `__call__` names each parameter and the return type. Do not recover
-  an erased signature with `*args: Any` or `**kwargs: Any`. When one helper
-  wraps functions that do not share one parameter list, keep each signature
-  with `ParamSpec` on that Protocol.
+  whose `__call__` names each parameter and the return type. Do not use
+  `ParamSpec`. Do not recover an erased signature with `*args` or `**kwargs`.
+  If two wrapped functions do not share one parameter list, write each one
+  separately and name its parameters. Do not add a `TypeVar` only to fill a
+  generic slot the function never reads; annotate the methods it actually calls.
 - Do not accept a parameter only to immediately delete it to silence type or lint
   checks, such as starting a function with `del request_id`. Remove unnecessary
   parameters and update callers. If an established interface requires an unused
