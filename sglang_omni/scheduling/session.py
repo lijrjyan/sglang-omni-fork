@@ -1,5 +1,36 @@
-# SPDX-License-Identifier: Apache-2.0
-"""Persistent state for session-aware pipeline stages."""
+"""State kept for one long-lived pipeline connection.
+
+Note (chenyang): These definitions could be hard to understand.
+
+A stage is one segment of the pipeline that a unit passes through. Just as
+we defined for Qwen3 Omni, thinker, talker, and the completion head are
+stages. A stage receives a request, runs that request through its scheduler,
+and routes the result to the next stage. When the session starts, the
+coordinator picks one fixed worker for each stage and stores those owners on
+the session. After that, every unit of the session runs only on those
+workers.
+
+A session is one long-lived connection. A session ID identifies it. State
+stays across the many short requests/units of that connection, so a later
+unit reuses what earlier units left behind: perception state, AR state such as
+the KV cache and token history, and encoder or codec state. When a unit
+finishes, that unit's own resources are released. The session state stays.
+Closing the session releases that state and returns the session's capacity.
+
+An operation is one action sent for a session: open, append, or close.
+append is the unit above, and it follows the stages from one to the next.
+open and close each target one stage. open visits the stages from upstream
+to downstream and creates that stage's session state. close visits them from
+downstream to upstream and releases the state. On one stage, open, append,
+and close share one arrival order.
+
+A cursor is one stage's record of the operations that have arrived for one
+session. It keeps them in arrival order, and it keeps the place that may
+start next. Each stage has its own cursor for that session. An operation
+that enters the inbox takes the next place. The stage runs it only when
+that place is due. Chunks emitted during append go back to the caller
+through the coordinator.
+"""
 
 from __future__ import annotations
 
