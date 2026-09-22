@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Model-independent, bounded session command and output contracts."""
+"""Model-independent, bounded session operation and output contracts."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ import msgspec
 SESSION_METADATA_KEY: Literal["omni_session"] = "omni_session"
 # Note (Junnan Li): msgspec encodes bytes as base64 text by default; keep them native on both sides.
 BUILTIN_TYPES = (bytes,)
-SessionOperation = Literal["open", "append", "close"]
 ChunkPayload = bytes | dict[str, object] | None
 DEFAULT_MAX_MODALITIES = 8
 DEFAULT_MAX_PENDING_CHUNKS = 16
@@ -21,7 +20,7 @@ DEFAULT_MAX_PENDING_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_OUTPUT_CHUNKS = 64
 DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_CHUNK_BYTES = 1024 * 1024
-DEFAULT_COMMAND_TIMEOUT_S = 30.0
+DEFAULT_OPERATION_TIMEOUT_S = 30.0
 DEFAULT_IDLE_TIMEOUT_S = 300.0
 # Note (Junnan Li): Msgpack bin headers grow by 1 byte at 256 bytes and 3 bytes at 65536.
 MSGPACK_BIN8_LIMIT = 256
@@ -58,8 +57,8 @@ class OutputChunkDict(TypedDict):
     kind: Literal["data", "input_done"]
 
 
-class SessionCommandDict(TypedDict):
-    operation: SessionOperation
+class SessionOperationDict(TypedDict):
+    operation: Literal["open", "append", "close"]
     ref: SessionRefDict
     stages: list[str]
     chunk: TimedChunkDict | None
@@ -155,20 +154,20 @@ class SessionLimits:
     max_output_chunks: int = DEFAULT_MAX_OUTPUT_CHUNKS
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
     max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES
-    command_timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S
+    operation_timeout_s: float = DEFAULT_OPERATION_TIMEOUT_S
     idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S
 
 
 @dataclass(frozen=True)
-class SessionCommand:
-    """Coordinator-to-stage session command, carried in request metadata."""
+class SessionOperation:
+    """Coordinator-to-stage session operation, carried in request metadata."""
 
-    operation: SessionOperation
+    operation: Literal["open", "append", "close"]
     ref: SessionRef
     stages: tuple[str, ...]
     chunk: TimedChunk | None = None
 
-    def to_dict(self) -> SessionCommandDict:
+    def to_dict(self) -> SessionOperationDict:
         return {
             "operation": self.operation,
             "ref": self.ref.to_dict(),
@@ -177,18 +176,20 @@ class SessionCommand:
         }
 
     @classmethod
-    def from_dict(cls, data: object) -> SessionCommand:
+    def from_dict(cls, data: object) -> SessionOperation:
         if not isinstance(data, dict):
-            raise ValueError("session command must be an object")
+            raise ValueError("session operation must be an object")
         return msgspec.convert(data, type=cls, strict=True, builtin_types=BUILTIN_TYPES)
 
 
-def find_session_command(metadata: Mapping[str, object]) -> SessionCommand | None:
-    """Return the command in request metadata, or None for an ordinary request."""
-    command_fields = metadata.get(SESSION_METADATA_KEY)
-    if command_fields is None:
+def find_session_operation(
+    metadata: Mapping[str, object],
+) -> SessionOperation | None:
+    """Return the operation in request metadata, or None for an ordinary request."""
+    operation_fields = metadata.get(SESSION_METADATA_KEY)
+    if operation_fields is None:
         return None
-    return SessionCommand.from_dict(command_fields)
+    return SessionOperation.from_dict(operation_fields)
 
 
 def wire_size(chunk_fields: TimedChunkDict | OutputChunkDict) -> int:

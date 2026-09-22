@@ -19,7 +19,6 @@ from sglang_omni.proto import OmniRequest, StreamMessage
 from sglang_omni.proto.session import (
     SESSION_METADATA_KEY,
     OutputChunk,
-    SessionCommand,
     SessionLimits,
     SessionOperation,
     SessionRef,
@@ -157,7 +156,7 @@ class CoordinatorSessions:
                 for owner in owners:
                     # Note (Junnan Li): Record the attempt first; a stage may allocate before its reply is lost.
                     session.opened.append(owner)
-                    await self.session_command(session, "open", owner=owner)
+                    await self.session_operation(session, "open", owner=owner)
                 if (
                     self.is_sessions_stopping
                     or self.session_unavailable_stages.intersection(owners)
@@ -293,7 +292,7 @@ class CoordinatorSessions:
                     continue
                 chunk, size = session.pending.popleft()
                 try:
-                    await self.session_command(session, "append", chunk=chunk)
+                    await self.session_operation(session, "append", chunk=chunk)
                     self.emit_session_output(
                         session,
                         chunk.seq,
@@ -307,16 +306,16 @@ class CoordinatorSessions:
             session.error = exc
             self.owned_session_task(self.close_session_state(session))
 
-    async def session_command(
+    async def session_operation(
         self,
         session: Session,
-        operation: SessionOperation,
+        operation: Literal["open", "append", "close"],
         *,
         owner: str | None = None,
         chunk: TimedChunk | None = None,
     ) -> None:
         ref = session.ref
-        command = SessionCommand(
+        session_operation = SessionOperation(
             operation=operation,
             ref=ref,
             stages=session.stages,
@@ -326,7 +325,7 @@ class CoordinatorSessions:
             session.request,
             metadata={
                 **session.request.metadata,
-                SESSION_METADATA_KEY: command.to_dict(),
+                SESSION_METADATA_KEY: session_operation.to_dict(),
             },
         )
         request_id = f"session-{uuid.uuid4()}"
@@ -363,7 +362,7 @@ class CoordinatorSessions:
             if operation == "close":
                 await run()
             else:
-                await asyncio.wait_for(run(), session.limits.command_timeout_s)
+                await asyncio.wait_for(run(), session.limits.operation_timeout_s)
         except asyncio.TimeoutError as exc:
             self.begin_session_close(session)
             raise TimeoutError(f"session {operation} timed out") from exc
@@ -414,7 +413,7 @@ class CoordinatorSessions:
         if session.pump is not None and session.pump is not asyncio.current_task():
             try:
                 await asyncio.wait_for(
-                    asyncio.shield(session.pump), session.limits.command_timeout_s
+                    asyncio.shield(session.pump), session.limits.operation_timeout_s
                 )
             except asyncio.TimeoutError as exc:
                 session.cleanup_error = session.error = exc
@@ -429,7 +428,7 @@ class CoordinatorSessions:
         unconfirmed = list(session.opened)
         for owner in reversed(session.opened):
             try:
-                await self.session_command(session, "close", owner=owner)
+                await self.session_operation(session, "close", owner=owner)
                 unconfirmed.pop()
             except Exception as exc:
                 session.cleanup_error = exc

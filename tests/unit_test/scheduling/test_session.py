@@ -4,6 +4,7 @@
 import queue
 import threading
 from dataclasses import asdict, dataclass
+from typing import Literal
 
 import msgpack
 import pytest
@@ -13,7 +14,6 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     OutputChunk,
     ResourceUsage,
-    SessionCommand,
     SessionOperation,
     SessionRef,
     TimedChunk,
@@ -26,8 +26,8 @@ from sglang_omni.scheduling.session import (
     SessionScheduler,
 )
 from tests.unit_test.fixtures.session_pipeline import (
-    command_metadata,
     compute_registered,
+    operation_metadata,
 )
 
 
@@ -60,7 +60,7 @@ def test_open_usage_failure_releases_state():
 
     events = queue.Queue()
     scheduler = SessionScheduler(BrokenUsage("source", events))
-    request = OmniRequest(None, metadata=command_metadata("open", SessionRef("one")))
+    request = OmniRequest(None, metadata=operation_metadata("open", SessionRef("one")))
     with pytest.raises(RuntimeError, match="usage failed"):
         compute_registered(scheduler, StagePayload("one-open", request, {}))
     assert events.get_nowait()[0] == "open"
@@ -83,7 +83,7 @@ def test_stage_capacity_is_aggregate():
 
     def invoke(sid, operation):
         request = OmniRequest(
-            None, metadata=command_metadata(operation, SessionRef(sid))
+            None, metadata=operation_metadata(operation, SessionRef(sid))
         )
         return compute_registered(scheduler, StagePayload(sid + operation, request, {}))
 
@@ -98,7 +98,7 @@ def test_stage_capacity_is_aggregate():
     assert closed == ["one", "two"]
 
 
-def test_malformed_command_fails_inside_the_request_boundary():
+def test_malformed_operation_fails_inside_the_request_boundary():
 
     scheduler = SessionScheduler(Hooks("source", queue.Queue()))
     worker = threading.Thread(target=scheduler.start)
@@ -112,7 +112,9 @@ def test_malformed_command_fails_inside_the_request_boundary():
         assert output.request_id == "bad"
         assert output.type == "error"
         assert isinstance(output.data, ValueError)
-        request = OmniRequest(None, metadata=command_metadata("open", SessionRef("ok")))
+        request = OmniRequest(
+            None, metadata=operation_metadata("open", SessionRef("ok"))
+        )
         scheduler.inbox.put(
             IncomingMessage("open", "new_request", StagePayload("open", request, {}))
         )
@@ -146,7 +148,7 @@ def test_ordinary_request_uses_handler_or_reports_scoped_error(configured):
             assert isinstance(output.data, ValueError)
             assert "ordinary requests" in str(output.data)
         request = OmniRequest(
-            None, metadata=command_metadata("open", SessionRef("after-ordinary"))
+            None, metadata=operation_metadata("open", SessionRef("after-ordinary"))
         )
         scheduler.inbox.put(
             IncomingMessage("open", "new_request", StagePayload("open", request, {}))
@@ -201,12 +203,14 @@ class BlockingHooks(Hooks):
         return payload
 
 
-def session_stage_payload(request_id: str, operation: SessionOperation) -> StagePayload:
+def session_stage_payload(
+    request_id: str, operation: Literal["open", "append", "close"]
+) -> StagePayload:
     return StagePayload(
         request_id,
         OmniRequest(
             None,
-            metadata=command_metadata(
+            metadata=operation_metadata(
                 operation,
                 SessionRef("session"),
                 TimedChunk("audio", 0, 20, 0, b"x"),
@@ -216,7 +220,7 @@ def session_stage_payload(request_id: str, operation: SessionOperation) -> Stage
     )
 
 
-def test_session_commands_run_in_arrival_order_even_when_one_is_aborted():
+def test_session_operations_run_in_arrival_order_even_when_one_is_aborted():
     hooks = BlockingHooks()
     scheduler = SessionScheduler(hooks, max_concurrency=3)
     compute_registered(scheduler, session_stage_payload("open", "open"))
@@ -235,7 +239,7 @@ def test_session_commands_run_in_arrival_order_even_when_one_is_aborted():
     threads.append(threading.Thread(target=scheduler.compute, args=(messages[2].data,)))
     threads[1].start()
     threads[1].join(0.2)
-    assert threads[1].is_alive(), "third command ran before the first finished"
+    assert threads[1].is_alive(), "third operation ran before the first finished"
     hooks.release.set()
     for thread in threads:
         thread.join(5)
@@ -249,17 +253,17 @@ def test_session_commands_run_in_arrival_order_even_when_one_is_aborted():
     assert not scheduler.cursors_by_session and not scheduler.arrivals_by_request_id
 
 
-def test_later_command_does_not_start_before_the_session_lock() -> None:
+def test_later_operation_does_not_start_before_the_session_lock() -> None:
     hooks = BlockingHooks()
     scheduler = SessionScheduler(hooks, max_concurrency=3)
-    started: list[tuple[str, SessionOperation]] = []
+    started: list[tuple[str, Literal["open", "append", "close"]]] = []
     compute_session = scheduler.compute_session
 
     def record_compute_session(
-        payload: StagePayload, command: SessionCommand
+        payload: StagePayload, session_operation: SessionOperation
     ) -> StagePayload:
-        started.append((payload.request_id, command.operation))
-        return compute_session(payload, command)
+        started.append((payload.request_id, session_operation.operation))
+        return compute_session(payload, session_operation)
 
     scheduler.compute_session = record_compute_session
     compute_registered(scheduler, session_stage_payload("open", "open"))
@@ -292,7 +296,7 @@ def test_close_runs_after_its_request_is_aborted():
 
     def message(rid, operation):
         request = OmniRequest(
-            None, metadata=command_metadata(operation, SessionRef("s"))
+            None, metadata=operation_metadata(operation, SessionRef("s"))
         )
         return IncomingMessage(rid, "new_request", StagePayload(rid, request, {}))
 
@@ -311,7 +315,7 @@ def test_close_runs_after_its_request_is_aborted():
     assert not scheduler.open_sessions and not scheduler.arrivals_by_request_id
 
 
-def test_command_finished_by_abort_before_running_does_not_wait():
+def test_operation_finished_by_abort_before_running_does_not_wait():
 
     class AppendHooks(Hooks):
         def append(

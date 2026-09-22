@@ -30,7 +30,7 @@ async def test_timeout_cancel_noop_waits_before_close(linear_pair):
         OmniRequest(None, {"ignore_cancel": True, "delay": 0.3}),
         stages=["source", "sink"],
     )
-    coordinator.sessions[ref.session_id].limits = SessionLimits(command_timeout_s=0.1)
+    coordinator.sessions[ref.session_id].limits = SessionLimits(operation_timeout_s=0.1)
     output = coordinator.session_outputs(ref)
     await coordinator.append_session(ref, chunk(0))
     with pytest.raises(TimeoutError):
@@ -57,7 +57,7 @@ async def test_open_timeout_closes_the_opened_owner(linear_pair):
             OmniRequest(None, {"open_delay": 0.3}),
             stages=["source", "sink"],
             session_id="slow-open",
-            limits=SessionLimits(command_timeout_s=0.08),
+            limits=SessionLimits(operation_timeout_s=0.08),
         )
     assert "slow-open" not in coordinator.sessions
     assert [e[1] for e in event_log(events) if e[0] == "close"] == ["source"]
@@ -239,21 +239,21 @@ async def test_oversize_chunk_is_a_permanent_error(linear_pair):
 async def assert_closing_rejects_new_input(
     coordinator: Coordinator,
     monkeypatch: pytest.MonkeyPatch,
-    trigger: Literal["close", "shutdown", "idle", "command_timeout"],
+    trigger: Literal["close", "shutdown", "idle", "operation_timeout"],
 ) -> None:
     request_params = (
-        {"ignore_cancel": True, "delay": 0.3} if trigger == "command_timeout" else {}
+        {"ignore_cancel": True, "delay": 0.3} if trigger == "operation_timeout" else {}
     )
     ref = await coordinator.open_session(
         OmniRequest(None, request_params),
         stages=["source", "sink"],
         limits=SessionLimits(
             idle_timeout_s=0.2 if trigger == "idle" else 300,
-            command_timeout_s=0.1 if trigger == "command_timeout" else 30,
+            operation_timeout_s=0.1 if trigger == "operation_timeout" else 30,
         ),
     )
-    # Note (Junnan Li): A failed command aborts its request before the pump cleans up; admission is closed by then.
-    if trigger == "command_timeout":
+    # Note (Junnan Li): A failed operation aborts its request before the pump cleans up; admission is closed by then.
+    if trigger == "operation_timeout":
         entered, release = block_request_abort(monkeypatch, coordinator)
     else:
         entered, release = block_session_cleanup(monkeypatch, coordinator)
@@ -261,7 +261,7 @@ async def assert_closing_rejects_new_input(
         close_task = asyncio.create_task(coordinator.close_session(ref))
     elif trigger == "shutdown":
         close_task = asyncio.create_task(coordinator.shutdown_stages(["sink"]))
-    elif trigger == "command_timeout":
+    elif trigger == "operation_timeout":
         await coordinator.append_session(ref, chunk(0))
         close_task = None
     else:
@@ -280,11 +280,11 @@ async def assert_closing_rejects_new_input(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-@pytest.mark.parametrize("trigger", ["close", "idle", "command_timeout"])
+@pytest.mark.parametrize("trigger", ["close", "idle", "operation_timeout"])
 async def test_closing_rejects_input_before_cleanup(
     linear_pair: PipelineResources,
     monkeypatch: pytest.MonkeyPatch,
-    trigger: Literal["close", "idle", "command_timeout"],
+    trigger: Literal["close", "idle", "operation_timeout"],
 ) -> None:
     coordinator, _, _ = linear_pair
     await assert_closing_rejects_new_input(coordinator, monkeypatch, trigger)

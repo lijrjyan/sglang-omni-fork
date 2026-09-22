@@ -36,9 +36,8 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     SESSION_METADATA_KEY,
     ResourceUsage,
-    SessionCommand,
-    SessionCommandDict,
     SessionOperation,
+    SessionOperationDict,
     SessionRef,
     TimedChunk,
 )
@@ -58,7 +57,7 @@ StageEvent = OwnerEvent | AppendEvent
 
 
 class SessionMetadata(TypedDict):
-    omni_session: SessionCommandDict
+    omni_session: SessionOperationDict
 
 
 @dataclass
@@ -292,16 +291,18 @@ async def pipeline(
         events.close()
 
 
-def command_metadata(
-    operation: SessionOperation, ref: SessionRef, chunk: TimedChunk | None = None
+def operation_metadata(
+    operation: Literal["open", "append", "close"],
+    ref: SessionRef,
+    chunk: TimedChunk | None = None,
 ) -> SessionMetadata:
-    command = SessionCommand(
+    session_operation = SessionOperation(
         operation=operation,
         ref=ref,
         stages=("source",),
         chunk=chunk,
     )
-    return {SESSION_METADATA_KEY: command.to_dict()}
+    return {SESSION_METADATA_KEY: session_operation.to_dict()}
 
 
 def chunk(seq: int, eos: bool = False) -> TimedChunk:
@@ -371,7 +372,7 @@ async def wait_until(condition: Condition, timeout: float = 5) -> None:
 def compute_registered(
     scheduler: RegisteredScheduler, payload: StagePayload
 ) -> StagePayload:
-    """Run one session command on an unstarted scheduler through its inbox registration."""
+    """Run one session operation on an unstarted scheduler through its inbox registration."""
     scheduler.inbox.put(IncomingMessage(payload.request_id, "new_request", payload))
     message = scheduler.inbox.get_nowait()
     return scheduler.compute(message.data)

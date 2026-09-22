@@ -70,11 +70,19 @@ speculative generality.
   with `is_` / `has_` / `should_` / `can_`; do not add a second underscore
   in front. Public functions, variables, and constants must not have a
   leading underscore.
-- Names say what, not how: `load_checkpoint` not `do_thing`; `num_codebooks` not `n`.
-  Single letters only for loop indices (`i`,`j`) or math (`x`,`y`,`t`).
-- Interface names must identify the domain meaning, role, or unit of a value.
-  For example, `speaker_embedding` is clearer than `spks`. Choose names that fit
-  the actual operation; short mathematical names belong in local equations.
+- Precision beats brevity. Every parameter, local variable, function, method,
+  class, and type alias names the unit it is. A reader must know which
+  physical unit it is without reading the body or another file. Name that
+  unit, not the mechanism: `load_checkpoint`, `speaker_embedding`.
+- Write the full word. Do not clip a word, and do not use a generic role
+  when the unit is known.
+  Wrong: `op`, `SessionOp`, `rid`, `seq`, `cmd`, `ctx`, `req`, `fn`, `cb`,
+  `tmp`, `data`, `info`, `item`, `obj`, `handler`, `manager`.
+  Right: `operation`, `SessionOperation`, `request_id`, `sequence`,
+  `session_operation`, `session_context`, `request`, `request_compute`,
+  `session_hooks`.
+- Single letters only for loop indices (`i`, `j`) or math (`x`, `y`, `t`).
+  Do not append `T` to invent a type name.
 
 ## TYPING & SIGNATURES
 

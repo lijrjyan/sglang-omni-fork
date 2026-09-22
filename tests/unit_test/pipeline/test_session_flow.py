@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import asyncio
 from multiprocessing.queues import Queue
+from typing import Literal
 
 import pytest
 
 from sglang_omni.pipeline.sessions import Session
 from sglang_omni.proto import OmniRequest
-from sglang_omni.proto.session import SessionOperation, TimedChunk, find_session_command
+from sglang_omni.proto.session import TimedChunk, find_session_operation
 from tests.unit_test.fixtures.session_pipeline import chunk, event_log, pipeline
 
 IN_FLIGHT_ACCEPT_TIMEOUT_S = 1
@@ -119,9 +120,9 @@ async def test_accepted_input_snapshots_mutable_payload(linear_pair, monkeypatch
     original = coordinator.control_plane.submit_to_stage
 
     async def submit(stage, endpoint, message):
-        command = find_session_command(message.data.request.metadata)
-        if command is not None and command.operation == "append":
-            submitted.append(command.chunk.payload)
+        session_operation = find_session_operation(message.data.request.metadata)
+        if session_operation is not None and session_operation.operation == "append":
+            submitted.append(session_operation.chunk.payload)
         return await original(stage, endpoint, message)
 
     monkeypatch.setattr(coordinator.control_plane, "submit_to_stage", submit)
@@ -154,11 +155,11 @@ async def test_next_input_is_accepted_while_one_unit_is_in_flight(
     ref = await coordinator.open_session(OmniRequest(None), stages=["source", "sink"])
     entered, release = asyncio.Event(), asyncio.Event()
     append_seqs: list[int] = []
-    original = coordinator.session_command
+    original = coordinator.session_operation
 
     async def hold_first_append(
         session: Session,
-        operation: SessionOperation,
+        operation: Literal["open", "append", "close"],
         *,
         owner: str | None = None,
         chunk: TimedChunk | None = None,
@@ -170,7 +171,7 @@ async def test_next_input_is_accepted_while_one_unit_is_in_flight(
                 await release.wait()
         return await original(session, operation, owner=owner, chunk=chunk)
 
-    monkeypatch.setattr(coordinator, "session_command", hold_first_append)
+    monkeypatch.setattr(coordinator, "session_operation", hold_first_append)
     outputs = coordinator.session_outputs(ref)
     try:
         assert await coordinator.append_session(ref, chunk(0)) == 0
@@ -215,19 +216,21 @@ async def test_mismatched_route_fails_before_leaving_the_session_route(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_later_commands_do_not_carry_the_opening_inputs(
+async def test_later_operations_do_not_carry_the_opening_inputs(
     linear_pair, monkeypatch
 ) -> None:
     coordinator, _, _ = linear_pair
-    submitted: list[tuple[SessionOperation, object | None, object | None]] = []
+    submitted: list[
+        tuple[Literal["open", "append", "close"], object | None, object | None]
+    ] = []
     original = coordinator.control_plane.submit_to_stage
 
     async def submit(stage, endpoint, message):
-        command = find_session_command(message.data.request.metadata)
-        if command is not None and command.operation != "open":
+        session_operation = find_session_operation(message.data.request.metadata)
+        if session_operation is not None and session_operation.operation != "open":
             submitted.append(
                 (
-                    command.operation,
+                    session_operation.operation,
                     message.data.request.inputs,
                     message.data.data["raw_inputs"],
                 )
@@ -243,8 +246,8 @@ async def test_later_commands_do_not_carry_the_opening_inputs(
         await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S)
     finally:
         await outputs.aclose()
-    command_ops = {command_op for command_op, _, _ in submitted}
-    assert command_ops >= {"append", "close"}
+    operation_names = {name for name, _, _ in submitted}
+    assert operation_names >= {"append", "close"}
     assert all(
         request_inputs is None and raw_inputs is None
         for _, request_inputs, raw_inputs in submitted

@@ -13,13 +13,13 @@ from sglang_omni.scheduling.session import (
     SessionScheduler,
 )
 from tests.unit_test.fixtures.session_pipeline import (
-    command_metadata,
     compute_registered,
+    operation_metadata,
 )
 
 
-def command(operation):
-    metadata = command_metadata(
+def operation_payload(operation):
+    metadata = operation_metadata(
         operation,
         SessionRef("session"),
         TimedChunk("audio", 0, 20, 0, b"pcm"),
@@ -59,13 +59,13 @@ class Hooks(SessionHooks):
         self.closed.append(ref)
 
 
-def run_command(scheduler, operation, profile=None):
+def run_operation(scheduler, operation, profile=None):
     errors = []
 
     def run():
         sys.setprofile(profile)
         try:
-            compute_registered(scheduler, command(operation))
+            compute_registered(scheduler, operation_payload(operation))
         except BaseException as exc:
             errors.append(exc)
         finally:
@@ -79,8 +79,8 @@ def run_command(scheduler, operation, profile=None):
 def test_stop_hands_cleanup_to_active_hook_completion():
     hooks = Hooks(block="append")
     scheduler = SessionScheduler(hooks)
-    compute_registered(scheduler, command("open"))
-    thread, errors = run_command(scheduler, "append")
+    compute_registered(scheduler, operation_payload("open"))
+    thread, errors = run_operation(scheduler, "append")
     try:
         assert hooks.entered.wait(5)
         scheduler.stop()
@@ -98,7 +98,7 @@ def test_stop_hands_cleanup_to_active_hook_completion():
 def test_stop_during_open_rejects_the_session():
     hooks = Hooks(block="open")
     scheduler = SessionScheduler(hooks)
-    thread, errors = run_command(scheduler, "open")
+    thread, errors = run_operation(scheduler, "open")
     try:
         assert hooks.entered.wait(5)
         scheduler.stop()
@@ -127,7 +127,7 @@ def test_stop_after_open_checks_before_owner_unlock():
             paused.set()
             assert release.wait(5)
 
-    thread, errors = run_command(scheduler, "open", profile)
+    thread, errors = run_operation(scheduler, "open", profile)
     try:
         assert paused.wait(5)
         scheduler.stop()

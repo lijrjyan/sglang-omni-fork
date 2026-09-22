@@ -50,7 +50,7 @@ from sglang_omni.proto import (
     StreamMessage,
     SubmitMessage,
 )
-from sglang_omni.proto.session import find_session_command
+from sglang_omni.proto.session import find_session_operation
 from sglang_omni.relay.base import Relay
 from sglang_omni.scheduling.messages import IncomingMessage
 
@@ -1271,12 +1271,12 @@ class Stage:
         if not self._owns_external_io:
             self.clear_request_state(request_id)
             return
-        command = (
-            find_session_command(result.request.metadata)
+        session_operation = (
+            find_session_operation(result.request.metadata)
             if isinstance(result, StagePayload)
             else None
         )
-        if command is not None and command.operation != "append":
+        if session_operation is not None and session_operation.operation != "append":
             await self.control_plane.send_complete(
                 CompleteMessage(
                     request_id=request_id,
@@ -1287,8 +1287,8 @@ class Stage:
             )
             self.clear_request_state(request_id)
             return
-        if command is not None:
-            owners = command.stages
+        if session_operation is not None:
+            owners = session_operation.stages
             if self.name not in owners or self._stream_targets:
                 await self.send_failure(
                     request_id, "session route must use fixed, linear payload edges"

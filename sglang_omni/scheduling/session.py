@@ -6,17 +6,16 @@ from __future__ import annotations
 import queue
 import threading
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Literal, Protocol
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     ResourceUsage,
-    SessionCommand,
     SessionOperation,
     SessionRef,
     TimedChunk,
-    find_session_command,
+    find_session_operation,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
@@ -30,7 +29,7 @@ class ChunkEmitter(Protocol):
     def __call__(self, chunk: TimedChunk) -> None: ...
 
 
-class CommandRegistrar(Protocol):
+class OperationRegistrar(Protocol):
     def __call__(self, message: IncomingMessage) -> None: ...
 
 
@@ -78,17 +77,17 @@ class StageSession:
 
 
 @dataclass(frozen=True, kw_only=True)
-class CommandArrival:
-    """Arrival position of one accepted command inside its session."""
+class OperationArrival:
+    """Arrival position of one accepted operation inside its session."""
 
     ref: SessionRef
-    operation: SessionOperation
+    operation: Literal["open", "append", "close"]
     sequence: int
 
 
 @dataclass(kw_only=True)
-class SessionCommandCursor:
-    """Arrival cursor for one session. A command starts when its sequence is runnable."""
+class SessionOperationCursor:
+    """Arrival cursor for one session. An operation starts when its sequence is runnable."""
 
     next_sequence: int = 0
     runnable_sequence: int = 0
@@ -96,7 +95,7 @@ class SessionCommandCursor:
 
 
 class SessionInbox(queue.Queue[IncomingMessage]):
-    def __init__(self, register: CommandRegistrar) -> None:
+    def __init__(self, register: OperationRegistrar) -> None:
         super().__init__()
         self.register = register
 
@@ -131,87 +130,87 @@ class SessionScheduler(SimpleScheduler):
         self.append_cancel_events: dict[str, threading.Event] = {}
         self.session_table_lock = threading.Lock()
         self.is_shutting_down = False
-        self.arrivals_by_request_id: dict[str, CommandArrival] = {}
-        self.cursors_by_session: dict[SessionRef, SessionCommandCursor] = {}
-        self.command_finished: threading.Condition = threading.Condition(
+        self.arrivals_by_request_id: dict[str, OperationArrival] = {}
+        self.cursors_by_session: dict[SessionRef, SessionOperationCursor] = {}
+        self.operation_finished: threading.Condition = threading.Condition(
             self.session_table_lock
         )
         super().__init__(
             self.compute,
             max_concurrency=max_concurrency,
-            abort_callback=self.cancel_command,
+            abort_callback=self.cancel_operation,
             shutdown_callback=self.shutdown_sessions,
         )
-        self.inbox = SessionInbox(self.register_command)
+        self.inbox = SessionInbox(self.register_operation)
 
-    def register_command(self, message: IncomingMessage) -> None:
+    def register_operation(self, message: IncomingMessage) -> None:
         try:
-            command = find_session_command(message.data.request.metadata)
+            session_operation = find_session_operation(message.data.request.metadata)
         except ValueError:
-            # Note (Junnan Li): put() runs on the stage loop; compute reports the malformed command.
+            # Note (Junnan Li): put() runs on the stage loop; compute reports the malformed operation.
             return
-        if command is None:
+        if session_operation is None:
             return
-        ref = command.ref
+        ref = session_operation.ref
         with self.session_table_lock:
-            cursor = self.cursors_by_session.setdefault(ref, SessionCommandCursor())
-            self.arrivals_by_request_id[message.request_id] = CommandArrival(
+            cursor = self.cursors_by_session.setdefault(ref, SessionOperationCursor())
+            self.arrivals_by_request_id[message.request_id] = OperationArrival(
                 ref=ref,
-                operation=command.operation,
+                operation=session_operation.operation,
                 sequence=cursor.next_sequence,
             )
             cursor.next_sequence += 1
 
-    def finish_command(self, request_id: str) -> None:
-        with self.command_finished:
+    def finish_operation(self, request_id: str) -> None:
+        with self.operation_finished:
             arrival = self.arrivals_by_request_id.pop(request_id, None)
             if arrival is None:
                 return
             cursor = self.cursors_by_session.get(arrival.ref)
             if cursor is None:
                 return
-            # Note (Junnan Li): An aborted command can finish before its predecessors ran.
+            # Note (Junnan Li): An aborted operation can finish before its predecessors ran.
             cursor.completed_sequences.add(arrival.sequence)
             while cursor.runnable_sequence in cursor.completed_sequences:
                 cursor.completed_sequences.discard(cursor.runnable_sequence)
                 cursor.runnable_sequence += 1
             if cursor.runnable_sequence == cursor.next_sequence:
                 del self.cursors_by_session[arrival.ref]
-            self.command_finished.notify_all()
+            self.operation_finished.notify_all()
 
     def consume_if_aborted(self, request_id: str) -> bool:
         aborted = super().consume_if_aborted(request_id)
         with self.session_table_lock:
             arrival = self.arrivals_by_request_id.get(request_id)
-            is_close_command = arrival is not None and arrival.operation == "close"
-        if aborted and is_close_command:
+            is_close_operation = arrival is not None and arrival.operation == "close"
+        if aborted and is_close_operation:
             # Note (Junnan Li): A timed-out close is request-aborted; skipping it would leak the state.
             return False
         if aborted:
-            self.finish_command(request_id)
+            self.finish_operation(request_id)
         return aborted
 
     def compute(self, payload: StagePayload) -> StagePayload:
-        command = find_session_command(payload.request.metadata)
-        if command is None:
+        session_operation = find_session_operation(payload.request.metadata)
+        if session_operation is None:
             if self.request_compute is None:
                 raise ValueError("this stage has no compute_fn for ordinary requests")
             return self.request_compute(payload)
-        ref = command.ref
+        ref = session_operation.ref
         try:
-            with self.command_finished:
+            with self.operation_finished:
                 # Note (Junnan Li): A request-level abort may already have consumed the arrival.
                 arrival = self.arrivals_by_request_id.get(payload.request_id)
                 if arrival is not None:
                     ref = arrival.ref
                     sequence = arrival.sequence
-                    self.command_finished.wait_for(
+                    self.operation_finished.wait_for(
                         lambda: (
                             (cursor := self.cursors_by_session.get(ref)) is None
                             or cursor.runnable_sequence >= sequence
                         )
                     )
-            return self.compute_session(payload, command)
+            return self.compute_session(payload, session_operation)
         finally:
             try:
                 # Note (Junnan Li): stop skips a session whose hook is running; it is closed here.
@@ -223,9 +222,9 @@ class SessionScheduler(SimpleScheduler):
                     with session.lock:
                         self.close_session(ref, session)
             finally:
-                self.finish_command(payload.request_id)
+                self.finish_operation(payload.request_id)
 
-    def cancel_command(self, request_id: str) -> None:
+    def cancel_operation(self, request_id: str) -> None:
         with self.session_table_lock:
             cancel_event = self.append_cancel_events.get(request_id)
             if cancel_event is not None:
@@ -296,10 +295,10 @@ class SessionScheduler(SimpleScheduler):
             session.lock.release()
 
     def compute_session(
-        self, payload: StagePayload, command: SessionCommand
+        self, payload: StagePayload, session_operation: SessionOperation
     ) -> StagePayload:
-        ref = command.ref
-        operation = command.operation
+        ref = session_operation.ref
+        operation = session_operation.operation
         if operation == "open":
             self.open_session(ref, payload.request)
             payload.data = {"opened": True}
@@ -321,8 +320,8 @@ class SessionScheduler(SimpleScheduler):
             elif self.is_shutting_down:
                 raise RuntimeError("session scheduler is stopping")
             else:
-                input_chunk = command.chunk
-                assert input_chunk is not None, "append command carries no chunk"
+                input_chunk = session_operation.chunk
+                assert input_chunk is not None, "append operation carries no chunk"
                 cancel_event = threading.Event()
                 with self.session_table_lock:
                     self.append_cancel_events[payload.request_id] = cancel_event
