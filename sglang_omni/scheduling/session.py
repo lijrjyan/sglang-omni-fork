@@ -397,9 +397,8 @@ class SessionScheduler(SimpleScheduler):
                         cancel_event = threading.Event()
                         with self.session_table_lock:
                             self.append_cancel_events[payload.request_id] = cancel_event
-                        with self._abort_lock:
-                            if payload.request_id in self._aborted:
-                                cancel_event.set()
+                        if self.is_aborted(payload.request_id):
+                            cancel_event.set()
 
                         def emit(chunk: TimedChunk) -> None:
                             if not cancel_event.is_set():

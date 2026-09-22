@@ -82,6 +82,10 @@ class SimpleScheduler:
         except Exception:
             logger.exception("SimpleScheduler: abort cleanup failed for %s", request_id)
 
+    def is_aborted(self, request_id: str) -> bool:
+        with self._abort_lock:
+            return request_id in self._aborted
+
     def consume_if_aborted(self, request_id: str) -> bool:
         with self._abort_lock:
             if request_id not in self._aborted:
