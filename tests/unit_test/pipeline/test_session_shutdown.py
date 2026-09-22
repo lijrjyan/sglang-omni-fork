@@ -32,19 +32,20 @@ class Hooks(SessionHooks):
         self.block = block
         self.entered = threading.Event()
         self.release = threading.Event()
-        self.closed: list[object] = []
+        self.opened: set[SessionRef] = set()
+        self.closed: list[SessionRef] = []
 
-    def open(self, ref: SessionRef, request: OmniRequest) -> object:
+    def open(self, ref: SessionRef, request: OmniRequest) -> None:
         self.pause("open")
-        return object()
+        self.opened.add(ref)
 
     def append(
         self,
-        state: object,
         chunk: TimedChunk,
         payload: StagePayload,
         context: SessionContext,
     ) -> StagePayload:
+        assert context.ref in self.opened
         self.pause("append")
         return payload
 
@@ -53,8 +54,9 @@ class Hooks(SessionHooks):
             self.entered.set()
             assert self.release.wait(5)
 
-    def close(self, state: object) -> None:
-        self.closed.append(state)
+    def close(self, ref: SessionRef) -> None:
+        self.opened.remove(ref)
+        self.closed.append(ref)
 
 
 def run_command(scheduler, op, profile=None):

@@ -97,10 +97,12 @@ speculative generality.
   element types and optionality. Bare `dict`/`list`/`tuple` are not annotations.
 - Do not annotate with `Any`. It disables checking for that value and every
   field read from it. Name a dataclass, TypedDict, `Literal`, or a union of
-  those. Do not use `TypeVar` or `Generic`. A value the holder stores and
-  passes on without reading its fields is `object`; the code that creates
-  the value names its real type. On an untrusted boundary, `object` is also
-  allowed, and the next use must narrow it with `isinstance`. Do not write
+  those. Do not use `TypeVar` or `Generic`. Do not annotate a value as
+  `object` because the current function does not read its fields. Name the
+  type the caller actually passes. If callers do not share one type, the
+  code that creates the value keeps it, instead of putting it on a shared
+  signature. On an untrusted boundary, `object` is allowed, and the next
+  use must narrow it with `isinstance`. Do not write
   `dict[str, Any]`, `list[Any]`, `tuple[Any, ...]`, or `Coroutine[Any, Any, T]`.
   A coroutine that does not yield is `Coroutine[None, None, T]`.
 - Do not annotate with `Callable` or `Callable[...]`. Declare a `Protocol`

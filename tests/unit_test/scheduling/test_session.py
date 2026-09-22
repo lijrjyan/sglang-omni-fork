@@ -41,19 +41,21 @@ class Hooks(SessionHooks):
     def __init__(self, name: str, events: queue.Queue[tuple[object, ...]]) -> None:
         self.name = name
         self.events = events
+        self.states: dict[SessionRef, RecordedState] = {}
 
-    def open(self, ref: SessionRef, request: OmniRequest) -> RecordedState:
+    def open(self, ref: SessionRef, request: OmniRequest) -> None:
         self.events.put(("open", self.name, ref.session_id))
-        return RecordedState(ref.session_id)
+        self.states[ref] = RecordedState(ref.session_id)
 
-    def close(self, state: RecordedState) -> None:
+    def close(self, ref: SessionRef) -> None:
+        state = self.states.pop(ref)
         self.events.put(("close", self.name, state.session_id))
 
 
 def test_open_usage_failure_releases_state():
 
     class BrokenUsage(Hooks):
-        def usage(self, state: RecordedState) -> ResourceUsage:
+        def usage(self, ref: SessionRef) -> ResourceUsage:
             raise RuntimeError("usage failed")
 
     events = queue.Queue()
@@ -70,11 +72,11 @@ def test_open_usage_failure_releases_state():
 def test_stage_capacity_is_aggregate():
 
     class SizedHooks(Hooks):
-        def open(self, ref: SessionRef, request: OmniRequest) -> RecordedState:
-            return RecordedState(ref.session_id, byte_count=2)
+        def open(self, ref: SessionRef, request: OmniRequest) -> None:
+            self.states[ref] = RecordedState(ref.session_id, byte_count=2)
 
-        def usage(self, state: RecordedState) -> ResourceUsage:
-            return ResourceUsage(bytes=state.byte_count)
+        def usage(self, ref: SessionRef) -> ResourceUsage:
+            return ResourceUsage(bytes=self.states[ref].byte_count)
 
     events = queue.Queue()
     scheduler = SessionScheduler(SizedHooks("source", events), max_state_bytes=3)
@@ -186,7 +188,6 @@ class BlockingHooks(Hooks):
 
     def append(
         self,
-        state: RecordedState,
         chunk: TimedChunk,
         payload: StagePayload,
         context: SessionContext,
@@ -312,11 +313,11 @@ def test_command_finished_by_abort_before_running_does_not_wait():
     class AppendHooks(Hooks):
         def append(
             self,
-            state: RecordedState,
             chunk: TimedChunk,
             payload: StagePayload,
             context: SessionContext,
         ) -> StagePayload:
+            state = self.states[context.ref]
             self.events.put(("append", self.name, state.session_id))
             return payload
 

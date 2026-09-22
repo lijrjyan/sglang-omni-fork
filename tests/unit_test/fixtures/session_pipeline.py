@@ -123,24 +123,25 @@ class Hooks(SessionHooks):
     def __init__(self, name: str, events: Queue[StageEvent]) -> None:
         self.name = name
         self.events = events
+        self.states: dict[SessionRef, HookState] = {}
 
-    def open(self, ref: SessionRef, request: OmniRequest) -> HookState:
+    def open(self, ref: SessionRef, request: OmniRequest) -> None:
         state = read_hook_state(ref, request)
         self.events.put(("open", self.name, ref.session_id))
         time.sleep(state.open_delay_s)
         if state.fail_open_stage == self.name:
             raise RuntimeError("open failed")
-        return state
+        self.states[ref] = state
 
     def append(
         self,
-        state: HookState,
         chunk: TimedChunk,
         payload: StagePayload,
         context: SessionContext,
     ) -> StagePayload:
         import torch
 
+        state = self.states[context.ref]
         self.events.put(("append", self.name, state.session_id, chunk.seq))
         state.count += 1
         logical_name = self.name.partition(REPLICA_SEPARATOR)[0]
@@ -173,14 +174,17 @@ class Hooks(SessionHooks):
             payload.data = {"count": state.count}
         return payload
 
-    def close(self, state: HookState) -> None:
+    def close(self, ref: SessionRef) -> None:
+        state = self.states.get(ref)
+        assert state is not None
         self.events.put(("close", self.name, state.session_id))
         if state.fail_close_once_stage == self.name:
             state.fail_close_once_stage = None
             raise RuntimeError("close rejected")
+        del self.states[ref]
 
-    def usage(self, state: HookState) -> ResourceUsage:
-        return ResourceUsage(bytes=state.count)
+    def usage(self, ref: SessionRef) -> ResourceUsage:
+        return ResourceUsage(bytes=self.states[ref].count)
 
 
 def make_session_scheduler(name: str, events: Queue[StageEvent]) -> SessionScheduler:

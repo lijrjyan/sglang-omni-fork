@@ -47,32 +47,31 @@ class SessionContext:
 class SessionHooks:
     """Hooks run serially per session; different sessions may run concurrently.
 
+    Each hook keeps the state it created. The scheduler only passes SessionRef.
     Failed open releases allocations it has not returned. close is idempotent.
-    The scheduler stores the open() result and passes it back without reading it.
     """
 
-    def open(self, ref: SessionRef, request: OmniRequest) -> object:
+    def open(self, ref: SessionRef, request: OmniRequest) -> None:
         raise NotImplementedError
 
     def append(
         self,
-        state: object,
         chunk: TimedChunk,
         payload: StagePayload,
         context: SessionContext,
     ) -> StagePayload:
         raise NotImplementedError
 
-    def close(self, state: object) -> None:
+    def close(self, ref: SessionRef) -> None:
         raise NotImplementedError
 
-    def usage(self, state: object) -> ResourceUsage:
+    def usage(self, ref: SessionRef) -> ResourceUsage:
         return ResourceUsage()
 
 
 @dataclass(kw_only=True)
 class StageSession:
-    state: object | None
+    is_open: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
     usage: ResourceUsage = field(default_factory=ResourceUsage)
 
@@ -236,17 +235,14 @@ class SessionScheduler(SimpleScheduler):
             raise RuntimeError("session shutdown cleanup failed") from errors[0]
 
     def close_session(self, key: tuple[str, int], session: StageSession) -> None:
-        state = session.state
-        if state is not None:
-            self.hooks.close(state)
-            session.state = None
+        if session.is_open:
+            self.hooks.close(SessionRef(key[0], key[1]))
+            session.is_open = False
         with self.session_lock:
             self.sessions.pop(key, None)
 
-    def update_usage(self, session: StageSession) -> None:
-        state = session.state
-        assert state is not None
-        usage = self.hooks.usage(state)
+    def update_usage(self, session: StageSession, ref: SessionRef) -> None:
+        usage = self.hooks.usage(ref)
         with self.session_lock:
             session.usage = usage
             if (
@@ -260,7 +256,7 @@ class SessionScheduler(SimpleScheduler):
 
     def open_session(self, ref: SessionRef, request: OmniRequest) -> None:
         key = (ref.session_id, ref.incarnation)
-        session = StageSession(state=None)
+        session = StageSession()
         session.lock.acquire()
         with self.session_lock:
             if self.is_closing:
@@ -274,8 +270,9 @@ class SessionScheduler(SimpleScheduler):
                 raise QueueFullError()
             self.sessions[key] = session
         try:
-            session.state = self.hooks.open(ref, request)
-            self.update_usage(session)
+            self.hooks.open(ref, request)
+            session.is_open = True
+            self.update_usage(session, ref)
             if self.is_closing:
                 raise RuntimeError("session scheduler is stopping")
         except BaseException:
@@ -313,8 +310,6 @@ class SessionScheduler(SimpleScheduler):
             else:
                 input_chunk = command.chunk
                 assert input_chunk is not None, "append command carries no chunk"
-                state = session.state
-                assert state is not None
                 event = threading.Event()
                 with self.session_lock:
                     self.commands[payload.request_id] = event
@@ -335,12 +330,11 @@ class SessionScheduler(SimpleScheduler):
 
                 try:
                     updated_payload = self.hooks.append(
-                        state,
                         input_chunk,
                         payload,
                         SessionContext(ref=ref, cancelled=event, emit=emit),
                     )
-                    self.update_usage(session)
+                    self.update_usage(session, ref)
                     return updated_payload
                 finally:
                     with self.session_lock:
