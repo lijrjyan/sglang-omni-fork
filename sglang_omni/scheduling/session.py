@@ -400,7 +400,7 @@ class SessionScheduler(SimpleScheduler):
                         if self.is_aborted(payload.request_id):
                             cancel_event.set()
 
-                        def emit(chunk: TimedChunk) -> None:
+                        def emit_chunk(chunk: TimedChunk) -> None:
                             if not cancel_event.is_set():
                                 self.outbox.put(
                                     OutgoingMessage(
@@ -418,7 +418,7 @@ class SessionScheduler(SimpleScheduler):
                                 SessionContext(
                                     session_identity=session_identity,
                                     cancelled=cancel_event,
-                                    emit=emit,
+                                    emit=emit_chunk,
                                 ),
                             )
                             self.update_usage(session, session_identity)
