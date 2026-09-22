@@ -419,7 +419,7 @@ class Coordinator(CoordinatorSessions):
         target_stage: str | None = None,
         terminal_stages: set[str] | None = None,
         replica_bindings: dict[str, int] | None = None,
-        bypass_admission: bool = False,
+        should_bypass_admission: bool = False,
     ) -> None:
         """Submit a request without waiting for completion."""
         if self._fatal_error is not None:
@@ -428,7 +428,7 @@ class Coordinator(CoordinatorSessions):
             raise ValueError(f"Request {request_id} already exists")
 
         if (
-            not bypass_admission
+            not should_bypass_admission
             and self.max_in_flight is not None
             and len(self._requests) >= self.max_in_flight
         ):

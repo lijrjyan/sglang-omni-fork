@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Model-independent, bounded session command and output contracts."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -12,6 +13,19 @@ SESSION_METADATA_KEY = "omni_session"
 # Note (Junnan Li): msgspec encodes bytes as base64 text by default; keep them native on both sides.
 BUILTIN_TYPES = (bytes,)
 SessionOp = Literal["open", "append", "close"]
+DEFAULT_MAX_MODALITIES = 8
+DEFAULT_MAX_PENDING_CHUNKS = 16
+DEFAULT_MAX_PENDING_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_OUTPUT_CHUNKS = 64
+DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_CHUNK_BYTES = 1024 * 1024
+DEFAULT_COMMAND_TIMEOUT_S = 30.0
+DEFAULT_IDLE_TIMEOUT_S = 300.0
+# Note (Junnan Li): Msgpack bin headers grow by 1 byte at 256 bytes and 3 bytes at 65536.
+MSGPACK_BIN8_LIMIT = 256
+MSGPACK_BIN16_LIMIT = 65536
+MSGPACK_BIN16_HEADER_GROWTH = 1
+MSGPACK_BIN32_HEADER_GROWTH = 3
 
 
 @dataclass(frozen=True)
@@ -72,14 +86,14 @@ class ResourceUsage:
 
 @dataclass(frozen=True)
 class SessionLimits:
-    max_modalities: int = 8
-    max_pending_chunks: int = 16
-    max_pending_bytes: int = 4 * 1024 * 1024
-    max_output_chunks: int = 64
-    max_output_bytes: int = 4 * 1024 * 1024
-    max_chunk_bytes: int = 1024 * 1024
-    command_timeout_s: float = 30.0
-    idle_timeout_s: float = 300.0
+    max_modalities: int = DEFAULT_MAX_MODALITIES
+    max_pending_chunks: int = DEFAULT_MAX_PENDING_CHUNKS
+    max_pending_bytes: int = DEFAULT_MAX_PENDING_BYTES
+    max_output_chunks: int = DEFAULT_MAX_OUTPUT_CHUNKS
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES
+    command_timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S
+    idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S
 
 
 @dataclass(frozen=True)
@@ -101,21 +115,26 @@ class SessionCommand:
 
 def find_session_command(metadata: dict[str, Any]) -> SessionCommand | None:
     """Return the command in request metadata, or None for an ordinary request."""
-    data = metadata.get(SESSION_METADATA_KEY)
-    if data is None:
+    command_fields = metadata.get(SESSION_METADATA_KEY)
+    if command_fields is None:
         return None
-    return SessionCommand.from_dict(data)
+    return SessionCommand.from_dict(command_fields)
 
 
-def wire_size(value: dict[str, Any]) -> int:
+def wire_size(chunk_fields: dict[str, Any]) -> int:
     """Return the msgpack wire size of a chunk dict without copying a binary payload."""
-    if isinstance(value["payload"], bytes):
-        size = len(value["payload"])
-        # Note (Junnan Li): Msgpack bin headers grow by 1 byte at 256 bytes and 3 bytes at 65536.
-        header_growth = 0 if size < 256 else 1 if size < 65536 else 3
-        return (
-            len(msgpack.packb({**value, "payload": b""}, use_bin_type=True))
-            + size
-            + header_growth
+    payload = chunk_fields["payload"]
+    if isinstance(payload, bytes):
+        payload_size = len(payload)
+        if payload_size < MSGPACK_BIN8_LIMIT:
+            header_growth = 0
+        elif payload_size < MSGPACK_BIN16_LIMIT:
+            header_growth = MSGPACK_BIN16_HEADER_GROWTH
+        else:
+            header_growth = MSGPACK_BIN32_HEADER_GROWTH
+        packed_without_payload = msgpack.packb(
+            {**chunk_fields, "payload": b""}, use_bin_type=True
         )
-    return len(msgpack.packb(value, use_bin_type=True))
+        return len(packed_without_payload) + payload_size + header_growth
+    else:
+        return len(msgpack.packb(chunk_fields, use_bin_type=True))

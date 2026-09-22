@@ -1295,15 +1295,15 @@ class Stage:
                 )
                 return
             index = owners.index(self.name)
-            expected = (
-                self.logical_source(owners[index + 1])
-                if index + 1 < len(owners)
-                else None
-            )
+            if index + 1 < len(owners):
+                expected = self.logical_source(owners[index + 1])
+            else:
+                expected = None
             actual = self.get_next(request_id, result)
-            actual_target = (
-                actual[0] if isinstance(actual, list) and len(actual) == 1 else actual
-            )
+            if isinstance(actual, list) and len(actual) == 1:
+                actual_target = actual[0]
+            else:
+                actual_target = actual
             if actual_target != expected:
                 await self.send_failure(
                     request_id, "session route differs from the stage payload route"

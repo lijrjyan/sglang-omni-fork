@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Persistent state for session-aware pipeline stages."""
+
 from __future__ import annotations
 
 import queue
@@ -19,8 +20,12 @@ from sglang_omni.proto.session import (
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
+DEFAULT_MAX_SESSIONS = 64
+DEFAULT_MAX_CONCURRENCY = 4
+DEFAULT_MAX_STATE_BYTES = 1 << 30
 
-@dataclass
+
+@dataclass(kw_only=True)
 class SessionContext:
     ref: SessionRef
     cancelled: threading.Event
@@ -30,8 +35,7 @@ class SessionContext:
 class SessionHooks:
     """Hooks run serially per session; different sessions may run concurrently.
 
-    Failed open must release allocations it has not returned. append must stop
-    using state before returning, including on cancellation. close is idempotent.
+    Failed open releases allocations it has not returned. close is idempotent.
     """
 
     def open(self, ref: SessionRef, request: OmniRequest) -> Any:
@@ -53,14 +57,14 @@ class SessionHooks:
         return ResourceUsage()
 
 
-@dataclass
+@dataclass(kw_only=True)
 class StageSession:
     state: Any
     lock: threading.Lock = field(default_factory=threading.Lock)
     usage: ResourceUsage = field(default_factory=ResourceUsage)
 
 
-@dataclass
+@dataclass(kw_only=True)
 class CommandOrder:
     """Arrival order of one session's commands: seq served runs next."""
 
@@ -93,9 +97,9 @@ class SessionScheduler(SimpleScheduler):
         hooks: SessionHooks,
         *,
         compute_fn: Callable[[StagePayload], StagePayload] | None = None,
-        max_sessions: int = 64,
-        max_concurrency: int = 4,
-        max_state_bytes: int = 1 << 30,
+        max_sessions: int = DEFAULT_MAX_SESSIONS,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        max_state_bytes: int = DEFAULT_MAX_STATE_BYTES,
     ) -> None:
         self.hooks = hooks
         self.ordinary_compute = compute_fn
@@ -104,7 +108,7 @@ class SessionScheduler(SimpleScheduler):
         self.sessions: dict[tuple[str, int], StageSession] = {}
         self.commands: dict[str, threading.Event] = {}
         self.session_lock = threading.Lock()
-        self.closing = False
+        self.is_closing = False
         self.tickets: dict[str, tuple[tuple[str, int], int]] = {}
         self.close_requests: set[str] = set()
         self.orders: dict[tuple[str, int], CommandOrder] = {}
@@ -177,15 +181,17 @@ class SessionScheduler(SimpleScheduler):
                 if ticket is not None:
                     key, seq = ticket
                     self.served.wait_for(
-                        lambda: (order := self.orders.get(key)) is None
-                        or order.served >= seq
+                        lambda: (
+                            (order := self.orders.get(key)) is None
+                            or order.served >= seq
+                        )
                     )
             return self.compute_session(payload, command)
         finally:
             try:
                 # Note (Junnan Li): stop skips a session whose hook is running; it is closed here.
                 with self.session_lock:
-                    session = self.sessions.get(key) if self.closing else None
+                    session = self.sessions.get(key) if self.is_closing else None
                 if session is not None:
                     with session.lock:
                         self.close_session(key, session)
@@ -200,7 +206,7 @@ class SessionScheduler(SimpleScheduler):
 
     def shutdown_sessions(self) -> None:
         with self.session_lock:
-            self.closing = True
+            self.is_closing = True
             for event in self.commands.values():
                 event.set()
             sessions = list(self.sessions.items())
@@ -228,17 +234,20 @@ class SessionScheduler(SimpleScheduler):
         with self.session_lock:
             session.usage = usage
             if (
-                sum(s.usage.bytes for s in self.sessions.values())
+                sum(
+                    stage_session.usage.bytes
+                    for stage_session in self.sessions.values()
+                )
                 > self.max_state_bytes
             ):
                 raise QueueFullError()
 
     def open_session(self, ref: SessionRef, request: OmniRequest) -> None:
         key = (ref.session_id, ref.incarnation)
-        session = StageSession(None)
+        session = StageSession(state=None)
         session.lock.acquire()
         with self.session_lock:
-            if self.closing:
+            if self.is_closing:
                 session.lock.release()
                 raise RuntimeError("session scheduler is stopping")
             if key in self.sessions:
@@ -251,7 +260,7 @@ class SessionScheduler(SimpleScheduler):
         try:
             session.state = self.hooks.open(ref, request)
             self.update_usage(session)
-            if self.closing:
+            if self.is_closing:
                 raise RuntimeError("session scheduler is stopping")
         except BaseException:
             self.close_session(key, session)
@@ -276,43 +285,45 @@ class SessionScheduler(SimpleScheduler):
             if op == "close":
                 payload.data = {"closed": True}
                 return payload
-            raise ValueError("unknown session incarnation")
+            else:
+                raise ValueError("unknown session incarnation")
         with session.lock:
             if op == "close":
                 self.close_session(key, session)
                 payload.data = {"closed": True}
                 return payload
-            if self.closing:
+            elif self.is_closing:
                 raise RuntimeError("session scheduler is stopping")
-            input_chunk = command.chunk
-            assert input_chunk is not None, "append command carries no chunk"
-            event = threading.Event()
-            with self.session_lock:
-                self.commands[payload.request_id] = event
-            with self._abort_lock:
-                if payload.request_id in self._aborted:
-                    event.set()
-
-            def emit(chunk: TimedChunk) -> None:
-                if not event.is_set():
-                    self.outbox.put(
-                        OutgoingMessage(
-                            request_id=payload.request_id,
-                            type="stream",
-                            data=chunk.to_dict(),
-                            metadata={"modality": chunk.modality},
-                        )
-                    )
-
-            try:
-                result = self.hooks.append(
-                    session.state,
-                    input_chunk,
-                    payload,
-                    SessionContext(ref, event, emit),
-                )
-                self.update_usage(session)
-                return result
-            finally:
+            else:
+                input_chunk = command.chunk
+                assert input_chunk is not None, "append command carries no chunk"
+                event = threading.Event()
                 with self.session_lock:
-                    self.commands.pop(payload.request_id, None)
+                    self.commands[payload.request_id] = event
+                with self._abort_lock:
+                    if payload.request_id in self._aborted:
+                        event.set()
+
+                def emit(chunk: TimedChunk) -> None:
+                    if not event.is_set():
+                        self.outbox.put(
+                            OutgoingMessage(
+                                request_id=payload.request_id,
+                                type="stream",
+                                data=chunk.to_dict(),
+                                metadata={"modality": chunk.modality},
+                            )
+                        )
+
+                try:
+                    updated_payload = self.hooks.append(
+                        session.state,
+                        input_chunk,
+                        payload,
+                        SessionContext(ref=ref, cancelled=event, emit=emit),
+                    )
+                    self.update_usage(session)
+                    return updated_payload
+                finally:
+                    with self.session_lock:
+                        self.commands.pop(payload.request_id, None)
