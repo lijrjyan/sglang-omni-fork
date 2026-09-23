@@ -65,9 +65,15 @@ from sglang_omni.proto.admin import (
     ADMIN_UPDATE_WEIGHTS_FROM_TENSOR,
     ADMIN_WEIGHTS_CHECKER,
 )
+from sglang_omni.proto.request import StagePayload
 from sglang_omni.proto.session import find_session_operation
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
-from sglang_omni.scheduling.sglang_backend import ar_session
+from sglang_omni.scheduling.sglang_backend.ar_session import (
+    ARSessionAdapter,
+    ARSessionBridge,
+    SessionUnit,
+    is_close_request,
+)
 from sglang_omni.scheduling.types import (
     ARRequestData,
     DeferredAdmission,
@@ -77,7 +83,6 @@ from sglang_omni.scheduling.types import (
 logger = logging.getLogger(__name__)
 
 _FAILED_BATCH_RESULT = object()
-
 
 _ABORTED_REQUEST_ID_LIMIT = 10000
 _ABORTED_REQUEST_ID_RETAINED = 5000
@@ -210,7 +215,7 @@ class OmniScheduler:
         are defined directly on this class and take precedence.
     """
 
-    session_bridge: ar_session.ARSessionBridge | None = None
+    session_bridge: ARSessionBridge | None = None
     previous_pending_decode: PendingDecode | None = None
 
     def __init__(
@@ -224,7 +229,7 @@ class OmniScheduler:
         *,
         model_runner: Any = None,
         request_builder: Callable | None = None,
-        session_adapter: ar_session.ARSessionAdapter | None = None,
+        session_adapter: ARSessionAdapter | None = None,
         result_adapter: Callable | None = None,
         stream_output_builder: Callable | None = None,
         stream_chunk_handler: Callable | None = None,
@@ -417,6 +422,7 @@ class OmniScheduler:
         # decode batch, or None. Tracked here (not just a loop local) so abort
         # can reach the in-flight step. See _event_loop_async_decode.
         self._async_pending: PendingDecode | None = None
+        self.previous_pending_decode = None
         self.forward_ct = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs = 0
@@ -646,7 +652,7 @@ class OmniScheduler:
 
         self.session_controller = SessionController(self.tree_cache)
         if self.session_adapter is not None:
-            self.session_bridge = ar_session.ARSessionBridge(self, self.session_adapter)
+            self.session_bridge = ARSessionBridge(self, self.session_adapter)
         self.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
         self.load_snapshot_writer = None
         self.kv_events_publisher = SimpleNamespace(
@@ -915,7 +921,7 @@ class OmniScheduler:
             is_cleanup = (
                 self.session_bridge is not None
                 and msg.type == "new_request"
-                and ar_session.ARSessionBridge.is_cleanup(msg.data)
+                and is_close_request(msg.data)
             )
             if msg.request_id in self._aborted_request_ids and not is_cleanup:
                 continue
@@ -962,59 +968,77 @@ class OmniScheduler:
                 break
         return recv_msgs
 
+    def active_session_unit(self, request_id: str) -> SessionUnit | None:
+        bridge = self.session_bridge
+        if bridge is None:
+            return None
+        else:
+            return bridge.requests.get(request_id)
+
+    def route_session_input(self, payload: StagePayload) -> bool:
+        """Return whether the payload should be built and enqueued."""
+        operation = find_session_operation(payload.request.metadata)
+        bridge = self.session_bridge
+        if operation is None:
+            return True
+        elif bridge is None:
+            raise ValueError("AR streaming sessions are not enabled for this stage")
+        elif operation.operation != "append":
+            session_payload = bridge.apply_operation(payload, operation)
+            if payload.request_id in self._aborted_request_ids:
+                return False
+            else:
+                self.outbox.put(
+                    OutgoingMessage(
+                        request_id=payload.request_id,
+                        type="result",
+                        data=session_payload,
+                    )
+                )
+                return False
+        else:
+            unit = bridge.accept(payload, operation)
+            chunk = unit.chunk
+            is_empty_eos = (
+                chunk.eos
+                and chunk.duration_ms == 0
+                and isinstance(chunk.payload, bytes)
+                and not chunk.payload
+            )
+            if not is_empty_eos:
+                return True
+            else:
+                try:
+                    eos_payload = bridge.adapter.finish_input(
+                        unit.session_identity, payload
+                    )
+                except Exception:
+                    bridge.complete(payload.request_id)
+                    raise
+                if eos_payload is None:
+                    return True
+                else:
+                    bridge.complete(payload.request_id)
+                    self.outbox.put(
+                        OutgoingMessage(
+                            request_id=payload.request_id,
+                            type="result",
+                            data=eos_payload,
+                        )
+                    )
+                    return False
+
     def process_input_requests(self, recv_reqs):
         """Convert incoming payloads to SGLang Reqs and enqueue."""
-        ordinary_payloads = []
-        bridge = self.session_bridge
+        ordinary_payloads: list[StagePayload] = []
         for payload in recv_reqs:
             try:
-                operation = find_session_operation(payload.request.metadata)
-                if operation is None:
-                    ordinary_payloads.append(payload)
-                    continue
-                if bridge is None:
-                    raise ValueError(
-                        "AR streaming sessions are not enabled for this stage"
-                    )
-                if operation.operation != "append":
-                    result = bridge.operation(payload, operation)
-                    if payload.request_id not in self._aborted_request_ids:
-                        self.outbox.put(
-                            OutgoingMessage(
-                                request_id=payload.request_id,
-                                type="result",
-                                data=result,
-                            )
-                        )
-                else:
-                    unit = bridge.accept(payload, operation)
-                    chunk = unit.chunk
-                    if (
-                        chunk.eos
-                        and chunk.duration_ms == 0
-                        and isinstance(chunk.payload, bytes)
-                        and not chunk.payload
-                    ):
-                        try:
-                            eos_payload = bridge.adapter.finish_input(
-                                unit.session_identity, payload
-                            )
-                        except Exception:
-                            bridge.complete(payload.request_id)
-                            raise
-                        if eos_payload is not None:
-                            bridge.complete(payload.request_id)
-                            self.outbox.put(
-                                OutgoingMessage(
-                                    request_id=payload.request_id,
-                                    type="result",
-                                    data=eos_payload,
-                                )
-                            )
-                            continue
-                    ordinary_payloads.append(payload)
+                should_schedule = self.route_session_input(payload)
             except (ValueError, QueueFullError) as exc:
                 self.emit_request_error(payload.request_id, exc)
+            else:
+                if should_schedule:
+                    ordinary_payloads.append(payload)
         recv_reqs = ordinary_payloads
         self.drain_request_admission_results()
         self.drain_request_build_results()
@@ -1056,8 +1080,8 @@ class OmniScheduler:
                 payload.prefetched_chunks = buffered_chunks
             pending_stream_done = ingress.done if ingress is not None else False
             payload.prefetched_stream_done = pending_stream_done
-            is_session_append = bridge is not None and req_id in bridge.requests
-            if not is_session_append and not self.is_request_build_ready(
+            session_unit = self.active_session_unit(req_id)
+            if session_unit is None and not self.is_request_build_ready(
                 payload,
                 pending_stream_done=pending_stream_done,
             ):
@@ -1066,10 +1090,10 @@ class OmniScheduler:
             else:
                 pass
             active_stage = _get_active_stage()
-            if bridge is not None and req_id in bridge.requests:
-                request_build_executor = None
-            else:
+            if session_unit is None:
                 request_build_executor = self._request_build_executor
+            else:
+                request_build_executor = None
             if request_build_executor is not None:
                 with self.request_admission_lock:
                     if (
@@ -1142,12 +1166,15 @@ class OmniScheduler:
             stage=active_stage,
             event_name="scheduler_request_build_start",
         )
-        bridge = self.session_bridge
-        if bridge is not None and req_id in bridge.requests:
-            unit = bridge.requests[req_id]
-            req_data = bridge.adapter.build(unit.session_identity, unit.chunk, payload)
-        else:
+        session_unit = self.active_session_unit(req_id)
+        if session_unit is None:
             req_data = self._request_builder(payload)
+        else:
+            bridge = self.session_bridge
+            assert bridge is not None
+            req_data = bridge.adapter.build(
+                session_unit.session_identity, session_unit.chunk, payload
+            )
         _emit_event(
             request_id=req_id,
             stage=active_stage,
@@ -1426,8 +1453,10 @@ class OmniScheduler:
     ) -> None:
         req_id = payload.request_id
         self._deferred_request_payloads.pop(req_id, None)
-        bridge = self.session_bridge
-        if bridge is not None and req_id in bridge.requests:
+        session_unit = self.active_session_unit(req_id)
+        if session_unit is not None:
+            bridge = self.session_bridge
+            assert bridge is not None
             try:
                 bridge.materialize(payload, req_data)
             except ValueError as exc:
@@ -1448,10 +1477,13 @@ class OmniScheduler:
                 self.emit_request_error(req_id, ValueError(error_msg))
                 self.abort(req_id)
                 return
-        if bridge is not None and req_id in bridge.requests:
-            error = bridge.capacity_error(req_id)
-            if error:
-                self.emit_request_error(req_id, ValueError(error))
+        session_unit = self.active_session_unit(req_id)
+        if session_unit is not None:
+            bridge = self.session_bridge
+            assert bridge is not None
+            capacity_message = bridge.capacity_error(req_id)
+            if capacity_message is not None:
+                self.emit_request_error(req_id, ValueError(capacity_message))
                 bridge.rollback(req_id)
                 self.abort(req_id)
                 return
@@ -1508,8 +1540,9 @@ class OmniScheduler:
             req._omni_terminal_claimed = False  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             req._omni_data = req_data  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             self.waiting_queue.append(req)
-            if bridge is not None and req_id in bridge.requests:
-                bridge.requests[req_id].is_enqueued = True
+            enqueued_unit = self.active_session_unit(req_id)
+            if enqueued_unit is not None:
+                enqueued_unit.is_enqueued = True
 
         if request_admission_lock_held:
             enqueue_if_live()
@@ -1804,8 +1837,10 @@ class OmniScheduler:
             else:
                 pass
             req_output = mr_output.outputs[rid]
-            if bridge is not None and rid in bridge.requests:
-                messages = bridge.messages(rid, sched_req.data, req_output)
+            session_unit = self.active_session_unit(rid)
+            if session_unit is not None:
+                assert bridge is not None
+                messages = bridge.stream_messages(rid, sched_req.data, req_output)
             elif self._stream_output_builder is not None:
                 messages = self._stream_output_builder(rid, sched_req.data, req_output)
             else:
@@ -1831,19 +1866,22 @@ class OmniScheduler:
             self.outbox.put(msg)
 
     def flush_stream_output(self, request_id: str, req_data: Any) -> None:
-        bridge = self.session_bridge
-        if bridge is not None and request_id in bridge.requests:
+        session_unit = self.active_session_unit(request_id)
+        if session_unit is not None:
+            bridge = self.session_bridge
+            assert bridge is not None
             self.put_stream_messages(
-                request_id, bridge.messages(request_id, req_data, should_flush=True)
+                request_id,
+                bridge.stream_messages(request_id, req_data, should_flush=True),
             )
+        elif self._stream_output_builder is None:
+            return
         else:
-            stream_output_builder = self._stream_output_builder
-            if stream_output_builder is None:
-                return
-            flush = getattr(stream_output_builder, "flush", None)
+            flush = getattr(self._stream_output_builder, "flush", None)
             if flush is None:
                 return
-            self.put_stream_messages(request_id, flush(request_id, req_data))
+            else:
+                self.put_stream_messages(request_id, flush(request_id, req_data))
 
     @staticmethod
     def make_batch_result(mr_output):
@@ -2053,13 +2091,13 @@ class OmniScheduler:
                 data.output_ids = list(req.output_ids)
                 data.weight_version = get_serving().weight_version
                 self.flush_stream_output(rid, data)
-                bridge = self.session_bridge
-                if bridge is not None and rid in bridge.requests:
-                    result = bridge.adapter.result(
-                        bridge.requests[rid].session_identity, data
-                    )
-                else:
+                session_unit = self.active_session_unit(rid)
+                if session_unit is None:
                     result = self._result_adapter(data)
+                else:
+                    bridge = self.session_bridge
+                    assert bridge is not None
+                    result = bridge.adapter.result(session_unit.session_identity, data)
             except Exception as exc:
                 terminal_error = exc
                 logger.exception(
@@ -2179,13 +2217,17 @@ class OmniScheduler:
 
     def stop(self) -> None:
         self._running = False
-        if self.session_bridge is not None and self._scheduler_thread_id is not None:
+        retains_scheduler_thread = (
+            self.session_bridge is not None and self._scheduler_thread_id is not None
+        )
+        if retains_scheduler_thread:
             # note (Junnan Li): Cleanup runs on the scheduler thread after it drains GPU work.
             return
-        if self.session_bridge is not None:
-            self.session_bridge.shutdown()
-        self.discard_pending_request_admissions()
-        self.shutdown_resources()
+        else:
+            if self.session_bridge is not None:
+                self.session_bridge.shutdown()
+            self.discard_pending_request_admissions()
+            self.shutdown_resources()
 
     def discard_pending_request_admissions(self) -> None:
         with self.request_admission_lock:
@@ -2220,7 +2262,7 @@ class OmniScheduler:
                 return
             if (
                 request_id != bridge.cancelling_request_id
-                and request_id in bridge.requests
+                and self.active_session_unit(request_id) is not None
             ):
                 bridge.cancel(request_id)
                 return
@@ -2960,6 +3002,11 @@ class OmniScheduler:
         pending_decode = self._async_pending
         return pending_decode.batch if pending_decode is not None else None
 
+    def synchronize_launched_decode(self) -> None:
+        pending_decode = self._async_pending
+        if pending_decode is not None:
+            pending_decode.device_step.event.synchronize()
+
     def wait_async_device(self, batch: ScheduleBatch, device_step: PendingStep) -> None:
         device_steps = [device_step]
         pending_decode = self._async_pending
@@ -2973,8 +3020,8 @@ class OmniScheduler:
         ):
             # note (Junnan Li): Prior-result collection may trim KV still used by the current step.
             device_steps.append(pending_decode.device_step)
-        for device_step in device_steps:
-            device_step.event.synchronize()
+        for launched_step in device_steps:
+            launched_step.event.synchronize()
 
     def resolve_and_process(
         self, batch, sched_output, pending_step, *, is_device_ready: bool = False
@@ -3058,19 +3105,19 @@ class OmniScheduler:
                 )
                 pending_decode, self._async_pending = self._async_pending, None
                 self.process_owned_async(pending_decode)
+        elif self._async_pending is None:
             return
-        if self._async_pending is None:
-            return
-        pending_decode = self._async_pending
-        self._async_pending = None
-        try:
-            self.resolve_and_process(
-                pending_decode.batch,
-                pending_decode.scheduler_output,
-                pending_decode.device_step,
-            )
-        except Exception as exc:
-            self.handle_batch_failure(pending_decode.batch, exc)
+        else:
+            pending_decode = self._async_pending
+            self._async_pending = None
+            try:
+                self.resolve_and_process(
+                    pending_decode.batch,
+                    pending_decode.scheduler_output,
+                    pending_decode.device_step,
+                )
+            except Exception as exc:
+                self.handle_batch_failure(pending_decode.batch, exc)
 
     def drop_stale_overrun(self, batch):
         """Drop reqs finished OR retracted by the just-completed drain from the
@@ -3304,7 +3351,7 @@ class OmniScheduler:
             if msg.request_id != request_id or (
                 self.session_bridge is not None
                 and msg.type == "new_request"
-                and ar_session.ARSessionBridge.is_cleanup(msg.data)
+                and is_close_request(msg.data)
             ):
                 retained.append(msg)
             else:
