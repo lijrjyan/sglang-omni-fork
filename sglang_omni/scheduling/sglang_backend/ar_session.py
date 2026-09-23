@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bridge pipeline units to native streaming sessions."""
+"""Bridge pipeline units to streaming sessions."""
 
 from __future__ import annotations
 
@@ -43,13 +43,13 @@ def is_close_request(payload: StagePayload) -> bool:
 
 
 class ARSessionAdapter:
-    """Convert unit inputs and outputs without mutating native session state."""
+    """Convert unit inputs and outputs without mutating streaming session state."""
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
-        """Initialize auxiliary model history after native session creation."""
+        """Initialize auxiliary model history after the streaming session is created."""
 
     def close(self, session_identity: SessionIdentity) -> None:
-        """Release auxiliary history after native work and KV are released."""
+        """Release auxiliary history after streaming session work and KV are released."""
 
     def finish_input(
         self, session_identity: SessionIdentity, payload: StagePayload
@@ -155,7 +155,7 @@ class ARSessionBridge:
                     self.adapter.open(session_identity, payload.request)
                     payload.data = {"opened": True}
                 else:
-                    raise ValueError("native session open failed")
+                    raise ValueError("streaming session open failed")
         elif operation_kind == "close":
             if session is not None:
                 self.close_session(session)
@@ -211,7 +211,7 @@ class ARSessionBridge:
                 "history-aware session embedding and multimodal inputs are not supported"
             )
         else:
-            native_session = self.bridge_scheduler.session_controller.get(
+            streaming_session = self.bridge_scheduler.session_controller.get(
                 unit.session_identity.id
             )
             tokenized_input = TokenizedGenerateReqInput(
@@ -223,7 +223,7 @@ class ARSessionBridge:
                 token_type_ids=None,
                 sampling_params=adapter_request.sampling_params,
                 logprob_start_len=adapter_request.logprob_start_len,
-                session_params=SessionParams(id=native_session.session_id),
+                session_params=SessionParams(id=streaming_session.session_id),
                 stream=adapter_request.stream,
                 return_logprob=adapter_request.return_logprob,
                 return_sampling_mask=adapter_request.return_sampling_mask,
@@ -241,14 +241,14 @@ class ARSessionBridge:
                 top_logprobs_num=adapter_request.logprob.top_logprobs_num,
                 token_ids_logprob=adapter_request.logprob.token_ids_logprob,
             )
-            session_request = native_session.create_req(
+            session_request = streaming_session.create_req(
                 tokenized_input,
                 adapter_request.tokenizer,
                 self.bridge_scheduler.model_config.vocab_size,
                 eos_token_ids=adapter_request.eos_token_ids,
             )
             if session_request.to_finish is not None:
-                raise ValueError("native session rejected append")
+                raise ValueError("streaming session rejected append")
             else:
                 unit.session_request = session_request
                 session_request.logprob_start_len = adapter_request.logprob_start_len
@@ -261,11 +261,11 @@ class ARSessionBridge:
     def release_append_unit(self, request_id: str) -> None:
         unit = self.units_by_request_id.pop(request_id, None)
         if unit is not None:
-            native_session = self.bridge_scheduler.session_controller.get(
+            streaming_session = self.bridge_scheduler.session_controller.get(
                 unit.session_identity.id
             )
-            if native_session is not None and unit.session_request is not None:
-                native_session.abort_req()
+            if streaming_session is not None and unit.session_request is not None:
+                streaming_session.abort_req()
             self.sessions[unit.session_identity.id].unit = None
 
     def cancel(self, request_id: str) -> None:
@@ -397,7 +397,7 @@ class ARSessionBridge:
         if unit is not None:
             self.sessions[unit.session_identity.id].unit = None
 
-    def close_native_session(self, session: BridgeSession) -> None:
+    def close_streaming_session(self, session: BridgeSession) -> None:
         if session.unit is not None:
             self.bridge_scheduler.abort(session.unit.request_id)
         session_id = session.session_identity.id
@@ -409,17 +409,17 @@ class ARSessionBridge:
             self.bridge_scheduler.session_controller.get(session_id) is not None
             or session_id in self.bridge_scheduler.tree_cache.slots
         ):
-            raise RuntimeError("native session close is still pending")
+            raise RuntimeError("streaming session close is still pending")
 
     def close_session(self, session: BridgeSession) -> None:
-        self.close_native_session(session)
+        self.close_streaming_session(session)
         self.adapter.close(session.session_identity)
         self.sessions.pop(session.session_identity.id)
 
     def shutdown(self) -> None:
         adapter_failures: dict[str, Exception] = {}
         for session in list(self.sessions.values()):
-            self.close_native_session(session)
+            self.close_streaming_session(session)
             session_id = session.session_identity.id
             try:
                 self.adapter.close(session.session_identity)
