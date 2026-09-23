@@ -35,11 +35,11 @@ REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV = 1
 
 def is_close_request(payload: StagePayload) -> bool:
     """Return whether the payload carries a session close."""
-    operation = find_session_operation(payload.request.metadata)
-    if operation is None:
+    operation_metadata = find_session_operation(payload.request.metadata)
+    if operation_metadata is None:
         return False
     else:
-        return operation.operation == "close"
+        return operation_metadata.operation == "close"
 
 
 class ARSessionAdapter:
