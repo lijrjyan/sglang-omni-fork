@@ -210,51 +210,53 @@ class ARSessionBridge:
             raise ValueError(
                 "history-aware session embedding and multimodal inputs are not supported"
             )
-        native_session = self.bridge_scheduler.session_controller.get(
-            unit.session_identity.id
-        )
-        tokenized_input = TokenizedGenerateReqInput(
-            rid=adapter_request.rid,
-            input_text=None,
-            input_ids=array("q", adapter_request.origin_input_ids),
-            input_embeds=None,
-            mm_inputs=None,
-            token_type_ids=None,
-            sampling_params=adapter_request.sampling_params,
-            logprob_start_len=adapter_request.logprob_start_len,
-            session_params=SessionParams(id=native_session.session_id),
-            stream=adapter_request.stream,
-            return_logprob=adapter_request.return_logprob,
-            return_sampling_mask=adapter_request.return_sampling_mask,
-            lora_id=adapter_request.lora_id,
-            custom_logit_processor=adapter_request.custom_logit_processor,
-            require_reasoning=adapter_request.require_reasoning,
-            return_hidden_states=adapter_request.return_hidden_states,
-            return_routed_experts=adapter_request.return_routed_experts,
-            routed_experts_start_len=adapter_request.routed_experts_start_len,
-            priority=adapter_request.priority,
-            routing_key=adapter_request.routing_key,
-            extra_key=adapter_request.extra_key,
-            cache_salt=adapter_request.cache_salt,
-            http_worker_ipc=adapter_request.http_worker_ipc,
-            top_logprobs_num=adapter_request.logprob.top_logprobs_num,
-            token_ids_logprob=adapter_request.logprob.token_ids_logprob,
-        )
-        session_request = native_session.create_req(
-            tokenized_input,
-            adapter_request.tokenizer,
-            self.bridge_scheduler.model_config.vocab_size,
-            eos_token_ids=adapter_request.eos_token_ids,
-        )
-        if session_request.to_finish is not None:
-            raise ValueError("native session rejected append")
-        unit.session_request = session_request
-        session_request.logprob_start_len = adapter_request.logprob_start_len
-        session_request._omni_prompt_cache_key = getattr(
-            adapter_request, "_omni_prompt_cache_key", None
-        )
-        request_data.req = session_request
-        request_data.stage_payload = payload
+        else:
+            native_session = self.bridge_scheduler.session_controller.get(
+                unit.session_identity.id
+            )
+            tokenized_input = TokenizedGenerateReqInput(
+                rid=adapter_request.rid,
+                input_text=None,
+                input_ids=array("q", adapter_request.origin_input_ids),
+                input_embeds=None,
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=adapter_request.sampling_params,
+                logprob_start_len=adapter_request.logprob_start_len,
+                session_params=SessionParams(id=native_session.session_id),
+                stream=adapter_request.stream,
+                return_logprob=adapter_request.return_logprob,
+                return_sampling_mask=adapter_request.return_sampling_mask,
+                lora_id=adapter_request.lora_id,
+                custom_logit_processor=adapter_request.custom_logit_processor,
+                require_reasoning=adapter_request.require_reasoning,
+                return_hidden_states=adapter_request.return_hidden_states,
+                return_routed_experts=adapter_request.return_routed_experts,
+                routed_experts_start_len=adapter_request.routed_experts_start_len,
+                priority=adapter_request.priority,
+                routing_key=adapter_request.routing_key,
+                extra_key=adapter_request.extra_key,
+                cache_salt=adapter_request.cache_salt,
+                http_worker_ipc=adapter_request.http_worker_ipc,
+                top_logprobs_num=adapter_request.logprob.top_logprobs_num,
+                token_ids_logprob=adapter_request.logprob.token_ids_logprob,
+            )
+            session_request = native_session.create_req(
+                tokenized_input,
+                adapter_request.tokenizer,
+                self.bridge_scheduler.model_config.vocab_size,
+                eos_token_ids=adapter_request.eos_token_ids,
+            )
+            if session_request.to_finish is not None:
+                raise ValueError("native session rejected append")
+            else:
+                unit.session_request = session_request
+                session_request.logprob_start_len = adapter_request.logprob_start_len
+                session_request._omni_prompt_cache_key = getattr(
+                    adapter_request, "_omni_prompt_cache_key", None
+                )
+                request_data.req = session_request
+                request_data.stage_payload = payload
 
     def release_append_unit(self, request_id: str) -> None:
         unit = self.units_by_request_id.pop(request_id, None)
