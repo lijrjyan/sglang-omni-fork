@@ -43,10 +43,7 @@ def is_close_request(payload: StagePayload) -> bool:
 
 
 class ARSessionAdapter:
-    """Convert unit inputs and outputs without mutating native session state.
-
-    Build from the relayed payload; only the entry stage consumes chunk.payload.
-    """
+    """Convert unit inputs and outputs without mutating native session state."""
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
         """Initialize auxiliary model history after native session creation."""
@@ -93,7 +90,13 @@ class SessionUnit:
     session_identity: SessionIdentity
     stages: tuple[str, ...]
     chunk: TimedChunk
-    request: Req | None = None
+    # Note (chenyang):
+    # There are multiple requests in SGLang Omni. Let's make a distinction between them.
+    # payload.request is the user's OmniRequest: inputs, params, and metadata. It is not queued.
+    # The session scheduler creates session_request with Session.create_req and queues that same
+    # SGLang Req. create_req builds it from token ids produced from the OmniRequest, joins tokens
+    # from earlier turns, and binds it to the streaming session.
+    session_request: Req | None = None
     is_enqueued: bool = False
 
 
@@ -112,7 +115,7 @@ class ARSessionBridge:
         self.scheduler = scheduler
         self.adapter = adapter
         self.sessions: dict[str, BridgeSession] = {}
-        self.requests: dict[str, SessionUnit] = {}
+        self.units_by_request_id: dict[str, SessionUnit] = {}
         self.cancelling_request_id: str | None = None
 
     def drain(self) -> None:
@@ -178,7 +181,7 @@ class ARSessionBridge:
                 stages=operation.stages,
                 chunk=chunk,
             )
-            self.requests[payload.request_id] = session.unit
+            self.units_by_request_id[payload.request_id] = session.unit
             return session.unit
         elif session.unit.request_id != payload.request_id:
             raise ValueError("session already has an active request")
@@ -189,7 +192,7 @@ class ARSessionBridge:
         self, payload: StagePayload, request_data: SGLangARRequestData
     ) -> None:
         self.drain()
-        unit = self.requests[payload.request_id]
+        unit = self.units_by_request_id[payload.request_id]
         adapter_request = request_data.req
         assert (
             adapter_request.rid == payload.request_id
@@ -207,7 +210,7 @@ class ARSessionBridge:
         native_session = self.scheduler.session_controller.get(
             unit.session_identity.session_id
         )
-        tokenized_request = TokenizedGenerateReqInput(
+        tokenized_input = TokenizedGenerateReqInput(
             rid=adapter_request.rid,
             input_text=None,
             input_ids=array("q", adapter_request.origin_input_ids),
@@ -234,35 +237,35 @@ class ARSessionBridge:
             top_logprobs_num=adapter_request.logprob.top_logprobs_num,
             token_ids_logprob=adapter_request.logprob.token_ids_logprob,
         )
-        request = native_session.create_req(
-            tokenized_request,
+        session_request = native_session.create_req(
+            tokenized_input,
             adapter_request.tokenizer,
             self.scheduler.model_config.vocab_size,
             eos_token_ids=adapter_request.eos_token_ids,
         )
-        if request.to_finish is not None:
+        if session_request.to_finish is not None:
             raise ValueError("native session rejected append")
-        unit.request = request
-        request.logprob_start_len = adapter_request.logprob_start_len
-        request._omni_prompt_cache_key = getattr(
+        unit.session_request = session_request
+        session_request.logprob_start_len = adapter_request.logprob_start_len
+        session_request._omni_prompt_cache_key = getattr(
             adapter_request, "_omni_prompt_cache_key", None
         )
-        request_data.req = request
+        request_data.req = session_request
         request_data.stage_payload = payload
 
     def rollback(self, request_id: str) -> None:
-        unit = self.requests.pop(request_id, None)
+        unit = self.units_by_request_id.pop(request_id, None)
         if unit is not None:
             native_session = self.scheduler.session_controller.get(
                 unit.session_identity.session_id
             )
-            if native_session is not None and unit.request is not None:
+            if native_session is not None and unit.session_request is not None:
                 native_session.abort_req()
             self.sessions[unit.session_identity.session_id].unit = None
 
     def cancel(self, request_id: str) -> None:
-        unit = self.requests[request_id]
-        request = unit.request
+        unit = self.units_by_request_id[request_id]
+        session_request = unit.session_request
         previous_cancelling_request_id = self.cancelling_request_id
         self.cancelling_request_id = request_id
         try:
@@ -272,38 +275,38 @@ class ARSessionBridge:
                 self.rollback(request_id)
             else:
                 assert (
-                    request is not None
+                    session_request is not None
                 ), f"enqueued session request {request_id} has no Req"
                 is_queued = any(
-                    queued_request is request
+                    queued_request is session_request
                     for queued_request in self.scheduler.waiting_queue
                 )
                 if is_queued:
                     # note (Junnan Li): Failed prefill admission may have restored the prior slot.
-                    request.detach_kv()
-                    request.session = None
+                    session_request.detach_kv()
+                    session_request.session = None
                     self.scheduler.abort(request_id)
                     self.drain()
                 else:
                     self.scheduler.abort(request_id)
                     self.drain()
-                    request.finished_reason = FINISH_ABORT()
-                    self.scheduler.release_request_kv_cache(request)
+                    session_request.finished_reason = FINISH_ABORT()
+                    self.scheduler.release_request_kv_cache(session_request)
                     # note (Junnan Li): Batch selection must filter rows and tensors together.
-                    if self.scheduler.chunked_req is request:
+                    if self.scheduler.chunked_req is session_request:
                         self.scheduler.chunked_req = None
-                    if request._omni_data is not None:
+                    if session_request._omni_data is not None:
                         self.scheduler.run_abort_callback(request_id)
-                        request._omni_data = None
+                        session_request._omni_data = None
                 self.rollback(request_id)
         finally:
             self.cancelling_request_id = previous_cancelling_request_id
 
     def capacity_error(self, request_id: str) -> str | None:
-        unit = self.requests[request_id]
-        request = unit.request
+        unit = self.units_by_request_id[request_id]
+        session_request = unit.session_request
         assert (
-            request is not None
+            session_request is not None
         ), f"session capacity check {request_id} requires a materialized Req"
         cache = self.scheduler.tree_cache
         slot = cache.slots.get(unit.session_identity.session_id)
@@ -311,10 +314,10 @@ class ARSessionBridge:
         free_request_slots = self.scheduler.req_to_token_pool.free_slots
         unallocated_request_count = sum(
             other_unit is not unit
-            and other_unit.request is not None
-            and not other_unit.request.kv.holds_kv
+            and other_unit.session_request is not None
+            and not other_unit.session_request.kv.holds_kv
             and other_unit.session_identity.session_id not in cache.slots
-            for other_unit in self.requests.values()
+            for other_unit in self.units_by_request_id.values()
         )
         if (
             not retained_kv_tokens
@@ -327,19 +330,19 @@ class ARSessionBridge:
                 "(one slot kept for a session that already holds KV)"
             )
         else:
-            required_kv_tokens = len(request.origin_input_ids) + int(
-                request.sampling_params.max_new_tokens or 0
+            required_kv_tokens = len(session_request.origin_input_ids) + int(
+                session_request.sampling_params.max_new_tokens or 0
             )
             reserved_kv_tokens = 0
-            for other_unit in self.requests.values():
-                if other_unit is unit or other_unit.request is None:
+            for other_unit in self.units_by_request_id.values():
+                if other_unit is unit or other_unit.session_request is None:
                     continue
-                other_request = other_unit.request
-                allocated_kv_tokens = other_request.kv.kv_allocated_len
+                other_session_request = other_unit.session_request
+                allocated_kv_tokens = other_session_request.kv.kv_allocated_len
                 reserved_kv_tokens += max(
                     0,
-                    len(other_request.origin_input_ids)
-                    + int(other_request.sampling_params.max_new_tokens or 0)
+                    len(other_session_request.origin_input_ids)
+                    + int(other_session_request.sampling_params.max_new_tokens or 0)
                     - allocated_kv_tokens,
                 )
             available_kv_tokens = (
@@ -363,7 +366,7 @@ class ARSessionBridge:
         *,
         should_flush: bool = False,
     ) -> Iterable[OutgoingMessage]:
-        unit = self.requests[request_id]
+        unit = self.units_by_request_id[request_id]
         if get_active_stage() != unit.stages[-1]:
             return
         else:
@@ -385,7 +388,7 @@ class ARSessionBridge:
                 )
 
     def complete(self, request_id: str) -> None:
-        unit = self.requests.pop(request_id, None)
+        unit = self.units_by_request_id.pop(request_id, None)
         if unit is not None:
             self.sessions[unit.session_identity.session_id].unit = None
 

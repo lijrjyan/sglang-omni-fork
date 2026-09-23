@@ -973,7 +973,7 @@ class OmniScheduler:
         if bridge is None:
             return None
         else:
-            return bridge.requests.get(request_id)
+            return bridge.units_by_request_id.get(request_id)
 
     def route_session_input(self, payload: StagePayload) -> bool:
         """Return whether the payload should be built and enqueued."""
