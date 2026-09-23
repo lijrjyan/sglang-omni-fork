@@ -142,6 +142,9 @@ class SessionRuntime:
                         self.limits.cleanup_timeout_s,
                     )
                 except Exception as exc:
+                    logger.exception(
+                        f"Realtime session {self.session_id} admission failed"
+                    )
                     try:
                         await asyncio.wait_for(
                             adapter.close(), self.limits.cleanup_timeout_s
