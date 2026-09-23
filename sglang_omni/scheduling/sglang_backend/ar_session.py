@@ -1,0 +1,400 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Bridge pipeline units to native streaming sessions."""
+from __future__ import annotations
+
+from array import array
+from dataclasses import dataclass
+from typing import Iterable
+
+from sglang.srt.managers.io_struct import (
+    CloseSessionReqInput,
+    OpenSessionReqInput,
+    SessionParams,
+    TokenizedGenerateReqInput,
+)
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+
+from sglang_omni.admission import QueueFullError
+from sglang_omni.profiler.event_recorder import get_active_stage
+from sglang_omni.proto.request import OmniRequest, StagePayload
+from sglang_omni.proto.session import (
+    SessionIdentity,
+    SessionOperation,
+    TimedChunk,
+    find_session_operation,
+)
+from sglang_omni.scheduling import omni_scheduler
+from sglang_omni.scheduling.message import OutgoingMessage
+from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
+from sglang_omni.scheduling.types import RequestOutput
+
+
+class ARSessionAdapter:
+    """Convert unit inputs and outputs without mutating native session state.
+
+    Build from the relayed payload; only the entry stage consumes chunk.payload.
+    """
+
+    def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+        """Initialize auxiliary model history after native session creation."""
+
+    def close(self, session_identity: SessionIdentity) -> None:
+        """Release auxiliary history after native work and KV are released."""
+
+    def finish_input(
+        self, session_identity: SessionIdentity, payload: StagePayload
+    ) -> StagePayload | None:
+        """Return a relayed EOS payload, or None to use normal generation."""
+        return None
+
+    def build(
+        self,
+        session_identity: SessionIdentity,
+        chunk: TimedChunk,
+        payload: StagePayload,
+    ) -> SGLangARRequestData:
+        raise NotImplementedError
+
+    def result(
+        self, session_identity: SessionIdentity, request_data: SGLangARRequestData
+    ) -> StagePayload:
+        raise NotImplementedError
+
+    def stream(
+        self,
+        session_identity: SessionIdentity,
+        request_data: SGLangARRequestData,
+        output: RequestOutput,
+    ) -> Iterable[TimedChunk]:
+        return ()
+
+    def flush(
+        self, session_identity: SessionIdentity, request_data: SGLangARRequestData
+    ) -> Iterable[TimedChunk]:
+        return ()
+
+
+@dataclass(kw_only=True)
+class SessionUnit:
+    request_id: str
+    session_identity: SessionIdentity
+    stages: tuple[str, ...]
+    chunk: TimedChunk
+    request: Req | None = None
+    is_enqueued: bool = False
+
+
+@dataclass(kw_only=True)
+class BridgeSession:
+    session_identity: SessionIdentity
+    unit: SessionUnit | None = None
+
+
+class ARSessionBridge:
+    """All methods run on the scheduler thread, including lifecycle commands."""
+
+    def __init__(
+        self, scheduler: omni_scheduler.OmniScheduler, adapter: ARSessionAdapter
+    ) -> None:
+        self.scheduler = scheduler
+        self.adapter = adapter
+        self.sessions: dict[str, BridgeSession] = {}
+        self.requests: dict[str, SessionUnit] = {}
+        self.cancelling_request_id: str | None = None
+
+    def drain(self) -> None:
+        pending_decode = self.scheduler._async_pending
+        if pending_decode is not None:
+            pending_decode.device_step.event.synchronize()
+        self.scheduler.resolve_pending_async()
+
+    @staticmethod
+    def native_id(session_identity: SessionIdentity) -> str:
+        return session_identity.session_id
+
+    @staticmethod
+    def is_cleanup(payload: StagePayload) -> bool:
+        operation = find_session_operation(payload.request.metadata)
+        return operation is not None and operation.operation == "close"
+
+    def operation(
+        self, payload: StagePayload, operation: SessionOperation
+    ) -> StagePayload:
+        session_identity = operation.session_identity
+        session_id = self.native_id(session_identity)
+        operation_kind = operation.operation
+        controller = self.scheduler.session_controller
+        session = self.sessions.get(session_id)
+        if (
+            session is not None
+            and session_identity.incarnation != session.session_identity.incarnation
+        ):
+            raise ValueError("stale session incarnation")
+        if operation_kind == "open":
+            if session is not None:
+                raise ValueError("session already opened")
+            if len(self.sessions) >= self.scheduler.max_running_requests:
+                raise QueueFullError()
+            result = controller.open(
+                OpenSessionReqInput(
+                    session_id=session_id,
+                    capacity_of_str_len=0,
+                    streaming=True,
+                    timeout=None,
+                )
+            )
+            if not result.success:
+                raise ValueError("native session open failed")
+            self.sessions[session_id] = BridgeSession(session_identity=session_identity)
+            self.adapter.open(session_identity, payload.request)
+            payload.data = {"opened": True}
+        elif operation_kind == "close":
+            if session is not None:
+                self.close_session(session)
+            payload.data = {"closed": True}
+        else:
+            raise ValueError("unknown session operation")
+        return payload
+
+    def accept(self, payload: StagePayload, operation: SessionOperation) -> SessionUnit:
+        chunk = operation.chunk
+        assert (
+            chunk is not None
+        ), f"session append {payload.request_id} requires a chunk"
+        session_identity = operation.session_identity
+        session = self.sessions.get(self.native_id(session_identity))
+        if session is None or session_identity != session.session_identity:
+            raise ValueError("unknown or stale session incarnation")
+        if session.unit is None:
+            session.unit = SessionUnit(
+                request_id=payload.request_id,
+                session_identity=session_identity,
+                stages=operation.stages,
+                chunk=chunk,
+            )
+            self.requests[payload.request_id] = session.unit
+            return session.unit
+        elif session.unit.request_id != payload.request_id:
+            raise ValueError("session already has an active request")
+        else:
+            return session.unit
+
+    def materialize(
+        self, payload: StagePayload, request_data: SGLangARRequestData
+    ) -> None:
+        self.drain()
+        unit = self.requests[payload.request_id]
+        adapter_request = request_data.req
+        assert (
+            adapter_request.rid == payload.request_id
+        ), f"session adapter changed request ID: expected {payload.request_id}, got {adapter_request.rid}"
+        if (
+            request_data.prefill_input_embeds is not None
+            or request_data.decode_input_embeds
+            or request_data.input_embeds_are_projected
+            or adapter_request.input_embeds is not None
+            or adapter_request.multimodal_inputs is not None
+        ):
+            raise ValueError(
+                "history-aware session embedding and multimodal inputs are not supported"
+            )
+        native_session = self.scheduler.session_controller.get(
+            self.native_id(unit.session_identity)
+        )
+        tokenized_request = TokenizedGenerateReqInput(
+            rid=adapter_request.rid,
+            input_text=None,
+            input_ids=array("q", adapter_request.origin_input_ids),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=adapter_request.sampling_params,
+            logprob_start_len=adapter_request.logprob_start_len,
+            session_params=SessionParams(id=native_session.session_id),
+            stream=adapter_request.stream,
+            return_logprob=adapter_request.return_logprob,
+            return_sampling_mask=adapter_request.return_sampling_mask,
+            lora_id=adapter_request.lora_id,
+            custom_logit_processor=adapter_request.custom_logit_processor,
+            require_reasoning=adapter_request.require_reasoning,
+            return_hidden_states=adapter_request.return_hidden_states,
+            return_routed_experts=adapter_request.return_routed_experts,
+            routed_experts_start_len=adapter_request.routed_experts_start_len,
+            priority=adapter_request.priority,
+            routing_key=adapter_request.routing_key,
+            extra_key=adapter_request.extra_key,
+            cache_salt=adapter_request.cache_salt,
+            http_worker_ipc=adapter_request.http_worker_ipc,
+            top_logprobs_num=adapter_request.logprob.top_logprobs_num,
+            token_ids_logprob=adapter_request.logprob.token_ids_logprob,
+        )
+        request = native_session.create_req(
+            tokenized_request,
+            adapter_request.tokenizer,
+            self.scheduler.model_config.vocab_size,
+            eos_token_ids=adapter_request.eos_token_ids,
+        )
+        if request.to_finish is not None:
+            raise ValueError("native session rejected append")
+        unit.request = request
+        request.logprob_start_len = adapter_request.logprob_start_len
+        request._omni_prompt_cache_key = getattr(
+            adapter_request, "_omni_prompt_cache_key", None
+        )
+        request_data.req = request
+        request_data.stage_payload = payload
+
+    def rollback(self, request_id: str) -> None:
+        unit = self.requests.pop(request_id, None)
+        if unit is not None:
+            native_session = self.scheduler.session_controller.get(
+                self.native_id(unit.session_identity)
+            )
+            if native_session is not None and unit.request is not None:
+                native_session.abort_req()
+            self.sessions[self.native_id(unit.session_identity)].unit = None
+
+    def cancel(self, request_id: str) -> None:
+        unit = self.requests[request_id]
+        request = unit.request
+        previous_cancelling_request_id = self.cancelling_request_id
+        self.cancelling_request_id = request_id
+        try:
+            if not unit.is_enqueued:
+                # note (Junnan Li): Before enqueue, rollback must preserve the prior unit's KV.
+                self.scheduler.abort(request_id)
+                self.rollback(request_id)
+            else:
+                assert (
+                    request is not None
+                ), f"enqueued session request {request_id} has no Req"
+                is_queued = any(
+                    queued_request is request
+                    for queued_request in self.scheduler.waiting_queue
+                )
+                if is_queued:
+                    # note (Junnan Li): Failed prefill admission may have restored the prior slot.
+                    request.detach_kv()
+                    request.session = None
+                self.scheduler.abort(request_id)
+                self.drain()
+                if not is_queued:
+                    request.finished_reason = FINISH_ABORT()
+                    self.scheduler.release_request_kv_cache(request)
+                    # note (Junnan Li): Batch selection must filter rows and tensors together.
+                    if self.scheduler.chunked_req is request:
+                        self.scheduler.chunked_req = None
+                    if request._omni_data is not None:
+                        self.scheduler.run_abort_callback(request_id)
+                        request._omni_data = None
+
+                self.rollback(request_id)
+        finally:
+            self.cancelling_request_id = previous_cancelling_request_id
+
+    def capacity_error(self, request_id: str) -> str | None:
+        unit = self.requests[request_id]
+        request = unit.request
+        assert (
+            request is not None
+        ), f"session capacity check {request_id} requires a materialized Req"
+        cache = self.scheduler.tree_cache
+        slot = cache.slots.get(self.native_id(unit.session_identity))
+        retained_kv_tokens = slot.kv.kv_allocated_len if slot is not None else 0
+        free_request_slots = self.scheduler.req_to_token_pool.free_slots
+        unallocated_request_count = sum(
+            other_unit is not unit
+            and other_unit.request is not None
+            and not other_unit.request.kv.holds_kv
+            and self.native_id(other_unit.session_identity) not in cache.slots
+            for other_unit in self.requests.values()
+        )
+        # note (Junnan Li): Reserve a prefill slot so retained sessions can append.
+        if (
+            not retained_kv_tokens
+            and len(free_request_slots) <= unallocated_request_count + 1
+        ):
+            error = (
+                "session request slot capacity exhausted (one admission slot reserved)"
+            )
+        else:
+            required_kv_tokens = len(request.origin_input_ids) + int(
+                request.sampling_params.max_new_tokens or 0
+            )
+            reserved_kv_tokens = 0
+            for other_unit in self.requests.values():
+                if other_unit is unit or other_unit.request is None:
+                    continue
+                other_request = other_unit.request
+                allocated_kv_tokens = other_request.kv.kv_allocated_len
+                reserved_kv_tokens += max(
+                    0,
+                    len(other_request.origin_input_ids)
+                    + int(other_request.sampling_params.max_new_tokens or 0)
+                    - allocated_kv_tokens,
+                )
+            available_kv_tokens = (
+                self.scheduler.token_to_kv_pool_allocator.available_size()
+                + cache.evictable_size()
+            )
+            if (
+                required_kv_tokens - retained_kv_tokens + reserved_kv_tokens
+                > available_kv_tokens
+            ):
+                error = "session KV capacity exhausted"
+            else:
+                error = None
+        return error
+
+    def messages(
+        self,
+        request_id: str,
+        request_data: SGLangARRequestData,
+        output: RequestOutput | None = None,
+        *,
+        should_flush: bool = False,
+    ) -> Iterable[OutgoingMessage]:
+        unit = self.requests[request_id]
+        if get_active_stage() != unit.stages[-1]:
+            return
+        else:
+            session_identity = self.requests[request_id].session_identity
+            if should_flush:
+                chunks = self.adapter.flush(session_identity, request_data)
+            else:
+                assert (
+                    output is not None
+                ), f"session stream {request_id} requires request output"
+                chunks = self.adapter.stream(session_identity, request_data, output)
+            for chunk in chunks:
+                yield OutgoingMessage(
+                    request_id=request_id,
+                    type="stream",
+                    data=chunk.to_dict(),
+                    metadata={"modality": chunk.modality},
+                )
+
+    def complete(self, request_id: str) -> None:
+        unit = self.requests.pop(request_id, None)
+        if unit is not None:
+            self.sessions[self.native_id(unit.session_identity)].unit = None
+
+    def close_session(self, session: BridgeSession) -> None:
+        if session.unit is not None:
+            self.scheduler.abort(session.unit.request_id)
+        session_id = self.native_id(session.session_identity)
+        self.drain()
+        self.scheduler.session_controller.close(
+            CloseSessionReqInput(session_id=session_id)
+        )
+        if (
+            self.scheduler.session_controller.get(session_id) is not None
+            or session_id in self.scheduler.tree_cache.slots
+        ):
+            raise RuntimeError("native session close is still pending")
+        self.adapter.close(session.session_identity)
+        self.sessions.pop(session_id)
+
+    def shutdown(self) -> None:
+        for session in list(self.sessions.values()):
+            self.close_session(session)

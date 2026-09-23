@@ -29,7 +29,7 @@ from sglang_omni.admission import QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling import omni_scheduler as omni_scheduler_module
 from sglang_omni.scheduling.message import IncomingMessage
-from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+from sglang_omni.scheduling.omni_scheduler import OmniScheduler, PendingDecode
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
@@ -1018,7 +1018,9 @@ def test_immediate_finish_keeps_async_snapshot_aligned_until_resolve() -> None:
     scheduler.running_batch = live_batch
     scheduler.cur_batch = live_batch
     scheduler.last_batch = None
-    scheduler.async_pending = (snapshot, object(), object())
+    scheduler._async_pending = PendingDecode(
+        batch=snapshot, scheduler_output=object(), device_step=object()
+    )
     captured = {}
 
     def resolve(batch, _sched_output, _pending_step, *, skip_rids):

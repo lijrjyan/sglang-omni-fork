@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_memory, get_schedule
+from sglang.srt.runtime_context import get_memory, get_schedule, get_serving
+from sglang.srt.session.streaming_session import StreamingSession
 
 from sglang_omni.scheduling.sglang_backend.evict_heap_radix_cache import (
     EvictHeapRadixCache,
@@ -15,11 +16,9 @@ def create_tree_cache(
     token_to_kv_pool_allocator,
     page_size: int,
 ):
-    """Create a tree cache from the published config.
+    """Select a base cache and wrap it when streaming sessions require it.
 
-    When radix cache is disabled we always return ChunkCache so the scheduler
-    keeps plain KV-cache semantics without any prefix matching. Non-lru
-    eviction policies fall back to the upstream RadixCache.
+    Disabling radix selects ChunkCache; streaming may wrap that base cache.
     """
     params = CacheInitParams(
         disable=get_memory().disable_radix_cache,
@@ -34,15 +33,18 @@ def create_tree_cache(
     if get_memory().disable_radix_cache:
         from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
-        return ChunkCache(params)
+        cache = ChunkCache(params)
+    elif params.eviction_policy.lower() == "lru":
+        cache = EvictHeapRadixCache(params)
     else:
-        pass
+        from sglang.srt.mem_cache.radix_cache import RadixCache
 
-    if params.eviction_policy.lower() == "lru":
-        return EvictHeapRadixCache(params)
+        cache = RadixCache(params)
+
+    if (
+        get_serving().enable_streaming_session
+        and not cache.supports_streaming_session()
+    ):
+        return StreamingSession(cache)
     else:
-        pass
-
-    from sglang.srt.mem_cache.radix_cache import RadixCache
-
-    return RadixCache(params)
+        return cache
