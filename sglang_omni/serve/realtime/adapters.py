@@ -19,7 +19,6 @@ from sglang_omni.serve.realtime.output import OutputEvent, TurnFailure
 from sglang_omni.serve.realtime.schema import SessionConfiguration
 from sglang_omni.serve.realtime.task_cleanup import cancel_local_tasks
 from sglang_omni.serve.realtime.types import (
-    DEFAULT_AUDIO_RATE,
     InteractionAdapter,
     OutputSink,
     RuntimeLimits,
@@ -47,7 +46,7 @@ class CoordinatorAdapter(InteractionAdapter):
         stages: list[str],
         request_builder: RequestBuilder,
         output_converter: OutputConverter,
-        input_rate: int = DEFAULT_AUDIO_RATE,
+        input_rate: int | None = None,
         atomic_consumption: bool = False,
         limits: SessionLimits | None = None,
     ) -> None:
@@ -76,6 +75,13 @@ class CoordinatorAdapter(InteractionAdapter):
     async def open(
         self, session_id: str, config: SessionConfiguration, emit: OutputSink
     ) -> None:
+        input_rate = config["audio"]["input"]["format"]["rate"]
+        if self.input_rate is not None and self.input_rate != input_rate:
+            raise ValueError(
+                f"adapter input_rate {self.input_rate} differs from negotiated rate {input_rate}"
+            )
+        else:
+            self.input_rate = input_rate
         self.output_sink = emit
         self.session_identity = await self.client.open_session(
             self.request_builder(config),
@@ -124,7 +130,7 @@ class CoordinatorAdapter(InteractionAdapter):
                 )
 
     async def process(self, unit: Unit) -> int:
-        assert self.session_identity is not None
+        assert self.session_identity is not None and self.input_rate is not None
         if self.reader_error is not None:
             raise self.reader_error
         self.active_unit = unit
