@@ -26,6 +26,7 @@ class ResponseState:
     terminal: bool
     visible: bool
     terminal_sent: bool
+    close_terminals_queued: bool
     text_done_sent: bool
     audio_done_sent: bool
     audio_visible: bool
@@ -73,11 +74,14 @@ class OutputBuffer:
         if isinstance(event, ResponseStarted):
             if response_id in self.responses:
                 raise RuntimeError("duplicate response creation")
+            if len(self.responses) >= self.limits.max_output_events:
+                raise RuntimeError("unfinished response budget exhausted")
             self.responses[event.response_id] = ResponseState(
                 output_modalities=modalities,
                 terminal=False,
                 visible=False,
                 terminal_sent=False,
+                close_terminals_queued=False,
                 text_done_sent=False,
                 audio_done_sent=False,
                 audio_visible=False,
@@ -98,13 +102,14 @@ class OutputBuffer:
                 raise RuntimeError("only one message item per response is supported")
             state.item_id = event.item_id
             if isinstance(event, (TextDelta, TextFinished)):
-                state.text = (
+                text = (
                     state.text + event.text
                     if isinstance(event, TextDelta)
                     else event.text
                 )
-                if len(state.text) > self.limits.max_history_chars:
+                if len(text) > self.limits.max_history_chars:
                     raise ContextLimitError("response text context limit")
+                state.text = text
             if isinstance(event, AudioDelta):
                 if len(event.pcm) % 2:
                     raise RuntimeError("producer emitted invalid PCM16")
@@ -122,13 +127,15 @@ class OutputBuffer:
         self.output_seq += 1
 
     def finish_responses(self, status: ResponseStatus, reason: str) -> None:
+        """Reserve at most three closing events per bounded response slot."""
         for response_id, state in list(self.responses.items()):
-            if state.terminal_sent:
+            if state.terminal_sent or state.close_terminals_queued:
                 continue
             elif not state.visible:
                 self.responses.pop(response_id)
                 continue
             state.terminal = True
+            state.close_terminals_queued = True
             item_id = state.item_id or "item_" + response_id
             events: list[OutputEvent] = []
             if not state.text_done_sent and state.output_modalities:
