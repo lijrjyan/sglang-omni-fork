@@ -29,9 +29,8 @@ from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import RequestOutput
 
-# Streaming sessions track tokens, so the string-length budget stays unused.
-STREAMING_SESSION_STRING_CAPACITY = 0
-RESERVED_ADMISSION_SLOTS = 1
+SESSION_STRING_LENGTH_LIMIT_CHARACTERS = 0
+REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV = 1
 
 
 def is_close_request(payload: StagePayload) -> bool:
@@ -142,7 +141,7 @@ class ARSessionBridge:
                 result = controller.open(
                     OpenSessionReqInput(
                         session_id=session_id,
-                        capacity_of_str_len=STREAMING_SESSION_STRING_CAPACITY,
+                        capacity_of_str_len=SESSION_STRING_LENGTH_LIMIT_CHARACTERS,
                         streaming=True,
                         timeout=None,
                     )
@@ -320,10 +319,12 @@ class ARSessionBridge:
         if (
             not retained_kv_tokens
             and len(free_request_slots)
-            <= unallocated_request_count + RESERVED_ADMISSION_SLOTS
+            <= unallocated_request_count
+            + REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV
         ):
             capacity_message = (
-                "session request slot capacity exhausted (one admission slot reserved)"
+                "session request-to-token slots exhausted "
+                "(one slot kept for a session that already holds KV)"
             )
         else:
             required_kv_tokens = len(request.origin_input_ids) + int(
