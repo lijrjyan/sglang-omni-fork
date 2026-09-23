@@ -64,7 +64,7 @@ class CoordinatorSessions:
 
     def __init__(self) -> None:
         self.is_sessions_stopping = False
-        self.next_incarnation = 1
+        self.next_open_index = 1
         self.session_unavailable_stages: set[str] = set()
         self.sessions: dict[str, Session] = {}
         self.session_stream_handlers: dict[str, SessionStreamHandler] = {}
@@ -159,13 +159,13 @@ class CoordinatorSessions:
         else:
             pass
         session = Session(
-            session_identity=SessionIdentity(session_id, self.next_incarnation),
+            session_identity=SessionIdentity(session_id, self.next_open_index),
             request=request,
             stages=owners,
             bindings=bindings,
             limits=limits or SessionLimits(),
         )
-        self.next_incarnation += 1
+        self.next_open_index += 1
         self.sessions[session_id] = session
         try:
             async with session.lock:
@@ -202,7 +202,7 @@ class CoordinatorSessions:
         else:
             pass
         if chunk.seq != session.next_input:
-            raise ValueError("input seq must be contiguous within an incarnation")
+            raise ValueError("input seq must be contiguous within an open index")
         else:
             pass
         if chunk.modality in session.ended_modalities:

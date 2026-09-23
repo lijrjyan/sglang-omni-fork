@@ -335,7 +335,7 @@ async def test_close_fences_queued_outputs(linear_pair):
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_stale_incarnation_cannot_address_the_reopened_session(
+async def test_stale_open_index_cannot_address_the_reopened_session(
     linear_pair,
 ) -> None:
     coordinator, _, _ = linear_pair
@@ -346,7 +346,7 @@ async def test_stale_incarnation_cannot_address_the_reopened_session(
     reopened = await coordinator.open_session(
         OmniRequest(None), stages=["source", "sink"], session_id="again"
     )
-    assert reopened.incarnation != session_identity.incarnation
+    assert reopened.open_index != session_identity.open_index
     with pytest.raises(ValueError, match="stale"):
         await coordinator.append_session(session_identity, chunk(0))
     with pytest.raises(ValueError, match="stale"):

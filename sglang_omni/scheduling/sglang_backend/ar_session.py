@@ -132,9 +132,9 @@ class ARSessionBridge:
         session = self.sessions.get(session_id)
         if (
             session is not None
-            and session_identity.incarnation != session.session_identity.incarnation
+            and session_identity.open_index != session.session_identity.open_index
         ):
-            raise ValueError("stale session incarnation")
+            raise ValueError("stale session open index")
         if operation_kind == "open":
             if session is not None:
                 raise ValueError("session already opened")
@@ -173,7 +173,7 @@ class ARSessionBridge:
         session_identity = operation.session_identity
         session = self.sessions.get(session_identity.session_id)
         if session is None or session_identity != session.session_identity:
-            raise ValueError("unknown or stale session incarnation")
+            raise ValueError("unknown or stale session open index")
         if session.unit is None:
             session.unit = SessionUnit(
                 request_id=payload.request_id,
