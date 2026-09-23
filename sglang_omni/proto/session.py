@@ -30,7 +30,7 @@ MSGPACK_BIN32_HEADER_GROWTH = 3
 
 
 class SessionIdentityDict(TypedDict):
-    session_id: str
+    id: str
     open_index: int
 
 
@@ -66,13 +66,13 @@ class SessionOperationDict(TypedDict):
 
 @dataclass(frozen=True)
 class SessionIdentity:
-    """One open of a session_id. open_index is the number issued for that open."""
+    """One open of an id. open_index is the number issued for that open."""
 
-    session_id: str
+    id: str
     open_index: int = 1
 
     def to_dict(self) -> SessionIdentityDict:
-        return {"session_id": self.session_id, "open_index": self.open_index}
+        return {"id": self.id, "open_index": self.open_index}
 
 
 @dataclass(frozen=True)

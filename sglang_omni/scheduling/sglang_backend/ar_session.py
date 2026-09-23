@@ -15,7 +15,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 
-from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.admission import QueueFullError
 from sglang_omni.profiler.event_recorder import get_active_stage
 from sglang_omni.proto.request import OmniRequest, StagePayload
@@ -26,6 +25,7 @@ from sglang_omni.proto.session import (
     find_session_operation,
 )
 from sglang_omni.scheduling.message import OutgoingMessage
+from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import RequestOutput
 
@@ -126,10 +126,9 @@ class ARSessionBridge:
         self, payload: StagePayload, operation: SessionOperation
     ) -> StagePayload:
         session_identity = operation.session_identity
-        session_id = session_identity.session_id
         operation_kind = operation.operation
         controller = self.bridge_scheduler.session_controller
-        session = self.sessions.get(session_id)
+        session = self.sessions.get(session_identity.id)
         if (
             session is not None
             and session_identity.open_index != session.session_identity.open_index
@@ -143,14 +142,14 @@ class ARSessionBridge:
             else:
                 result = controller.open(
                     OpenSessionReqInput(
-                        session_id=session_id,
+                        session_id=session_identity.id,
                         capacity_of_str_len=SESSION_STRING_LENGTH_LIMIT_CHARACTERS,
                         streaming=True,
                         timeout=None,
                     )
                 )
                 if result.success:
-                    self.sessions[session_id] = BridgeSession(
+                    self.sessions[session_identity.id] = BridgeSession(
                         session_identity=session_identity
                     )
                     self.adapter.open(session_identity, payload.request)
@@ -171,7 +170,7 @@ class ARSessionBridge:
             chunk is not None
         ), f"session append {payload.request_id} requires a chunk"
         session_identity = operation.session_identity
-        session = self.sessions.get(session_identity.session_id)
+        session = self.sessions.get(session_identity.id)
         if session is None or session_identity != session.session_identity:
             raise ValueError("unknown or stale session open index")
         if session.unit is None:
@@ -208,7 +207,7 @@ class ARSessionBridge:
                 "history-aware session embedding and multimodal inputs are not supported"
             )
         native_session = self.bridge_scheduler.session_controller.get(
-            unit.session_identity.session_id
+            unit.session_identity.id
         )
         tokenized_input = TokenizedGenerateReqInput(
             rid=adapter_request.rid,
@@ -257,11 +256,11 @@ class ARSessionBridge:
         unit = self.units_by_request_id.pop(request_id, None)
         if unit is not None:
             native_session = self.bridge_scheduler.session_controller.get(
-                unit.session_identity.session_id
+                unit.session_identity.id
             )
             if native_session is not None and unit.session_request is not None:
                 native_session.abort_req()
-            self.sessions[unit.session_identity.session_id].unit = None
+            self.sessions[unit.session_identity.id].unit = None
 
     def cancel(self, request_id: str) -> None:
         unit = self.units_by_request_id[request_id]
@@ -309,14 +308,14 @@ class ARSessionBridge:
             session_request is not None
         ), f"session capacity check {request_id} requires a materialized Req"
         cache = self.bridge_scheduler.tree_cache
-        slot = cache.slots.get(unit.session_identity.session_id)
+        slot = cache.slots.get(unit.session_identity.id)
         retained_kv_tokens = slot.kv.kv_allocated_len if slot is not None else 0
         free_request_slots = self.bridge_scheduler.req_to_token_pool.free_slots
         unallocated_request_count = sum(
             other_unit is not unit
             and other_unit.session_request is not None
             and not other_unit.session_request.kv.holds_kv
-            and other_unit.session_identity.session_id not in cache.slots
+            and other_unit.session_identity.id not in cache.slots
             for other_unit in self.units_by_request_id.values()
         )
         if (
@@ -390,12 +389,12 @@ class ARSessionBridge:
     def complete(self, request_id: str) -> None:
         unit = self.units_by_request_id.pop(request_id, None)
         if unit is not None:
-            self.sessions[unit.session_identity.session_id].unit = None
+            self.sessions[unit.session_identity.id].unit = None
 
     def close_native_session(self, session: BridgeSession) -> None:
         if session.unit is not None:
             self.bridge_scheduler.abort(session.unit.request_id)
-        session_id = session.session_identity.session_id
+        session_id = session.session_identity.id
         self.drain()
         self.bridge_scheduler.session_controller.close(
             CloseSessionReqInput(session_id=session_id)
@@ -409,13 +408,13 @@ class ARSessionBridge:
     def close_session(self, session: BridgeSession) -> None:
         self.close_native_session(session)
         self.adapter.close(session.session_identity)
-        self.sessions.pop(session.session_identity.session_id)
+        self.sessions.pop(session.session_identity.id)
 
     def shutdown(self) -> None:
         adapter_failures: dict[str, Exception] = {}
         for session in list(self.sessions.values()):
             self.close_native_session(session)
-            session_id = session.session_identity.session_id
+            session_id = session.session_identity.id
             try:
                 self.adapter.close(session.session_identity)
             except Exception as adapter_error:

@@ -97,7 +97,7 @@ class CoordinatorSessions:
             pass
 
     def get_session(self, session_identity: SessionIdentity) -> Session:
-        session = self.sessions.get(session_identity.session_id)
+        session = self.sessions.get(session_identity.id)
         if session is None or session.session_identity != session_identity:
             raise ValueError("unknown or stale session reference")
         else:
@@ -437,7 +437,7 @@ class CoordinatorSessions:
                 pass
 
     async def close_session(self, session_identity: SessionIdentity) -> None:
-        session = self.sessions.get(session_identity.session_id)
+        session = self.sessions.get(session_identity.id)
         if session is None:
             return
         else:
@@ -508,7 +508,7 @@ class CoordinatorSessions:
         session.output_wake.set()
         # Note (Junnan Li): An unacknowledged owner may still hold buffers; keep its capacity reserved.
         if session.cleanup_error is None:
-            del self.sessions[session.session_identity.session_id]
+            del self.sessions[session.session_identity.id]
         else:
             pass
 
