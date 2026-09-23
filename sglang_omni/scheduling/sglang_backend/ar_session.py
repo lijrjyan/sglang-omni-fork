@@ -134,7 +134,7 @@ class ARSessionBridge:
             and session_identity.open_index != session.session_identity.open_index
         ):
             raise ValueError("stale session open index")
-        if operation_kind == "open":
+        elif operation_kind == "open":
             if session is not None:
                 raise ValueError("session already opened")
             elif len(self.sessions) >= self.bridge_scheduler.max_running_requests:
@@ -176,19 +176,20 @@ class ARSessionBridge:
         session = self.sessions.get(session_identity.id)
         if session is None or session_identity != session.session_identity:
             raise ValueError("unknown or stale session open index")
-        if session.unit is None:
-            session.unit = SessionUnit(
-                request_id=payload.request_id,
-                session_identity=session_identity,
-                stages=operation.stages,
-                chunk=chunk,
-            )
-            self.units_by_request_id[payload.request_id] = session.unit
-            return session.unit
-        elif session.unit.request_id != payload.request_id:
-            raise ValueError("session already has an active request")
         else:
-            return session.unit
+            if session.unit is None:
+                session.unit = SessionUnit(
+                    request_id=payload.request_id,
+                    session_identity=session_identity,
+                    stages=operation.stages,
+                    chunk=chunk,
+                )
+                self.units_by_request_id[payload.request_id] = session.unit
+                return session.unit
+            elif session.unit.request_id != payload.request_id:
+                raise ValueError("session already has an active request")
+            else:
+                return session.unit
 
     def materialize(
         self, payload: StagePayload, request_data: SGLangARRequestData
