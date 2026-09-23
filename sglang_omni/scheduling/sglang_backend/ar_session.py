@@ -15,7 +15,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 
-import sglang_omni.scheduling.omni_scheduler as omni_scheduler
+from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.admission import QueueFullError
 from sglang_omni.profiler.event_recorder import get_active_stage
 from sglang_omni.proto.request import OmniRequest, StagePayload
@@ -110,17 +110,17 @@ class ARSessionBridge:
     """Map pipeline open, append, and close onto one SGLang streaming session."""
 
     def __init__(
-        self, scheduler: omni_scheduler.OmniScheduler, adapter: ARSessionAdapter
+        self, bridge_scheduler: OmniScheduler, adapter: ARSessionAdapter
     ) -> None:
-        self.scheduler = scheduler
+        self.bridge_scheduler = bridge_scheduler
         self.adapter = adapter
         self.sessions: dict[str, BridgeSession] = {}
         self.units_by_request_id: dict[str, SessionUnit] = {}
         self.cancelling_request_id: str | None = None
 
     def drain(self) -> None:
-        self.scheduler.synchronize_launched_decode()
-        self.scheduler.resolve_pending_async()
+        self.bridge_scheduler.synchronize_launched_decode()
+        self.bridge_scheduler.resolve_pending_async()
 
     def apply_operation(
         self, payload: StagePayload, operation: SessionOperation
@@ -128,7 +128,7 @@ class ARSessionBridge:
         session_identity = operation.session_identity
         session_id = session_identity.session_id
         operation_kind = operation.operation
-        controller = self.scheduler.session_controller
+        controller = self.bridge_scheduler.session_controller
         session = self.sessions.get(session_id)
         if (
             session is not None
@@ -138,7 +138,7 @@ class ARSessionBridge:
         if operation_kind == "open":
             if session is not None:
                 raise ValueError("session already opened")
-            elif len(self.sessions) >= self.scheduler.max_running_requests:
+            elif len(self.sessions) >= self.bridge_scheduler.max_running_requests:
                 raise QueueFullError()
             else:
                 result = controller.open(
@@ -207,7 +207,7 @@ class ARSessionBridge:
             raise ValueError(
                 "history-aware session embedding and multimodal inputs are not supported"
             )
-        native_session = self.scheduler.session_controller.get(
+        native_session = self.bridge_scheduler.session_controller.get(
             unit.session_identity.session_id
         )
         tokenized_input = TokenizedGenerateReqInput(
@@ -240,7 +240,7 @@ class ARSessionBridge:
         session_request = native_session.create_req(
             tokenized_input,
             adapter_request.tokenizer,
-            self.scheduler.model_config.vocab_size,
+            self.bridge_scheduler.model_config.vocab_size,
             eos_token_ids=adapter_request.eos_token_ids,
         )
         if session_request.to_finish is not None:
@@ -256,7 +256,7 @@ class ARSessionBridge:
     def rollback(self, request_id: str) -> None:
         unit = self.units_by_request_id.pop(request_id, None)
         if unit is not None:
-            native_session = self.scheduler.session_controller.get(
+            native_session = self.bridge_scheduler.session_controller.get(
                 unit.session_identity.session_id
             )
             if native_session is not None and unit.session_request is not None:
@@ -271,7 +271,7 @@ class ARSessionBridge:
         try:
             if not unit.is_enqueued:
                 # note (Junnan Li): Before enqueue, rollback must preserve the prior unit's KV.
-                self.scheduler.abort(request_id)
+                self.bridge_scheduler.abort(request_id)
                 self.rollback(request_id)
             else:
                 assert (
@@ -279,24 +279,24 @@ class ARSessionBridge:
                 ), f"enqueued session request {request_id} has no Req"
                 is_queued = any(
                     queued_request is session_request
-                    for queued_request in self.scheduler.waiting_queue
+                    for queued_request in self.bridge_scheduler.waiting_queue
                 )
                 if is_queued:
                     # note (Junnan Li): Failed prefill admission may have restored the prior slot.
                     session_request.detach_kv()
                     session_request.session = None
-                    self.scheduler.abort(request_id)
+                    self.bridge_scheduler.abort(request_id)
                     self.drain()
                 else:
-                    self.scheduler.abort(request_id)
+                    self.bridge_scheduler.abort(request_id)
                     self.drain()
                     session_request.finished_reason = FINISH_ABORT()
-                    self.scheduler.release_request_kv_cache(session_request)
+                    self.bridge_scheduler.release_request_kv_cache(session_request)
                     # note (Junnan Li): Batch selection must filter rows and tensors together.
-                    if self.scheduler.chunked_req is session_request:
-                        self.scheduler.chunked_req = None
+                    if self.bridge_scheduler.chunked_req is session_request:
+                        self.bridge_scheduler.chunked_req = None
                     if session_request._omni_data is not None:
-                        self.scheduler.run_abort_callback(request_id)
+                        self.bridge_scheduler.run_abort_callback(request_id)
                         session_request._omni_data = None
                 self.rollback(request_id)
         finally:
@@ -308,10 +308,10 @@ class ARSessionBridge:
         assert (
             session_request is not None
         ), f"session capacity check {request_id} requires a materialized Req"
-        cache = self.scheduler.tree_cache
+        cache = self.bridge_scheduler.tree_cache
         slot = cache.slots.get(unit.session_identity.session_id)
         retained_kv_tokens = slot.kv.kv_allocated_len if slot is not None else 0
-        free_request_slots = self.scheduler.req_to_token_pool.free_slots
+        free_request_slots = self.bridge_scheduler.req_to_token_pool.free_slots
         unallocated_request_count = sum(
             other_unit is not unit
             and other_unit.session_request is not None
@@ -346,7 +346,7 @@ class ARSessionBridge:
                     - allocated_kv_tokens,
                 )
             available_kv_tokens = (
-                self.scheduler.token_to_kv_pool_allocator.available_size()
+                self.bridge_scheduler.token_to_kv_pool_allocator.available_size()
                 + cache.evictable_size()
             )
             if (
@@ -394,15 +394,15 @@ class ARSessionBridge:
 
     def close_native_session(self, session: BridgeSession) -> None:
         if session.unit is not None:
-            self.scheduler.abort(session.unit.request_id)
+            self.bridge_scheduler.abort(session.unit.request_id)
         session_id = session.session_identity.session_id
         self.drain()
-        self.scheduler.session_controller.close(
+        self.bridge_scheduler.session_controller.close(
             CloseSessionReqInput(session_id=session_id)
         )
         if (
-            self.scheduler.session_controller.get(session_id) is not None
-            or session_id in self.scheduler.tree_cache.slots
+            self.bridge_scheduler.session_controller.get(session_id) is not None
+            or session_id in self.bridge_scheduler.tree_cache.slots
         ):
             raise RuntimeError("native session close is still pending")
 
