@@ -1327,7 +1327,9 @@ class Stage:
                 is_done=True,
             )
 
-        next_stages = self.get_next(request_id, result) if command is None else actual
+        next_stages = (
+            self.get_next(request_id, result) if session_operation is None else actual
+        )
         if next_stages is None:
             # Terminal: notify coordinator
             _emit_event(
