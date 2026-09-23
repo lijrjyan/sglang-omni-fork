@@ -1458,14 +1458,14 @@ class OmniScheduler:
             bridge = self.session_bridge
             assert bridge is not None
             try:
-                bridge.materialize(payload, req_data)
+                bridge.create_session_request(payload, req_data)
             except ValueError as exc:
-                bridge.rollback(req_id)
+                bridge.release_append_unit(req_id)
                 self.abort(req_id)
                 self.emit_request_error(req_id, exc)
                 return
             except Exception:
-                bridge.rollback(req_id)
+                bridge.release_append_unit(req_id)
                 self.abort(req_id)
                 raise
         req = req_data.req
@@ -1484,7 +1484,7 @@ class OmniScheduler:
             capacity_message = bridge.capacity_error(req_id)
             if capacity_message is not None:
                 self.emit_request_error(req_id, ValueError(capacity_message))
-                bridge.rollback(req_id)
+                bridge.release_append_unit(req_id)
                 self.abort(req_id)
                 return
         kv_error = self.request_kv_capacity_error(req)

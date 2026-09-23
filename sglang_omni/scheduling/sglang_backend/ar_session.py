@@ -191,7 +191,7 @@ class ARSessionBridge:
             else:
                 return session.unit
 
-    def materialize(
+    def create_session_request(
         self, payload: StagePayload, request_data: SGLangARRequestData
     ) -> None:
         self.drain()
@@ -256,7 +256,7 @@ class ARSessionBridge:
         request_data.req = session_request
         request_data.stage_payload = payload
 
-    def rollback(self, request_id: str) -> None:
+    def release_append_unit(self, request_id: str) -> None:
         unit = self.units_by_request_id.pop(request_id, None)
         if unit is not None:
             native_session = self.bridge_scheduler.session_controller.get(
@@ -273,9 +273,9 @@ class ARSessionBridge:
         self.cancelling_request_id = request_id
         try:
             if not unit.is_enqueued:
-                # note (Junnan Li): Before enqueue, rollback must preserve the prior unit's KV.
+                # note (Junnan Li): Before enqueue, release_append_unit must preserve the prior unit's KV.
                 self.bridge_scheduler.abort(request_id)
-                self.rollback(request_id)
+                self.release_append_unit(request_id)
             else:
                 assert (
                     session_request is not None
@@ -301,7 +301,7 @@ class ARSessionBridge:
                     if session_request._omni_data is not None:
                         self.bridge_scheduler.run_abort_callback(request_id)
                         session_request._omni_data = None
-                self.rollback(request_id)
+                self.release_append_unit(request_id)
         finally:
             self.cancelling_request_id = previous_cancelling_request_id
 
@@ -310,7 +310,7 @@ class ARSessionBridge:
         session_request = unit.session_request
         assert (
             session_request is not None
-        ), f"session capacity check {request_id} requires a materialized Req"
+        ), f"session capacity check {request_id} requires a session request"
         cache = self.bridge_scheduler.tree_cache
         slot = cache.slots.get(unit.session_identity.id)
         retained_kv_tokens = slot.kv.kv_allocated_len if slot is not None else 0
