@@ -388,7 +388,7 @@ class ARSessionBridge:
         if unit is not None:
             self.sessions[unit.session_identity.session_id].unit = None
 
-    def close_session(self, session: BridgeSession) -> None:
+    def close_native_session(self, session: BridgeSession) -> None:
         if session.unit is not None:
             self.scheduler.abort(session.unit.request_id)
         session_id = session.session_identity.session_id
@@ -401,9 +401,30 @@ class ARSessionBridge:
             or session_id in self.scheduler.tree_cache.slots
         ):
             raise RuntimeError("native session close is still pending")
+
+    def close_session(self, session: BridgeSession) -> None:
+        self.close_native_session(session)
         self.adapter.close(session.session_identity)
-        self.sessions.pop(session_id)
+        self.sessions.pop(session.session_identity.session_id)
 
     def shutdown(self) -> None:
+        adapter_failures: dict[str, Exception] = {}
         for session in list(self.sessions.values()):
-            self.close_session(session)
+            self.close_native_session(session)
+            session_id = session.session_identity.session_id
+            try:
+                self.adapter.close(session.session_identity)
+            except Exception as adapter_error:
+                adapter_failures[session_id] = adapter_error
+            else:
+                self.sessions.pop(session_id)
+        if not adapter_failures:
+            return
+        else:
+            failure_text = "; ".join(
+                f"{session_id}: {adapter_error}"
+                for session_id, adapter_error in adapter_failures.items()
+            )
+            raise RuntimeError(
+                f"AR session adapter cleanup failed for {failure_text}"
+            ) from next(iter(adapter_failures.values()))
