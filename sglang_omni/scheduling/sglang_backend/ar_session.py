@@ -159,6 +159,9 @@ class ARSessionBridge:
         elif operation_kind == "close":
             if session is not None:
                 self.close_session(session)
+            else:
+                pass
+                # note (chenyang): coding style, each if should be closed by else.
             payload.data = {"closed": True}
         else:
             raise ValueError("unknown session operation")
