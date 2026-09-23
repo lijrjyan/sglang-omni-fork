@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Callable
 
 from fastapi import WebSocket
 
@@ -15,11 +14,7 @@ from sglang_omni.serve.realtime.session import RealtimeSession
 from sglang_omni.serve.realtime.transcription_session import (
     RealtimeTranscriptionSession,
 )
-from sglang_omni.serve.realtime.types import (
-    Capabilities,
-    InteractionAdapter,
-    RuntimeLimits,
-)
+from sglang_omni.serve.realtime.types import AdapterFactory, Capabilities, RuntimeLimits
 
 RealtimeConnection = (
     RealtimeSession | SharedRealtimeSession | RealtimeTranscriptionSession
@@ -30,7 +25,7 @@ RealtimeConnection = (
 class RealtimeDeployment:
 
     capabilities: Capabilities
-    adapter_factory: Callable[[], InteractionAdapter]
+    adapter_factory: AdapterFactory
     limits: RuntimeLimits = field(default_factory=RuntimeLimits)
     max_connections: int = 128
 

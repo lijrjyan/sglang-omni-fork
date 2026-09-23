@@ -45,9 +45,10 @@ def project_output(
             ),
         )
     elif isinstance(event, ResponseFinished):
-        content: list[JsonValue] = [dict(type="output_text", text=event.text)]
         if output_modalities is not None and "text" not in output_modalities:
-            content = []
+            content: list[JsonValue] = []
+        else:
+            content = [dict(type="output_text", text=event.text)]
         if event.include_audio:
             content.append(dict(type="output_audio", transcript=event.text))
         return dict(

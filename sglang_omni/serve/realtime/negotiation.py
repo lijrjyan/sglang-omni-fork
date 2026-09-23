@@ -66,19 +66,8 @@ class SessionNegotiation:
             )
         if candidate.get("model", self.model) != self.model:
             raise ProtocolError("invalid_request", "model differs from deployment")
-        typ = candidate.get(
-            "type",
-            (
-                "transcription"
-                if self.capabilities.interaction == "transcription"
-                else "realtime"
-            ),
-        )
-        if typ != (
-            "transcription"
-            if self.capabilities.interaction == "transcription"
-            else "realtime"
-        ):
+        session_type = candidate.get("type", "realtime")
+        if session_type != "realtime":
             raise ProtocolError("invalid_request", "session type is unavailable")
         self.validate_audio(candidate)
         requested = candidate.get(
@@ -88,11 +77,11 @@ class SessionNegotiation:
         if not outputs:
             raise ProtocolError("invalid_request", "no supported output combination")
         micro = self.validate_extension(candidate)
-        return self.grant(candidate, typ, requested, outputs, micro)
+        return self.grant(candidate, session_type, requested, outputs, micro)
 
     def validate_audio(self, candidate: SessionConfiguration) -> None:
         audio = candidate.get("audio", {})
-        for direction, fmt, rate in (
+        for direction, audio_format, rate in (
             (
                 "input",
                 audio.get("input", {}).get("format"),
@@ -104,7 +93,9 @@ class SessionNegotiation:
                 self.capabilities.output_rate,
             ),
         ):
-            if fmt is not None and fmt != dict(type="audio/pcm", rate=rate):
+            if audio_format is not None and audio_format != dict(
+                type="audio/pcm", rate=rate
+            ):
                 raise ProtocolError(
                     "invalid_request",
                     "unsupported PCM format or sample rate",
@@ -134,7 +125,7 @@ class SessionNegotiation:
     def grant(
         self,
         candidate: SessionConfiguration,
-        typ: SessionType,
+        session_type: SessionType,
         requested: list[str],
         outputs: list[str],
         micro: float | None,
@@ -174,6 +165,6 @@ class SessionNegotiation:
                 direction, {}
             ).setdefault("format", dict(type="audio/pcm", rate=rate))
         candidate.update(
-            {"model": self.model, "type": typ, "output_modalities": outputs}
+            {"model": self.model, "type": session_type, "output_modalities": outputs}
         )
         return candidate, grant

@@ -60,9 +60,9 @@ class OutputBuffer:
         unit: Unit | None,
         output_modalities: tuple[str, ...],
     ) -> None:
-        rid = event.response_id if isinstance(event, ResponseEvent) else None
+        response_id = event.response_id if isinstance(event, ResponseEvent) else None
         # Note (Junnan Li): Keep each response's negotiated modalities across hot updates.
-        response = self.responses.get(rid) if rid is not None else None
+        response = self.responses.get(response_id) if response_id is not None else None
         modalities = (
             response.output_modalities if response is not None else None
         ) or output_modalities
@@ -71,7 +71,7 @@ class OutputBuffer:
         if isinstance(event, ResponseFinished) and "audio" not in modalities:
             event = replace(event, include_audio=False)
         if isinstance(event, ResponseStarted):
-            if rid in self.responses:
+            if response_id in self.responses:
                 raise RuntimeError("duplicate response creation")
             self.responses[event.response_id] = ResponseState(
                 output_modalities=modalities,
@@ -122,22 +122,27 @@ class OutputBuffer:
         self.output_seq += 1
 
     def finish_responses(self, status: ResponseStatus, reason: str) -> None:
-        for rid, state in list(self.responses.items()):
+        for response_id, state in list(self.responses.items()):
             if state.terminal_sent:
                 continue
             elif not state.visible:
-                del self.responses[rid]
+                self.responses.pop(response_id)
                 continue
             state.terminal = True
-            item_id = state.item_id or "item_" + rid
+            item_id = state.item_id or "item_" + response_id
             events: list[OutputEvent] = []
             if not state.text_done_sent and state.output_modalities:
-                events.append(TextFinished(rid, item_id, state.text))
+                events.append(TextFinished(response_id, item_id, state.text))
             if state.audio_visible and not state.audio_done_sent:
-                events.append(AudioFinished(rid, item_id))
+                events.append(AudioFinished(response_id, item_id))
             events.append(
                 ResponseFinished(
-                    rid, item_id, state.text, state.audio_visible, status, reason
+                    response_id,
+                    item_id,
+                    state.text,
+                    state.audio_visible,
+                    status,
+                    reason,
                 )
             )
             for event in events:
@@ -168,20 +173,20 @@ class OutputBuffer:
     def sent(self, envelope: Envelope) -> None:
         event = envelope.event
         if isinstance(event, ResponseFinished):
-            del self.responses[event.response_id]
+            self.responses.pop(event.response_id)
         elif isinstance(event, Closed):
             self.responses.clear()
 
     def terminal(self, event: Failure | Closed) -> None:
         # Note (Junnan Li): Terminal notifications must remain deliverable after media overflow.
         terminals = [
-            (env, size)
-            for env, size in self.output
-            if isinstance(env.event, Failure)
+            (envelope, size)
+            for envelope, size in self.output
+            if isinstance(envelope.event, Failure)
             or (
-                env.control
+                envelope.control
                 and isinstance(
-                    env.event, (TextFinished, AudioFinished, ResponseFinished)
+                    envelope.event, (TextFinished, AudioFinished, ResponseFinished)
                 )
             )
         ]

@@ -5,7 +5,7 @@ from collections.abc import Iterable
 
 
 async def cancel_local_tasks(
-    tasks: Iterable[asyncio.Task[object] | None], timeout: float
+    tasks: Iterable[asyncio.Task[None] | None], timeout: float
 ) -> None:
     local_tasks = {
         task

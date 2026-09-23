@@ -136,3 +136,7 @@ class InteractionAdapter:
 
     async def close(self) -> None:
         raise NotImplementedError
+
+
+class AdapterFactory(Protocol):
+    def __call__(self) -> InteractionAdapter: ...

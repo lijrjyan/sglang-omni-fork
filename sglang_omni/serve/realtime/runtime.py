@@ -7,9 +7,9 @@ import copy
 import logging
 import math
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextvars import ContextVar
-from typing import Literal, cast
+from typing import Literal
 
 from sglang_omni.serve.realtime.control import (
     Accepted,
@@ -29,6 +29,7 @@ from sglang_omni.serve.realtime.output_buffer import OutputBuffer
 from sglang_omni.serve.realtime.schema import GrantedCapabilities, SessionConfiguration
 from sglang_omni.serve.realtime.task_cleanup import cancel_local_tasks
 from sglang_omni.serve.realtime.types import (
+    AdapterFactory,
     Capabilities,
     Envelope,
     InteractionAdapter,
@@ -47,7 +48,7 @@ class SessionRuntime:
         self,
         model: str,
         capabilities: Capabilities,
-        adapter_factory: Callable[[], InteractionAdapter],
+        adapter_factory: AdapterFactory,
         limits: RuntimeLimits,
     ) -> None:
         self.session_id = "sess_" + uuid.uuid4().hex
@@ -168,27 +169,23 @@ class SessionRuntime:
             )
 
     async def append(
-        self, pcm: bytes, seq: object, start_ms: object, event_id: str
+        self, pcm: bytes, sequence: int, start_ms: float | None, event_id: str
     ) -> None:
         async with self.lock:
             self.require_open()
             if self.eos:
                 raise ProtocolError("invalid_state", "audio input has ended")
-            if type(seq) is not int or seq != self.next_seq:
+            if sequence != self.next_seq:
                 raise ProtocolError("invalid_state", "audio seq must be contiguous")
             if not pcm or len(pcm) % 2:
                 raise ProtocolError(
                     "invalid_request", "audio must contain whole PCM16 samples"
                 )
-            if start_ms is not None and (
-                type(start_ms) not in (int, float)
-                or not math.isfinite(cast(float, start_ms))
-                or not math.isclose(
-                    cast(float, start_ms),
-                    self.ms(self.accepted_samples),
-                    rel_tol=0,
-                    abs_tol=1e-7,
-                )
+            if start_ms is not None and not math.isclose(
+                start_ms,
+                self.ms(self.accepted_samples),
+                rel_tol=0,
+                abs_tol=1e-7,
             ):
                 raise ProtocolError(
                     "invalid_state", "input media time must be sample-contiguous"
@@ -202,7 +199,7 @@ class SessionRuntime:
             self.pending.extend(pcm)
             self.accepted_samples += len(pcm) // 2
             self.next_seq += 1
-            self.notify(Accepted(seq, self.ms(self.accepted_samples), event_id))
+            self.notify(Accepted(sequence, self.ms(self.accepted_samples), event_id))
             self.wake.set()
 
     async def clear(self, event_id: str) -> None:
