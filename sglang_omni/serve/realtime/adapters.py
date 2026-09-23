@@ -8,7 +8,12 @@ from collections.abc import Callable, Iterable
 
 from sglang_omni.client.client import Client
 from sglang_omni.proto.request import OmniRequest
-from sglang_omni.proto.session import OutputChunk, SessionLimits, SessionRef, TimedChunk
+from sglang_omni.proto.session import (
+    OutputChunk,
+    SessionIdentity,
+    SessionLimits,
+    TimedChunk,
+)
 from sglang_omni.serve.realtime.output import OutputEvent, TurnFailure
 from sglang_omni.serve.realtime.schema import SessionConfiguration
 from sglang_omni.serve.realtime.task_cleanup import cancel_local_tasks
@@ -45,8 +50,8 @@ class CoordinatorAdapter(InteractionAdapter):
         self.convert = output_converter
         self.rate = input_rate
         self.limits = limits or SessionLimits()
-        self.local_cleanup_timeout = self.limits.command_timeout_s
-        self.ref: SessionRef | None = None
+        self.local_cleanup_timeout = self.limits.operation_timeout_s
+        self.session_identity: SessionIdentity | None = None
         self.reader: asyncio.Task[None] | None = None
         self.active: Unit | None = None
         self.future: asyncio.Future[int] | None = None
@@ -63,7 +68,7 @@ class CoordinatorAdapter(InteractionAdapter):
         self, session_id: str, config: SessionConfiguration, emit: OutputSink
     ) -> None:
         self.emit = emit
-        self.ref = await self.client.open_session(
+        self.session_identity = await self.client.open_session(
             self.request_builder(config),
             stages=self.stages,
             limits=self.limits,
@@ -72,9 +77,9 @@ class CoordinatorAdapter(InteractionAdapter):
         self.reader = asyncio.create_task(self.read())
 
     async def read(self) -> None:
-        assert self.ref is not None and self.emit is not None
+        assert self.session_identity is not None and self.emit is not None
         try:
-            async for output in self.client.session_outputs(self.ref):
+            async for output in self.client.session_outputs(self.session_identity):
                 if self.active is None or output.input_seq != self.active.seq:
                     continue
                 if output.kind == "input_done":
@@ -105,7 +110,7 @@ class CoordinatorAdapter(InteractionAdapter):
                 await self.emit(TurnFailure("server_error", "internal", str(exc)))
 
     async def process(self, unit: Unit) -> int:
-        assert self.ref is not None
+        assert self.session_identity is not None
         if self.reader_error is not None:
             raise self.reader_error
         self.active = unit
@@ -120,7 +125,7 @@ class CoordinatorAdapter(InteractionAdapter):
             eos=unit.eos,
         )
         try:
-            await self.client.append_session(self.ref, chunk)
+            await self.client.append_session(self.session_identity, chunk)
             return await self.future
         finally:
             self.active = None
@@ -131,7 +136,7 @@ class CoordinatorAdapter(InteractionAdapter):
     async def close(self) -> None:
         self.closing = True
         try:
-            if self.ref is not None:
-                await self.client.close_session(self.ref)
+            if self.session_identity is not None:
+                await self.client.close_session(self.session_identity)
         finally:
             await cancel_local_tasks([self.reader], self.local_cleanup_timeout)
