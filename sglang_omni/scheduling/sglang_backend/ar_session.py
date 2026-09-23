@@ -107,7 +107,7 @@ class BridgeSession:
 
 
 class ARSessionBridge:
-    """All methods run on the scheduler thread, including lifecycle commands."""
+    """Map pipeline open, append, and close onto one SGLang streaming session."""
 
     def __init__(
         self, scheduler: omni_scheduler.OmniScheduler, adapter: ARSessionAdapter
