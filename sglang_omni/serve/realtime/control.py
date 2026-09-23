@@ -6,6 +6,7 @@ from sglang_omni.serve.realtime.schema import (
     GrantedCapabilities,
     SessionConfiguration,
     SessionType,
+    TailPolicy,
 )
 
 
@@ -42,7 +43,7 @@ class Cleared:
 @dataclass(frozen=True)
 class Ended:
     accepted_end_ms: float
-    tail_policy: str
+    tail_policy: TailPolicy
     client_event_id: str
 
 

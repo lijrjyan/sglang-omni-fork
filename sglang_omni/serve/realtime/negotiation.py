@@ -2,13 +2,11 @@
 
 import copy
 from dataclasses import asdict, dataclass
-from typing import cast
 
 from pydantic import ValidationError
 
 from sglang_omni.serve.realtime.schema import (
     GrantedCapabilities,
-    JsonObject,
     SessionConfiguration,
     SessionType,
     SessionUpdateRequest,
@@ -16,7 +14,9 @@ from sglang_omni.serve.realtime.schema import (
 from sglang_omni.serve.realtime.types import Capabilities, ProtocolError, RuntimeLimits
 
 
-def merge_config(current: JsonObject, patch: JsonObject) -> JsonObject:
+def merge_config(
+    current: dict[str, object], patch: dict[str, object]
+) -> dict[str, object]:
     result = copy.deepcopy(current)
     for key, value in patch.items():
         current_value = result.get(key)
@@ -38,7 +38,7 @@ class SessionNegotiation:
     ) -> tuple[SessionConfiguration, GrantedCapabilities]:
         try:
             candidate = SessionUpdateRequest.model_validate(
-                {"session": merge_config(cast(JsonObject, current), patch)}
+                {"session": merge_config(dict(current), patch)}
                 if isinstance(patch, dict)
                 else {"session": patch}
             ).session
@@ -157,13 +157,13 @@ class SessionNegotiation:
                     granted=outputs,
                 )
             )
-        for direction, rate in (
-            ("input", self.capabilities.input_rate),
-            ("output", self.capabilities.output_rate),
-        ):
-            cast(dict[str, JsonObject], candidate.setdefault("audio", {})).setdefault(
-                direction, {}
-            ).setdefault("format", dict(type="audio/pcm", rate=rate))
+        audio = candidate.setdefault("audio", {})
+        audio.setdefault("input", {}).setdefault(
+            "format", dict(type="audio/pcm", rate=self.capabilities.input_rate)
+        )
+        audio.setdefault("output", {}).setdefault(
+            "format", dict(type="audio/pcm", rate=self.capabilities.output_rate)
+        )
         candidate.update(
             {"model": self.model, "type": session_type, "output_modalities": outputs}
         )

@@ -6,13 +6,22 @@ import binascii
 import json
 import logging
 import uuid
-from typing import Literal, cast, get_args
+from typing import Literal
 
 from pydantic import ValidationError
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from sglang_omni.serve.realtime.control import ControlEvent, Failure
-from sglang_omni.serve.realtime.output import OutputEvent
+from sglang_omni.serve.realtime.control import (
+    Accepted,
+    Cleared,
+    Closed,
+    Created,
+    Drained,
+    Ended,
+    Failure,
+    UnitCompleted,
+    Updated,
+)
 from sglang_omni.serve.realtime.projection import project_control, project_output
 from sglang_omni.serve.realtime.runtime import SessionRuntime
 from sglang_omni.serve.realtime.schema import (
@@ -23,9 +32,6 @@ from sglang_omni.serve.realtime.schema import (
     SessionUpdateEvent,
 )
 from sglang_omni.serve.realtime.types import ProtocolError
-
-CONTROL_EVENT_TYPES: tuple[type[ControlEvent], ...] = get_args(ControlEvent)
-
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +76,24 @@ class SharedRealtimeSession:
 
     async def send(self) -> None:
         async for envelope in self.runtime.outputs():
-            if isinstance(envelope.event, CONTROL_EVENT_TYPES):
-                event = project_control(cast(ControlEvent, envelope.event))
+            if isinstance(
+                envelope.event,
+                (
+                    Accepted,
+                    Cleared,
+                    Closed,
+                    Created,
+                    Drained,
+                    Ended,
+                    Failure,
+                    UnitCompleted,
+                    Updated,
+                ),
+            ):
+                event = project_control(envelope.event)
             else:
                 event = project_output(
-                    cast(OutputEvent, envelope.event),
+                    envelope.event,
                     output_modalities=(
                         list(envelope.output_modalities)
                         if envelope.output_modalities is not None
@@ -84,14 +103,16 @@ class SharedRealtimeSession:
             event["event_id"] = "evt_" + uuid.uuid4().hex
             if envelope.unit is not None:
                 unit = envelope.unit
-                metadata = cast(JsonObject, event.setdefault("sglang", {}))
+                metadata = event.setdefault("sglang", {})
                 metadata.update(
-                    unit_id=f"unit_{unit.seq}",
-                    chunk_seq=envelope.chunk_seq,
-                    media_time=dict(
-                        t_start_ms=self.runtime.ms(unit.start_sample),
-                        duration_ms=self.runtime.ms(unit.real_samples),
-                    ),
+                    {
+                        "unit_id": f"unit_{unit.seq}",
+                        "chunk_seq": envelope.chunk_seq,
+                        "media_time": dict(
+                            t_start_ms=self.runtime.ms(unit.start_sample),
+                            duration_ms=self.runtime.ms(unit.real_samples),
+                        ),
+                    }
                 )
             self.runtime.output_buffer.before_send(envelope)
             await self.websocket.send_text(json.dumps(event, allow_nan=False))
