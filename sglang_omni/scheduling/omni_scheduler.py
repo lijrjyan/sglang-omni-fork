@@ -1481,7 +1481,7 @@ class OmniScheduler:
         if session_unit is not None:
             bridge = self.session_bridge
             assert bridge is not None
-            capacity_message = bridge.capacity_error(req_id)
+            capacity_message = bridge.check_session_capacity(req_id)
             if capacity_message is not None:
                 self.emit_request_error(req_id, ValueError(capacity_message))
                 bridge.release_append_unit(req_id)

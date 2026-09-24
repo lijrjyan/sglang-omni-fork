@@ -311,7 +311,7 @@ class ARSessionBridge:
         finally:
             self.cancelling_request_id = previous_cancelling_request_id
 
-    def capacity_error(self, request_id: str) -> str | None:
+    def check_session_capacity(self, request_id: str) -> str | None:
         unit = self.units_by_request_id[request_id]
         session_request = unit.session_request
         assert (
