@@ -1022,7 +1022,7 @@ def test_immediate_finish_keeps_async_snapshot_aligned_until_resolve() -> None:
     scheduler.running_batch = live_batch
     scheduler.cur_batch = live_batch
     scheduler.last_batch = None
-    scheduler._async_pending = PendingDecode(
+    scheduler.async_pending = PendingDecode(
         batch=snapshot, scheduler_output=object(), device_step=object()
     )
     captured = {}

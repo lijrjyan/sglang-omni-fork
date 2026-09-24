@@ -267,18 +267,18 @@ class OmniScheduler:
             raise ValueError("session_adapter requires enable_streaming_session")
         else:
             pass
-        self._request_builder = request_builder
-        self._result_adapter = result_adapter
-        self._model_runner = None
-        self._stream_output_builder = stream_output_builder
-        self._stream_chunk_handler = stream_chunk_handler
-        self._stream_done_handler = stream_done_handler
-        self._abort_callback = abort_callback
-        self._request_finished_callback = request_finished_callback
-        self._shutdown_callback = shutdown_callback
-        self._shutdown_lock = threading.Lock()
-        self._request_admission_lock = threading.RLock()
-        self._prompt_cache_epoch = 0
+        self.request_builder = request_builder
+        self.result_adapter = result_adapter
+        self.model_runner = None
+        self.stream_output_builder = stream_output_builder
+        self.stream_chunk_handler = stream_chunk_handler
+        self.stream_done_handler = stream_done_handler
+        self.abort_callback = abort_callback
+        self.request_finished_callback = request_finished_callback
+        self.shutdown_callback = shutdown_callback
+        self.shutdown_lock = threading.Lock()
+        self.request_admission_lock = threading.RLock()
+        self.prompt_cache_epoch = 0
         from sglang.srt.runtime_context import get_memory, get_parallel, get_schedule
 
         self.request_build_max_workers = max(1, int(request_build_max_workers))
@@ -431,7 +431,7 @@ class OmniScheduler:
         # Async decode (one-step lookahead): the launched-but-not-resolved
         # decode batch, or None. Tracked here (not just a loop local) so abort
         # can reach the in-flight step. See _event_loop_async_decode.
-        self._async_pending: PendingDecode | None = None
+        self.async_pending: PendingDecode | None = None
         self.previous_pending_decode = None
         self.forward_ct = 0
         self.return_health_check_ct = 0
@@ -597,7 +597,7 @@ class OmniScheduler:
 
         Some pipelines need the scheduler-owned outbox before they can build
         their model runner. They must use this method instead of assigning
-        ``_model_runner`` so late-bound runners receive the same execution
+        ``model_runner`` so late-bound runners receive the same execution
         bridge and FutureMap contract as runners supplied to ``__init__``.
         """
         if model_runner is None:
@@ -979,7 +979,7 @@ class OmniScheduler:
                 and msg.type == "new_request"
                 and is_close_request(msg.data)
             )
-            if msg.request_id in self._aborted_request_ids and not is_cleanup:
+            if msg.request_id in self.aborted_request_ids and not is_cleanup:
                 continue
             else:
                 pass
@@ -1041,7 +1041,7 @@ class OmniScheduler:
             raise ValueError("AR streaming sessions are not enabled for this stage")
         elif operation.operation != "append":
             session_payload = bridge.apply_operation(payload, operation)
-            if payload.request_id in self._aborted_request_ids:
+            if payload.request_id in self.aborted_request_ids:
                 return False
             else:
                 self.outbox.put(
@@ -1149,7 +1149,7 @@ class OmniScheduler:
                 pass
             active_stage = _get_active_stage()
             if session_unit is None:
-                request_build_executor = self._request_build_executor
+                request_build_executor = self.request_build_executor
             else:
                 request_build_executor = None
             if request_build_executor is not None:
@@ -1226,7 +1226,7 @@ class OmniScheduler:
         )
         session_unit = self.active_session_unit(req_id)
         if session_unit is None:
-            req_data = self._request_builder(payload)
+            req_data = self.request_builder(payload)
         else:
             bridge = self.session_bridge
             assert bridge is not None
@@ -1510,7 +1510,7 @@ class OmniScheduler:
         request_admission_lock_held: bool = False,
     ) -> None:
         req_id = payload.request_id
-        self._deferred_request_payloads.pop(req_id, None)
+        self.deferred_request_payloads.pop(req_id, None)
         session_unit = self.active_session_unit(req_id)
         if session_unit is not None:
             bridge = self.session_bridge
@@ -1537,6 +1537,10 @@ class OmniScheduler:
                 self.emit_request_error(req_id, ValueError(error_msg))
                 self.abort(req_id)
                 return
+            else:
+                pass
+        else:
+            pass
         session_unit = self.active_session_unit(req_id)
         if session_unit is not None:
             bridge = self.session_bridge
@@ -1894,7 +1898,7 @@ class OmniScheduler:
         vocoder's delayed-code stream. Aborted requests are suppressed for the
         same reason: an abort landing mid-step must not ship one more chunk."""
         bridge = self.session_bridge
-        if self._stream_output_builder is None and bridge is None:
+        if self.stream_output_builder is None and bridge is None:
             return
         else:
             pass
@@ -1909,8 +1913,8 @@ class OmniScheduler:
             if session_unit is not None:
                 assert bridge is not None
                 messages = bridge.stream_messages(rid, sched_req.data, req_output)
-            elif self._stream_output_builder is not None:
-                messages = self._stream_output_builder(rid, sched_req.data, req_output)
+            elif self.stream_output_builder is not None:
+                messages = self.stream_output_builder(rid, sched_req.data, req_output)
             else:
                 continue
             self.put_stream_messages(rid, messages)
@@ -1942,10 +1946,10 @@ class OmniScheduler:
                 request_id,
                 bridge.stream_messages(request_id, req_data, should_flush=True),
             )
-        elif self._stream_output_builder is None:
+        elif self.stream_output_builder is None:
             return
         else:
-            flush = getattr(self._stream_output_builder, "flush", None)
+            flush = getattr(self.stream_output_builder, "flush", None)
             if flush is None:
                 return
             else:
@@ -1992,7 +1996,7 @@ class OmniScheduler:
         live batch carries no token side channel under the upstream FutureMap
         contract.
         """
-        mr_output = self._model_runner.execute_resolve(pending_step)
+        mr_output = self.model_runner.execute_resolve(pending_step)
         if mr_output is None:
             return _FAILED_BATCH_RESULT
         else:
@@ -2161,7 +2165,7 @@ class OmniScheduler:
                 self.flush_stream_output(rid, data)
                 session_unit = self.active_session_unit(rid)
                 if session_unit is None:
-                    result = self._result_adapter(data)
+                    result = self.result_adapter(data)
                 else:
                     bridge = self.session_bridge
                     assert bridge is not None
@@ -2275,7 +2279,7 @@ class OmniScheduler:
                     pass
             finally:
                 self.emit_remaining_model_path_ends(status=model_path_status)
-                self._scheduler_thread_id = None
+                self.scheduler_thread_id = None
                 try:
                     self.shutdown_request_build_executor()
                 finally:
@@ -2286,9 +2290,9 @@ class OmniScheduler:
         self.start()
 
     def stop(self) -> None:
-        self._running = False
+        self.running = False
         retains_scheduler_thread = (
-            self.session_bridge is not None and self._scheduler_thread_id is not None
+            self.session_bridge is not None and self.scheduler_thread_id is not None
         )
         if retains_scheduler_thread:
             # note (Junnan Li): Cleanup runs on the scheduler thread after it drains GPU work.
@@ -2327,8 +2331,8 @@ class OmniScheduler:
         bridge = self.session_bridge
         if bridge is not None:
             if (
-                self._scheduler_thread_id is not None
-                and self._scheduler_thread_id != threading.get_ident()
+                self.scheduler_thread_id is not None
+                and self.scheduler_thread_id != threading.get_ident()
             ):
                 self.inbox.put(IncomingMessage(request_id=request_id, type="abort"))
                 return
@@ -2344,9 +2348,9 @@ class OmniScheduler:
                 pass
         else:
             pass
-        with self._request_admission_lock:
-            if request_id not in self._aborted_request_ids:
-                if len(self._aborted_request_ids) >= _ABORTED_REQUEST_ID_LIMIT:
+        with self.request_admission_lock:
+            if request_id not in self.aborted_request_ids:
+                if len(self.aborted_request_ids) >= _ABORTED_REQUEST_ID_LIMIT:
                     # note (Gaokai): evict oldest-first so a still-quiescing
                     # abort survives.
                     while len(self.aborted_request_ids) >= _ABORTED_REQUEST_ID_RETAINED:
@@ -3079,11 +3083,11 @@ class OmniScheduler:
 
     def async_pending_batch(self) -> ScheduleBatch | None:
         """Return the launched decode batch awaiting result processing, or None."""
-        pending_decode = self._async_pending
+        pending_decode = self.async_pending
         return pending_decode.batch if pending_decode is not None else None
 
     def synchronize_launched_decode(self) -> None:
-        pending_decode = self._async_pending
+        pending_decode = self.async_pending
         if pending_decode is not None:
             pending_decode.device_step.event.synchronize()
         else:
@@ -3091,7 +3095,7 @@ class OmniScheduler:
 
     def wait_async_device(self, batch: ScheduleBatch, device_step: PendingStep) -> None:
         device_steps = [device_step]
-        pending_decode = self._async_pending
+        pending_decode = self.async_pending
         if (
             pending_decode is not None
             and pending_decode.device_step is not device_step
@@ -3187,19 +3191,19 @@ class OmniScheduler:
                 self.process_owned_async(pending_decode)
             else:
                 pass
-            if self._async_pending is not None:
+            if self.async_pending is not None:
                 self.wait_async_device(
-                    self._async_pending.batch, self._async_pending.device_step
+                    self.async_pending.batch, self.async_pending.device_step
                 )
-                pending_decode, self._async_pending = self._async_pending, None
+                pending_decode, self.async_pending = self.async_pending, None
                 self.process_owned_async(pending_decode)
             else:
                 pass
-        elif self._async_pending is None:
+        elif self.async_pending is None:
             return
         else:
-            pending_decode = self._async_pending
-            self._async_pending = None
+            pending_decode = self.async_pending
+            self.async_pending = None
             try:
                 self.resolve_and_process(
                     pending_decode.batch,
@@ -3371,8 +3375,8 @@ class OmniScheduler:
                 except Exception as exc:
                     self.handle_batch_failure(batch, exc)
                 else:
-                    prev_pending = self._async_pending
-                    self._async_pending = PendingDecode(
+                    prev_pending = self.async_pending
+                    self.async_pending = PendingDecode(
                         batch=batch.copy(),
                         scheduler_output=sched_output,
                         device_step=pending_step,
@@ -3394,6 +3398,8 @@ class OmniScheduler:
                                 )
                             except Exception as exc:
                                 self.handle_batch_failure(prev_pending.batch, exc)
+                    else:
+                        pass
             else:
                 # Fast path (low-concurrency decode below the threshold) +
                 # prefill + empty all land here: flush any in-flight lookahead
@@ -3491,7 +3497,7 @@ class OmniScheduler:
             bridge.complete(request_id)
         else:
             pass
-        with self._request_admission_lock:
+        with self.request_admission_lock:
             detach_request_data(req)
             self.remember_completed_request(request_id)
             abort_cleanup_needed = request_id in self.aborted_request_ids

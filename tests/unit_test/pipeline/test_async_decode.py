@@ -673,7 +673,7 @@ def test_async_pending_batch_uses_initialized_state():
     s = OmniScheduler.__new__(OmniScheduler)
     s.async_pending = None
     assert s.async_pending_batch() is None
-    s._async_pending = PendingDecode(
+    s.async_pending = PendingDecode(
         batch="batchX", scheduler_output="sched_out", device_step="pending_step"
     )
     assert s.async_pending_batch() == "batchX"
@@ -1102,7 +1102,7 @@ def test_async_path_launch_failure_calls_handle_batch_failure():
     s.event_loop_async_decode()
 
     assert failures == [(batch, RuntimeError, "launch boom")]
-    # launch failed before _async_pending was set; prev state preserved.
+    # launch failed before async_pending was set; prev state preserved.
     assert s.async_pending is None
 
 
@@ -1138,16 +1138,16 @@ def test_async_path_resolve_failure_calls_handle_batch_failure():
     s.event_loop_async_decode()
 
     assert failures == [(prev_batch, RuntimeError, "resolve boom")]
-    # launch succeeded; _async_pending was rotated to the new batch.
-    assert s._async_pending is not None
-    assert s._async_pending.batch is new_batch
+    # launch succeeded; async_pending was rotated to the new batch.
+    assert s.async_pending is not None
+    assert s.async_pending.batch is new_batch
 
 
 def test_drain_resolve_failure_calls_handle_batch_failure():
     failures = []
     stranded_batch = _FakeBatch(2)
     s = OmniScheduler.__new__(OmniScheduler)
-    s._async_pending = PendingDecode(
+    s.async_pending = PendingDecode(
         batch=stranded_batch, scheduler_output="sched", device_step="step"
     )
 
