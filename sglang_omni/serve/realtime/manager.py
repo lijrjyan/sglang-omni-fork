@@ -65,6 +65,8 @@ class RealtimeSessionManager:
                 raise ValueError(
                     "This pipeline does not support realtime transcription."
                 )
+            else:
+                pass
             session: RealtimeConnection = RealtimeTranscriptionSession(
                 websocket,
                 client=self.client,
