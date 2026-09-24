@@ -2220,7 +2220,7 @@ class OmniScheduler:
             try:
                 if self.session_bridge is not None:
                     self.resolve_pending_async()
-                    self.session_bridge.shutdown()
+                    self.session_bridge.close_open_sessions()
                 else:
                     pass
             finally:
@@ -2245,7 +2245,7 @@ class OmniScheduler:
             return
         else:
             if self.session_bridge is not None:
-                self.session_bridge.shutdown()
+                self.session_bridge.close_open_sessions()
             else:
                 pass
             self.discard_pending_request_admissions()

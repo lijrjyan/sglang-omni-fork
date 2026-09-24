@@ -436,7 +436,7 @@ class ARSessionBridge:
         self.adapter.close(session.session_identity)
         self.sessions.pop(session.session_identity.id)
 
-    def shutdown(self) -> None:
+    def close_open_sessions(self) -> None:
         adapter_failures: dict[str, Exception] = {}
         for session in list(self.sessions.values()):
             self.close_streaming_session(session)
