@@ -266,7 +266,11 @@ class ARSessionBridge:
             )
             if streaming_session is not None and unit.session_request is not None:
                 streaming_session.abort_req()
+            else:
+                pass
             self.sessions[unit.session_identity.id].unit = None
+        else:
+            pass
 
     def cancel(self, request_id: str) -> None:
         unit = self.units_by_request_id[request_id]
@@ -406,10 +410,14 @@ class ARSessionBridge:
         unit = self.units_by_request_id.pop(request_id, None)
         if unit is not None:
             self.sessions[unit.session_identity.id].unit = None
+        else:
+            pass
 
     def close_streaming_session(self, session: BridgeSession) -> None:
         if session.unit is not None:
             self.bridge_scheduler.abort(session.unit.request_id)
+        else:
+            pass
         session_id = session.session_identity.id
         self.drain()
         self.bridge_scheduler.session_controller.close(
@@ -420,6 +428,8 @@ class ARSessionBridge:
             or session_id in self.bridge_scheduler.tree_cache.slots
         ):
             raise RuntimeError("streaming session close is still pending")
+        else:
+            pass
 
     def close_session(self, session: BridgeSession) -> None:
         self.close_streaming_session(session)

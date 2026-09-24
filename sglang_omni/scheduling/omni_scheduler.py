@@ -257,6 +257,8 @@ class OmniScheduler:
         self.session_bridge = None
         if session_adapter is not None and not server_args.enable_streaming_session:
             raise ValueError("session_adapter requires enable_streaming_session")
+        else:
+            pass
         self._request_builder = request_builder
         self._result_adapter = result_adapter
         self._model_runner = None
@@ -653,6 +655,8 @@ class OmniScheduler:
         self.session_controller = SessionController(self.tree_cache)
         if self.session_adapter is not None:
             self.session_bridge = ARSessionBridge(self, self.session_adapter)
+        else:
+            pass
         self.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
         self.load_snapshot_writer = None
         self.kv_events_publisher = SimpleNamespace(
@@ -918,6 +922,8 @@ class OmniScheduler:
             if msg.type == "abort":
                 self.abort(msg.request_id)
                 continue
+            else:
+                pass
             is_cleanup = (
                 self.session_bridge is not None
                 and msg.type == "new_request"
@@ -1039,6 +1045,8 @@ class OmniScheduler:
             else:
                 if should_schedule:
                     ordinary_payloads.append(payload)
+                else:
+                    pass
         recv_reqs = ordinary_payloads
         self.drain_request_admission_results()
         self.drain_request_build_results()
@@ -1468,6 +1476,8 @@ class OmniScheduler:
                 bridge.release_append_unit(req_id)
                 self.abort(req_id)
                 raise
+        else:
+            pass
         req = req_data.req
         self.normalize_req_token_arrays(req)
         req_id = req.rid
@@ -1487,6 +1497,10 @@ class OmniScheduler:
                 bridge.release_append_unit(req_id)
                 self.abort(req_id)
                 return
+            else:
+                pass
+        else:
+            pass
         kv_error = self.request_kv_capacity_error(req)
         if kv_error is not None:
             logger.warning(f"Rejecting request {req_id} before scheduling: {kv_error}")
@@ -1543,6 +1557,8 @@ class OmniScheduler:
             enqueued_unit = self.active_session_unit(req_id)
             if enqueued_unit is not None:
                 enqueued_unit.is_enqueued = True
+            else:
+                pass
 
         if request_admission_lock_held:
             enqueue_if_live()
@@ -1699,6 +1715,8 @@ class OmniScheduler:
             and self.get_num_allocatable_reqs(0, running_batch=running_batch) > 0
         ):
             running_batch.batch_is_full = False
+        else:
+            pass
         plan = _Upstream.get_next_batch_to_run(self, running_batch, self.last_batch)
         self.running_batch = plan.running_batch
         return plan.batch_to_run
@@ -2203,6 +2221,8 @@ class OmniScheduler:
                 if self.session_bridge is not None:
                     self.resolve_pending_async()
                     self.session_bridge.shutdown()
+                else:
+                    pass
             finally:
                 self.emit_remaining_model_path_ends(status=model_path_status)
                 self._scheduler_thread_id = None
@@ -2226,6 +2246,8 @@ class OmniScheduler:
         else:
             if self.session_bridge is not None:
                 self.session_bridge.shutdown()
+            else:
+                pass
             self.discard_pending_request_admissions()
             self.shutdown_resources()
 
@@ -2260,12 +2282,18 @@ class OmniScheduler:
             ):
                 self.inbox.put(IncomingMessage(request_id=request_id, type="abort"))
                 return
+            else:
+                pass
             if (
                 request_id != bridge.cancelling_request_id
                 and self.active_session_unit(request_id) is not None
             ):
                 bridge.cancel(request_id)
                 return
+            else:
+                pass
+        else:
+            pass
         with self._request_admission_lock:
             if request_id not in self._aborted_request_ids:
                 if len(self._aborted_request_ids) >= _ABORTED_REQUEST_ID_LIMIT:
@@ -2541,6 +2569,8 @@ class OmniScheduler:
                 "success": False,
                 "message": "close retained sessions before updating weights",
             }
+        else:
+            pass
         keep_pause = bool(payload.get("keep_pause", False))
         keep_engine_paused = keep_pause
         with self.admin_lock:
@@ -3006,6 +3036,8 @@ class OmniScheduler:
         pending_decode = self._async_pending
         if pending_decode is not None:
             pending_decode.device_step.event.synchronize()
+        else:
+            pass
 
     def wait_async_device(self, batch: ScheduleBatch, device_step: PendingStep) -> None:
         device_steps = [device_step]
@@ -3020,6 +3052,8 @@ class OmniScheduler:
         ):
             # note (Junnan Li): Prior-result collection may trim KV still used by the current step.
             device_steps.append(pending_decode.device_step)
+        else:
+            pass
         for launched_step in device_steps:
             launched_step.event.synchronize()
 
@@ -3042,6 +3076,8 @@ class OmniScheduler:
         """
         if self.session_bridge is not None and not is_device_ready:
             self.wait_async_device(batch, pending_step)
+        else:
+            pass
         # A request retracted at step S is still in step S+1's lagged batch;
         # drop it like a prior-step finish so its KV is not re-freed.
         pre_finished = [r.finished() or r.is_retracted for r in batch.reqs]
@@ -3099,12 +3135,16 @@ class OmniScheduler:
                     None,
                 )
                 self.process_owned_async(pending_decode)
+            else:
+                pass
             if self._async_pending is not None:
                 self.wait_async_device(
                     self._async_pending.batch, self._async_pending.device_step
                 )
                 pending_decode, self._async_pending = self._async_pending, None
                 self.process_owned_async(pending_decode)
+            else:
+                pass
         elif self._async_pending is None:
             return
         else:
@@ -3399,6 +3439,8 @@ class OmniScheduler:
         bridge = self.session_bridge
         if bridge is not None:
             bridge.complete(request_id)
+        else:
+            pass
         with self._request_admission_lock:
             detach_request_data(req)
             self.remember_completed_request(request_id)
