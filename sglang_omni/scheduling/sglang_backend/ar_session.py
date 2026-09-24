@@ -302,9 +302,9 @@ class ARSessionBridge:
                         self.bridge_scheduler.chunked_req = None
                     else:
                         pass
-                    if session_request._omni_data is not None:
+                    if session_request.omni_data is not None:
                         self.bridge_scheduler.run_abort_callback(request_id)
-                        session_request._omni_data = None
+                        session_request.omni_data = None
                     else:
                         pass
                 self.release_append_unit(request_id)

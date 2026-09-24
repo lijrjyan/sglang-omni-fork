@@ -125,7 +125,7 @@ def compact_decode_input_history(data: ARRequestData) -> None:
 
 def detach_request_data(req: Any) -> None:
     """Break Req -> data; async snapshots retain the one-way data -> Req edge."""
-    req._omni_data = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    req.omni_data = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
 
 
 class NoOpSender:
@@ -1538,7 +1538,7 @@ class OmniScheduler:
                 time.perf_counter()
             )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             req._omni_terminal_claimed = False  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            req._omni_data = req_data  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            req.omni_data = req_data  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             self.waiting_queue.append(req)
             enqueued_unit = self.active_session_unit(req_id)
             if enqueued_unit is not None:
@@ -1812,7 +1812,7 @@ class OmniScheduler:
 
         sched_reqs = [
             SchedulerRequest(
-                request_id=req.rid, data=req._omni_data
+                request_id=req.rid, data=req.omni_data
             )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             for req in batch.reqs
         ]
@@ -2040,7 +2040,7 @@ class OmniScheduler:
                     else:
                         pass
                     data = (
-                        req._omni_data
+                        req.omni_data
                     )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
                     if data is None:
                         logger.error(
@@ -2768,7 +2768,7 @@ class OmniScheduler:
     def _add_request_to_queue(self, req: Any, is_retracted: bool = False) -> None:
         if req.is_retracted:
             compact_decode_input_history(
-                req._omni_data
+                req.omni_data
             )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         else:
             pass
@@ -2847,7 +2847,7 @@ class OmniScheduler:
                 ):  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
                     # stream_output already owns final cleanup for this request.
                     if (
-                        req._omni_data is not None
+                        req.omni_data is not None
                     ):  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
                         marked = True
                     else:
@@ -3423,14 +3423,14 @@ class OmniScheduler:
             for req in batch.reqs:
                 if req.rid == request_id:
                     return (
-                        req._omni_data
+                        req.omni_data
                     )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
                 else:
                     pass
         for req in self.waiting_queue:
             if req.rid == request_id:
                 return (
-                    req._omni_data
+                    req.omni_data
                 )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             else:
                 pass

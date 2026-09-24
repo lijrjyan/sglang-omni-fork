@@ -1045,7 +1045,7 @@ def test_process_input_requests_builds_at_one_chunk_under_topology() -> None:
         return SGLangARRequestData(
             req=SimpleNamespace(
                 rid=payload.request_id,
-                _omni_data=None,
+                omni_data=None,
                 origin_input_ids=origin_input_ids,
                 origin_input_ids_unpadded=origin_input_ids,
                 sampling_params=SimpleNamespace(max_new_tokens=0),
@@ -1429,7 +1429,7 @@ def test_process_input_requests_partial_build_state_machine() -> None:
         req_data = SGLangARRequestData(
             req=SimpleNamespace(
                 rid=payload.request_id,
-                _omni_data=None,
+                omni_data=None,
                 origin_input_ids=origin_input_ids,
                 origin_input_ids_unpadded=origin_input_ids,
                 sampling_params=SimpleNamespace(max_new_tokens=0),
@@ -1462,7 +1462,7 @@ def test_process_input_requests_partial_build_state_machine() -> None:
     OmniScheduler.process_input_requests(scheduler, [payload])
 
     assert scheduler.waiting_queue, "request must have been built and enqueued"
-    built = scheduler.waiting_queue[0]._omni_data
+    built = scheduler.waiting_queue[0].omni_data
     assert built._captured_thinker_done is False
     assert "rid-partial-1" not in scheduler.deferred_request_payloads
     assert "rid-partial-1" not in scheduler.pending_stream_ingress
