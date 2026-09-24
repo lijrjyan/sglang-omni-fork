@@ -20,9 +20,6 @@ import sglang.srt.managers.scheduler as sglang_scheduler_module
 import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.observability.scheduler_stage_metrics import (
-    SchedulerStageMetricsRecorder,
-)
 from sglang.srt.runtime_context import get_context
 
 from sglang_omni.admission import QueueFullError
@@ -36,6 +33,13 @@ from sglang_omni.scheduling.stage_cache import StageOutputCache
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from sglang_omni.scheduling.types import ModelRunnerOutput
 from tests.unit_test.pipeline.helpers import run_scheduler
+
+
+class SchedulerStageMetricsRecorder:
+    """Stand-in for the upstream recorder this SGLang build does not ship."""
+
+    def __init__(self, enabled: bool = False) -> None:
+        self.enabled = enabled
 
 
 @pytest.fixture(autouse=True)

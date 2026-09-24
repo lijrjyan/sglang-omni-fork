@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -25,15 +27,23 @@ def create_tree_cache(
 
     Disabling radix selects ChunkCache; streaming may wrap that base cache.
     """
-    params = CacheInitParams(
-        disable=get_memory().disable_radix_cache,
-        req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        page_size=page_size,
-        chunked_prefill_size=get_schedule().chunked_prefill_size,
-        eviction_policy=get_memory().radix_eviction_policy,
-        eviction_policy_config=get_memory().radix_eviction_policy_config,
-    )
+    cache_init_arguments = {
+        "disable": get_memory().disable_radix_cache,
+        "req_to_token_pool": req_to_token_pool,
+        "token_to_kv_pool_allocator": token_to_kv_pool_allocator,
+        "page_size": page_size,
+        "chunked_prefill_size": get_schedule().chunked_prefill_size,
+        "eviction_policy": get_memory().radix_eviction_policy,
+    }
+    if "eviction_policy_config" in {
+        field.name for field in dataclasses.fields(CacheInitParams)
+    }:
+        cache_init_arguments["eviction_policy_config"] = (
+            get_memory().radix_eviction_policy_config
+        )
+    else:
+        pass
+    params = CacheInitParams(**cache_init_arguments)
 
     if get_memory().disable_radix_cache:
         cache: BasePrefixCache = ChunkCache(params)

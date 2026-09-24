@@ -92,6 +92,14 @@ _PENDING_STREAM_REQUEST_RETAINED = 5000
 _IDLE_WAIT_S = 0.02
 
 
+@dataclass(frozen=True, kw_only=True)
+class RequestTimeoutAbort:
+    """One request the scheduler clock says has run too long."""
+
+    rid: str
+    abort_message: str
+
+
 @dataclass(kw_only=True)
 class PendingDecode:
     """Launched decode batch and the state needed to collect its result."""
@@ -897,15 +905,57 @@ class OmniScheduler:
             gpu_id=self.gpu_id,
         )
 
+    def poll_request_timeout_aborts(self) -> tuple[RequestTimeoutAbort, ...]:
+        now = time.perf_counter()
+        timeout_aborts: list[RequestTimeoutAbort] = []
+        waiting_timeout_s = envs.SGLANG_REQ_WAITING_TIMEOUT.get()
+        if waiting_timeout_s > 0:
+            waiting_deadline = now - waiting_timeout_s
+            for queued_request in self.waiting_queue:
+                entry_time = queued_request.time_stats.wait_queue_entry_time
+                if 0 < entry_time < waiting_deadline:
+                    timeout_aborts.append(
+                        RequestTimeoutAbort(
+                            rid=queued_request.rid,
+                            abort_message="Request waiting timeout reached.",
+                        )
+                    )
+                else:
+                    pass
+        else:
+            pass
+        running_timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+        if running_timeout_s > 0:
+            running_deadline = now - running_timeout_s
+            running_batch = self.running_batch
+            if running_batch is not None:
+                for running_request in running_batch.reqs:
+                    entry_time = running_request.time_stats.forward_entry_time
+                    if (
+                        0 < entry_time < running_deadline
+                        and not running_request.finished()
+                    ):
+                        timeout_aborts.append(
+                            RequestTimeoutAbort(
+                                rid=running_request.rid,
+                                abort_message="Request running timeout reached.",
+                            )
+                        )
+                    else:
+                        pass
+            else:
+                pass
+        else:
+            pass
+        return tuple(timeout_aborts)
+
     def recv_requests(self):
         """Drain inbox on rank 0 and broadcast scheduler inputs to TP followers."""
         if self.is_entry_rank:
             # note (ratish): only this rank reads the clock. The failed request
             # makes the coordinator broadcast an abort, which reaches followers
             # the way every other abort does.
-            for (
-                timeout_abort
-            ) in self._poll_timeout_aborts():  # noqa: leading-underscore
+            for timeout_abort in self.poll_request_timeout_aborts():
                 if timeout_abort.rid in self.aborted_request_ids:
                     continue
                 else:

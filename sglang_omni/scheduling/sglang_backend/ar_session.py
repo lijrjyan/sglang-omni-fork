@@ -25,7 +25,6 @@ from sglang_omni.proto.session import (
     find_session_operation,
 )
 from sglang_omni.scheduling.message import OutgoingMessage
-from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import RequestOutput
 
