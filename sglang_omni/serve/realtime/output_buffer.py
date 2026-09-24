@@ -51,6 +51,8 @@ class OutputBuffer:
             or self.output_bytes + size > self.limits.max_output_bytes
         ):
             raise RuntimeError("outbound event budget exhausted")
+        else:
+            pass
         self.output.append((envelope, size))
         self.output_bytes += size
         self.output_wake.set()
@@ -69,13 +71,21 @@ class OutputBuffer:
         ) or output_modalities
         if isinstance(event, (AudioDelta, AudioFinished)) and "audio" not in modalities:
             return
+        else:
+            pass
         if isinstance(event, ResponseFinished) and "audio" not in modalities:
             event = replace(event, include_audio=False)
+        else:
+            pass
         if isinstance(event, ResponseStarted):
             if response_id in self.responses:
                 raise RuntimeError("duplicate response creation")
+            else:
+                pass
             if len(self.responses) >= self.limits.max_output_events:
                 raise RuntimeError("unfinished response budget exhausted")
+            else:
+                pass
             self.responses[event.response_id] = ResponseState(
                 output_modalities=modalities,
                 terminal=False,
@@ -96,10 +106,16 @@ class OutputBuffer:
             state = self.responses.get(event.response_id)
             if state is None:
                 raise RuntimeError("response output precedes creation")
+            else:
+                pass
             if state.terminal:
                 return
+            else:
+                pass
             if state.item_id and event.item_id != state.item_id:
                 raise RuntimeError("only one message item per response is supported")
+            else:
+                pass
             state.item_id = event.item_id
             if isinstance(event, (TextDelta, TextFinished)):
                 text = (
@@ -109,13 +125,25 @@ class OutputBuffer:
                 )
                 if len(text) > self.limits.max_history_chars:
                     raise ContextLimitError("response text context limit")
+                else:
+                    pass
                 state.text = text
+            else:
+                pass
             if isinstance(event, AudioDelta):
                 if len(event.pcm) % 2:
                     raise RuntimeError("producer emitted invalid PCM16")
+                else:
+                    pass
                 state.audio = True
+            else:
+                pass
             if isinstance(event, ResponseFinished):
                 state.terminal = True
+            else:
+                pass
+        else:
+            pass
         self.enqueue(
             Envelope(
                 event,
@@ -134,14 +162,20 @@ class OutputBuffer:
             elif not state.visible:
                 self.responses.pop(response_id)
                 continue
+            else:
+                pass
             state.terminal = True
             state.close_terminals_queued = True
             item_id = state.item_id or "item_" + response_id
             events: list[OutputEvent] = []
             if not state.text_done_sent and state.output_modalities:
                 events.append(TextFinished(response_id, item_id, state.text))
+            else:
+                pass
             if state.audio_visible and not state.audio_done_sent:
                 events.append(AudioFinished(response_id, item_id))
+            else:
+                pass
             events.append(
                 ResponseFinished(
                     response_id,
@@ -174,8 +208,12 @@ class OutputBuffer:
             self.responses[event.response_id].text_done_sent = True
         elif isinstance(event, AudioFinished):
             self.responses[event.response_id].audio_done_sent = True
+        else:
+            pass
         if isinstance(event, AudioDelta):
             self.responses[event.response_id].audio_visible = True
+        else:
+            pass
 
     def sent(self, envelope: Envelope) -> None:
         event = envelope.event
@@ -183,6 +221,8 @@ class OutputBuffer:
             self.responses.pop(event.response_id)
         elif isinstance(event, Closed):
             self.responses.clear()
+        else:
+            pass
 
     def terminal(self, event: Failure | Closed) -> None:
         # Note (Junnan Li): Terminal notifications must remain deliverable after media overflow.

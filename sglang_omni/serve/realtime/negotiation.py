@@ -58,17 +58,27 @@ class SessionNegotiation:
 
             if frozen(candidate) != frozen(current):
                 raise ProtocolError("invalid_state", "session field is frozen")
+            else:
+                pass
+        else:
+            pass
         if "instructions" in candidate and (
             len(candidate["instructions"]) > self.limits.max_history_chars
         ):
             raise ProtocolError(
                 "invalid_request", "instructions exceed context or have invalid type"
             )
+        else:
+            pass
         if candidate.get("model", self.model) != self.model:
             raise ProtocolError("invalid_request", "model differs from deployment")
+        else:
+            pass
         session_type = candidate.get("type", "realtime")
         if session_type != "realtime":
             raise ProtocolError("invalid_request", "session type is unavailable")
+        else:
+            pass
         self.validate_audio(candidate)
         requested = candidate.get(
             "output_modalities", list(self.capabilities.output_modalities)
@@ -76,6 +86,8 @@ class SessionNegotiation:
         outputs = [x for x in requested if x in self.capabilities.output_modalities][:1]
         if not outputs:
             raise ProtocolError("invalid_request", "no supported output combination")
+        else:
+            pass
         micro = self.validate_extension(candidate)
         return self.grant(candidate, session_type, requested, outputs, micro)
 
@@ -101,10 +113,14 @@ class SessionNegotiation:
                     "unsupported PCM format or sample rate",
                     f"session.audio.{direction}.format",
                 )
+            else:
+                pass
         if audio.get("input", {}).get("turn_detection") is not None:
             raise ProtocolError(
                 "not_applicable", "VAD is only available for turn-based sessions"
             )
+        else:
+            pass
 
     def validate_extension(self, candidate: SessionConfiguration) -> float | None:
         extension = candidate.get("sglang", {})
@@ -113,12 +129,16 @@ class SessionNegotiation:
             != self.capabilities.tail_policy
         ):
             raise ProtocolError("invalid_request", "tail policy is unavailable")
+        else:
+            pass
         timebase = extension.get("timebase", {})
         if (
             timebase.get("native_unit_ms", self.capabilities.native_unit_ms)
             != self.capabilities.native_unit_ms
         ):
             raise ProtocolError("invalid_request", "native cadence is fixed")
+        else:
+            pass
         micro = timebase.get("microturn_ms")
         return micro
 
@@ -147,6 +167,8 @@ class SessionNegotiation:
                     granted=None,
                 )
             )
+        else:
+            pass
         grant["microturn_ms"] = None
         if outputs != requested:
             grant["rejections"].append(
@@ -157,6 +179,8 @@ class SessionNegotiation:
                     granted=outputs,
                 )
             )
+        else:
+            pass
         audio = candidate.setdefault("audio", {})
         audio.setdefault("input", {}).setdefault(
             "format", dict(type="audio/pcm", rate=self.capabilities.input_rate)

@@ -125,11 +125,15 @@ class SessionRuntime:
     def require_open(self) -> None:
         if self.state != "OPEN":
             raise ProtocolError("invalid_state", "session is not OPEN")
+        else:
+            pass
 
     async def update(self, patch: object, event_id: str) -> None:
         async with self.lock:
             if self.state not in ("CREATED", "OPEN"):
                 raise ProtocolError("invalid_state", "session is closing")
+            else:
+                pass
             candidate, grant = self.negotiation.negotiate(
                 self.config, self.state, patch
             )
@@ -157,8 +161,12 @@ class SessionRuntime:
                 if self.close_task is not None:
                     # Note (Junnan Li): Admission cleanup belongs to the closing owner; do not publish OPEN here.
                     return
+                else:
+                    pass
                 self.state = "OPEN"
                 self.worker = asyncio.create_task(self.pump())
+            else:
+                pass
             self.config, self.granted = candidate, grant
             self.notify(
                 Updated(
@@ -178,12 +186,18 @@ class SessionRuntime:
             self.require_open()
             if self.eos:
                 raise ProtocolError("invalid_state", "audio input has ended")
+            else:
+                pass
             if sequence != self.next_seq:
                 raise ProtocolError("invalid_state", "audio seq must be contiguous")
+            else:
+                pass
             if not pcm or len(pcm) % 2:
                 raise ProtocolError(
                     "invalid_request", "audio must contain whole PCM16 samples"
                 )
+            else:
+                pass
             if start_ms is not None and not math.isclose(
                 start_ms,
                 self.ms(self.accepted_samples),
@@ -193,12 +207,16 @@ class SessionRuntime:
                 raise ProtocolError(
                     "invalid_state", "input media time must be sample-contiguous"
                 )
+            else:
+                pass
             if (
                 self.accepted_samples - self.consumed_samples - self.discarded_samples
             ) * 2 + len(pcm) > self.limits.max_input_bytes:
                 raise ProtocolError(
                     "buffer_overflow", "input budget exhausted; retry this seq"
                 )
+            else:
+                pass
             self.pending.extend(pcm)
             self.accepted_samples += len(pcm) // 2
             self.next_seq += 1
@@ -220,6 +238,8 @@ class SessionRuntime:
             self.require_open()
             if self.eos:
                 raise ProtocolError("invalid_state", "audio input already ended")
+            else:
+                pass
             unit_bytes = (
                 self.capabilities.input_rate
                 * self.capabilities.native_unit_ms
@@ -233,6 +253,8 @@ class SessionRuntime:
                 raise ProtocolError(
                     "invalid_state", "partial native unit; append more audio before EOS"
                 )
+            else:
+                pass
             self.eos = True
             self.eos_event_id = event_id
             self.notify(
@@ -256,8 +278,12 @@ class SessionRuntime:
                     self.wake.clear()
                     if self.state != "OPEN":
                         return
+                    else:
+                        pass
                     if len(self.pending) < unit_bytes and not self.eos:
                         continue
+                    else:
+                        pass
                     size = min(unit_bytes, len(self.pending))
                     start = self.accepted_samples - len(self.pending) // 2
                     pcm = bytes(self.pending[:size])
@@ -271,6 +297,8 @@ class SessionRuntime:
                     ):
                         self.padding_samples += (unit_bytes - size) // 2
                         pcm += b"\0" * (unit_bytes - size)
+                    else:
+                        pass
                     unit = Unit(
                         self.unit_seq,
                         start,
@@ -297,15 +325,21 @@ class SessionRuntime:
                     raise RuntimeError(
                         "adapter did not provide valid media consumption"
                     )
+                else:
+                    pass
                 self.consumed_samples += consumed
                 self.discarded_samples += discarded
                 if self.close_task is None:
                     self.output_buffer.enqueue(
                         Envelope(UnitCompleted(f"unit_{unit.seq}"), unit=unit)
                     )
+                else:
+                    pass
                 if eos:
                     if self.close_task is not None:
                         return
+                    else:
+                        pass
                     assert self.eos_event_id is not None
                     self.notify(
                         Drained(
@@ -317,6 +351,8 @@ class SessionRuntime:
                         )
                     )
                     return
+                else:
+                    pass
                 self.wake.set()
         except asyncio.CancelledError:
             raise
@@ -334,10 +370,14 @@ class SessionRuntime:
                 Failure(code, message[:MAX_FAILURE_MESSAGE_CHARS], True, event_id)
             )
             self.close_task = asyncio.create_task(self.run_close(code))
+        else:
+            pass
 
     async def close(self, reason: str, event_id: str | None = None) -> None:
         if self.close_task is None:
             self.close_task = asyncio.create_task(self.run_close(reason, event_id))
+        else:
+            pass
         await asyncio.shield(self.close_task)
 
     async def run_close(self, reason: str, event_id: str | None = None) -> None:
@@ -357,6 +397,8 @@ class SessionRuntime:
                 await asyncio.wait_for(
                     self.adapter.close(), self.limits.cleanup_timeout_s
                 )
+            else:
+                pass
         except Exception as exc:
             cleanup_error = exc
         finally:

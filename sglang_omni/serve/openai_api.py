@@ -1386,6 +1386,9 @@ def register_realtime(app: FastAPI) -> None:
                     "limits": asdict(deployment.limits),
                 }
 
+    else:
+        pass
+
     @app.websocket("/v1/realtime")
     async def realtime(websocket: WebSocket) -> None:
         if deployment is not None and len(manager.sessions) >= (

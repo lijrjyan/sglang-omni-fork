@@ -40,6 +40,8 @@ class RuntimeLimits:
     def __post_init__(self) -> None:
         if any(not math.isfinite(v) or v <= 0 for v in asdict(self).values()):
             raise ValueError("runtime limits must be finite and positive")
+        else:
+            pass
 
 
 @dataclass(frozen=True)
@@ -55,17 +57,27 @@ class Capabilities:
     def __post_init__(self) -> None:
         if self.interaction != "native":
             raise ValueError("unsupported interaction")
+        else:
+            pass
         if self.input_rate <= 0 or self.output_rate <= 0 or self.native_unit_ms <= 0:
             raise ValueError("positive rates and cadence required")
+        else:
+            pass
         if self.input_rate * self.native_unit_ms % 1000:
             raise ValueError("native cadence must contain whole samples")
+        else:
+            pass
         if self.tail_policy not in ("flush", "pad", "reject"):
             raise ValueError("unsupported tail policy")
+        else:
+            pass
         if not self.output_modalities or set(self.output_modalities) - {
             "text",
             "audio",
         }:
             raise ValueError("unsupported output modalities")
+        else:
+            pass
 
     def describe(self) -> GrantedCapabilities:
         return dict(

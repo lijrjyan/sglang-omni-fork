@@ -56,6 +56,8 @@ class SharedRealtimeSession:
                     result = task.result()
                     if task is reader and result == "disconnect":
                         disconnected = True
+                    else:
+                        pass
                 except WebSocketDisconnect:
                     disconnected = True
         finally:
@@ -67,6 +69,8 @@ class SharedRealtimeSession:
                     )
                 except (asyncio.TimeoutError, WebSocketDisconnect):
                     pass
+            else:
+                pass
             for task in (reader, sender):
                 task.cancel()
             await asyncio.gather(reader, sender, return_exceptions=True)
@@ -114,6 +118,8 @@ class SharedRealtimeSession:
                         ),
                     }
                 )
+            else:
+                pass
             self.runtime.output_buffer.before_send(envelope)
             await self.websocket.send_text(json.dumps(event, allow_nan=False))
             self.runtime.output_buffer.sent(envelope)
@@ -124,12 +130,16 @@ class SharedRealtimeSession:
             message = await self.websocket.receive()
             if message["type"] == "websocket.disconnect":
                 return "disconnect"
+            else:
+                pass
             event_id = None
             try:
                 if message.get("bytes") is not None:
                     raise ProtocolError(
                         "invalid_request", "binary frames are unsupported"
                     )
+                else:
+                    pass
                 try:
                     raw = json.loads(
                         message.get("text", ""),
@@ -145,6 +155,8 @@ class SharedRealtimeSession:
                     or not 0 < len(event_id) <= MAX_EVENT_ID_LENGTH
                 ):
                     event_id = None
+                else:
+                    pass
                 await self.dispatch(raw)
             except ProtocolError as exc:
                 try:
@@ -181,6 +193,8 @@ class SharedRealtimeSession:
                 raise ProtocolError(
                     "buffer_overflow", "encoded audio exceeds input budget"
                 )
+            else:
+                pass
             try:
                 pcm = base64.b64decode(event.audio, validate=True)
             except (ValueError, binascii.Error) as exc:

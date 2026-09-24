@@ -32,6 +32,8 @@ class RealtimeDeployment:
     def __post_init__(self) -> None:
         if type(self.max_connections) is not int or self.max_connections < 1:
             raise ValueError("max_connections must be a positive integer")
+        else:
+            pass
 
 
 logger = logging.getLogger(__name__)

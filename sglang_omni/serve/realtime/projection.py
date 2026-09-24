@@ -146,6 +146,8 @@ def project_output(
             content = [dict(type="output_text", text=event.text)]
         if event.include_audio:
             content.append(dict(type="output_audio", transcript=event.text))
+        else:
+            pass
         return dict(
             type="response.done",
             response=dict(
@@ -190,6 +192,8 @@ def project_output(
                 result["transcript"] = event.text
             else:
                 result["text"] = event.text
+        else:
+            pass
         return result
     elif isinstance(event, TurnFailure):
         return dict(

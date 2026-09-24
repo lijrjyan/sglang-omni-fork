@@ -18,11 +18,17 @@ async def cancel_local_tasks(
     for _ in range(2):
         if not pending:
             break
+        else:
+            pass
         for task in pending:
             task.cancel()
         _, pending = await asyncio.wait(pending, timeout=timeout)
     done = local_tasks - pending
     if done:
         await asyncio.gather(*done, return_exceptions=True)
+    else:
+        pass
     if pending:
         raise RuntimeError("local realtime task did not acknowledge cancellation")
+    else:
+        pass

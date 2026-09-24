@@ -52,6 +52,8 @@ class CoordinatorAdapter(InteractionAdapter):
     ) -> None:
         if not atomic_consumption:
             raise ValueError("a producer atomic-consumption contract is required")
+        else:
+            pass
         self.client = client
         self.stages = stages
         self.request_builder = request_builder
@@ -97,6 +99,8 @@ class CoordinatorAdapter(InteractionAdapter):
             async for output in self.client.session_outputs(self.session_identity):
                 if self.active_unit is None or output.input_seq != self.active_unit.seq:
                     continue
+                else:
+                    pass
                 if output.kind == "input_done":
                     for event in self.output_events:
                         await self.output_sink(event, self.active_unit)
@@ -107,6 +111,8 @@ class CoordinatorAdapter(InteractionAdapter):
                         and not self.unit_completion.done()
                     ):
                         self.unit_completion.set_result(self.active_unit.real_samples)
+                    else:
+                        pass
                 else:
                     for event in self.output_converter(output):
                         size = len(repr(event).encode())
@@ -115,10 +121,14 @@ class CoordinatorAdapter(InteractionAdapter):
                             or self.output_bytes + size > self.limits.max_output_bytes
                         ):
                             raise RuntimeError("native unit output budget exhausted")
+                        else:
+                            pass
                         self.output_events.append(event)
                         self.output_bytes += size
             if not self.is_closing:
                 raise RuntimeError("session output stream closed")
+            else:
+                pass
         except Exception as exc:
             logger.exception("Realtime session output reader failed")
             self.reader_error = exc
@@ -133,6 +143,8 @@ class CoordinatorAdapter(InteractionAdapter):
         assert self.session_identity is not None and self.input_rate is not None
         if self.reader_error is not None:
             raise self.reader_error
+        else:
+            pass
         self.active_unit = unit
         self.unit_completion = asyncio.get_running_loop().create_future()
         chunk = TimedChunk(
@@ -158,5 +170,7 @@ class CoordinatorAdapter(InteractionAdapter):
         try:
             if self.session_identity is not None:
                 await self.client.close_session(self.session_identity)
+            else:
+                pass
         finally:
             await cancel_local_tasks([self.output_reader], self.local_cleanup_timeout)
