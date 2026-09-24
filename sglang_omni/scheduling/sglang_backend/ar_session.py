@@ -322,11 +322,11 @@ class ARSessionBridge:
         retained_kv_tokens = slot.kv.kv_allocated_len if slot is not None else 0
         free_request_slots = self.bridge_scheduler.req_to_token_pool.free_slots
         unallocated_request_count = sum(
-            other_unit is not unit
-            and other_unit.session_request is not None
-            and not other_unit.session_request.kv.holds_kv
-            and other_unit.session_identity.id not in cache.slots
-            for other_unit in self.units_by_request_id.values()
+            active_append_unit is not unit
+            and active_append_unit.session_request is not None
+            and not active_append_unit.session_request.kv.holds_kv
+            and active_append_unit.session_identity.id not in cache.slots
+            for active_append_unit in self.units_by_request_id.values()
         )
         if (
             not retained_kv_tokens
@@ -343,17 +343,23 @@ class ARSessionBridge:
                 session_request.sampling_params.max_new_tokens or 0
             )
             reserved_kv_tokens = 0
-            for other_unit in self.units_by_request_id.values():
-                if other_unit is unit or other_unit.session_request is None:
+            for active_append_unit in self.units_by_request_id.values():
+                if (
+                    active_append_unit is unit
+                    or active_append_unit.session_request is None
+                ):
                     continue
-                other_session_request = other_unit.session_request
-                allocated_kv_tokens = other_session_request.kv.kv_allocated_len
-                reserved_kv_tokens += max(
-                    0,
-                    len(other_session_request.origin_input_ids)
-                    + int(other_session_request.sampling_params.max_new_tokens or 0)
-                    - allocated_kv_tokens,
-                )
+                else:
+                    active_session_request = active_append_unit.session_request
+                    allocated_kv_tokens = active_session_request.kv.kv_allocated_len
+                    reserved_kv_tokens += max(
+                        0,
+                        len(active_session_request.origin_input_ids)
+                        + int(
+                            active_session_request.sampling_params.max_new_tokens or 0
+                        )
+                        - allocated_kv_tokens,
+                    )
             available_kv_tokens = (
                 self.bridge_scheduler.token_to_kv_pool_allocator.available_size()
                 + cache.evictable_size()
