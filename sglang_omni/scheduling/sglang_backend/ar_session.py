@@ -254,7 +254,7 @@ class ARSessionBridge:
                 session_request.logprob_start_len = adapter_request.logprob_start_len
                 session_request._omni_prompt_cache_key = getattr(
                     adapter_request, "_omni_prompt_cache_key", None
-                )
+                ) # noqa: leading-underscore
                 request_data.req = session_request
                 request_data.stage_payload = payload
 
