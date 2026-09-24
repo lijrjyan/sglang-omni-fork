@@ -236,8 +236,10 @@ class FunCosyVoice3MlxModelRunner:
         from sglang.srt.hardware_backend.mlx.model_runner import MlxPendingDecode
 
         req_id = req_ids[0]
-        cache = self.req_caches[req_id]
-        input_ids = mx.array([[self.req_token_ids[req_id][-1]]], dtype=mx.int32)
+        cache = self._req_caches[req_id]  # noqa: leading-underscore
+        input_ids = mx.array(
+            [[self._req_token_ids[req_id][-1]]], dtype=mx.int32
+        )  # noqa: leading-underscore
         logits = self._decode_with_native_cache(
             [cache], [input_ids]
         )  # noqa: leading-underscore

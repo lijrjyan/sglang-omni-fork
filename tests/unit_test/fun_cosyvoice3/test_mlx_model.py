@@ -99,7 +99,7 @@ def test_runner_masks_controls_and_penalizes_each_repeated_id_once() -> None:
     speech_ids = mx.arange(SPEECH_TOKEN_SIZE, dtype=mx.int32)
     runner.cosyvoice3_seen_masks = {"req": (speech_ids == 5) | (speech_ids == 6)}
     runner._first_attention_cache = lambda cache: SimpleNamespace(offset=5)
-    runner.req_token_ids = {"req": [0, 0, 5, 5, 6]}
+    runner._req_token_ids = {"req": [0, 0, 5, 5, 6]}  # noqa: leading-underscore
 
     raw_logits = np.zeros((1, TOTAL_VOCAB_SIZE), dtype=np.float32)
     raw_logits[0, 5] = 4.0
