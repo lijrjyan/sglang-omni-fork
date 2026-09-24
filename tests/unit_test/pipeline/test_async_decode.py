@@ -740,7 +740,7 @@ def _drive_loop(seq, min_bs=2):
     events = []
     s = _new_scheduler_for_async_loop()
     s.running = True
-    s.engine_paused = False
+    s._engine_paused = False
     s.async_pending = None
     s.async_decode_min_batch_size = min_bs
     s.cur_batch = None
@@ -1001,7 +1001,7 @@ def test_fast_path_does_not_double_free_req_finished_by_drain():
 
     s = _new_scheduler_for_async_loop()
     s.running = True
-    s.engine_paused = False
+    s._engine_paused = False
     s.async_pending = None
     s.async_decode_min_batch_size = 2
     s.cur_batch = None
@@ -1061,7 +1061,7 @@ def test_fast_path_does_not_double_free_req_finished_by_drain():
 def _scaffold_async_loop(*, async_pending=None):
     s = _new_scheduler_for_async_loop()
     s.running = True
-    s.engine_paused = False
+    s._engine_paused = False
     s.async_pending = async_pending
     s.async_decode_min_batch_size = 2
     s.cur_batch = None

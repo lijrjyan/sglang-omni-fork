@@ -167,7 +167,7 @@ def test_scheduler_idle_sleep_yields_to_pending_request_builds(
 def test_normal_event_loop_uses_request_build_aware_idle_sleep(monkeypatch) -> None:
     scheduler = object.__new__(OmniScheduler)
     scheduler.running = True
-    scheduler.engine_paused = False
+    scheduler._engine_paused = False
     scheduler.request_admission_lock = threading.RLock()
     scheduler.pending_request_builds = {"req": object()}
     scheduler.pending_request_admissions = {}
@@ -385,7 +385,7 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
     scheduler.waiting_queue = []
     scheduler.last_batch = None
     scheduler.forward_ct = 0
-    scheduler.sched_idled = False
+    scheduler._sched_idled = False
     scheduler.first_emit_done = set()
     scheduler.prefill_start_done = set()
     scheduler.prefill_end_done = set()
@@ -902,7 +902,7 @@ def test_omni_scheduler_custom_runner_stamps_upstream_launch_metadata() -> None:
     scheduler.prefill_start_done = set()
     scheduler.prefill_end_done = set()
     scheduler.forward_ct = 0
-    scheduler.sched_idled = True
+    scheduler._sched_idled = True
     scheduler.processed_tokens_counter = 0
 
     def _batch(extend_num_tokens: int | None):
@@ -2400,7 +2400,7 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
         monkeypatch, return_runtime_context=True
     )
 
-    assert scheduler.pending_chunked_abort_req is None
+    assert scheduler._pending_chunked_abort_req is None
     assert scheduler.new_token_ratio_tracker is not None
     assert scheduler.dp_attn_adapter is not None
     assert scheduler.pool_stats_observer is not None

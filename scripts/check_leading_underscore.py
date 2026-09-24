@@ -59,6 +59,10 @@ ALLOWED_DEFS: frozenset[tuple[str, str]] = frozenset(
         # torch.nn.Module._buffers
         ("sglang_omni/models/qwen3_tts/codec_state_arena.py", "_buffers"),
         # SGLang ModelRunner / Scheduler / cache / MLX hooks
+        ("sglang_omni/scheduling/omni_scheduler.py", "_engine_paused"),
+        ("sglang_omni/scheduling/omni_scheduler.py", "_pending_chunked_abort_req"),
+        ("sglang_omni/scheduling/omni_scheduler.py", "_prev_step"),
+        ("sglang_omni/scheduling/omni_scheduler.py", "_sched_idled"),
         ("sglang_omni/model_runner/sglang_model_runner.py", "_extend_forward_kwargs"),
         (
             "sglang_omni/model_runner/sglang_model_runner.py",
