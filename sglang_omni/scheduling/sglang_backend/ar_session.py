@@ -300,9 +300,13 @@ class ARSessionBridge:
                     # note (Junnan Li): Batch selection must filter rows and tensors together.
                     if self.bridge_scheduler.chunked_req is session_request:
                         self.bridge_scheduler.chunked_req = None
+                    else:
+                        pass
                     if session_request._omni_data is not None:
                         self.bridge_scheduler.run_abort_callback(request_id)
                         session_request._omni_data = None
+                    else:
+                        pass
                 self.release_append_unit(request_id)
         finally:
             self.cancelling_request_id = previous_cancelling_request_id
