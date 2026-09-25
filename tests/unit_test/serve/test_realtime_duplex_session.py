@@ -67,9 +67,11 @@ class ScriptedAdapter(InteractionAdapter):
 
     reply: list[OutputEvent] = field(default_factory=list)
     unconsumed_samples: int = 0
+    is_holding_input: bool = False
     open_error: str | None = None
     close_error: str | None = None
     units: list[Unit] = field(default_factory=list)
+    held_samples: int = 0
     output_sink: OutputSink | None = None
     is_closed: bool = False
 
@@ -81,12 +83,20 @@ class ScriptedAdapter(InteractionAdapter):
         else:
             self.output_sink = emit
 
-    async def process(self, unit: Unit) -> int:
+    async def process(self, unit: Unit) -> int | tuple[int, int]:
         assert self.output_sink is not None
         self.units.append(unit)
         for event in self.reply:
             await self.output_sink(event)
-        return max(unit.real_samples - self.unconsumed_samples, 0)
+        if self.is_holding_input:
+            self.held_samples += unit.real_samples
+            return 0, 0
+        else:
+            return max(unit.real_samples - self.unconsumed_samples, 0)
+
+    async def clear(self) -> int:
+        held_samples, self.held_samples = self.held_samples, 0
+        return held_samples
 
     async def close(self) -> None:
         self.is_closed = True
@@ -345,6 +355,21 @@ def test_cleared_audio_is_reported_as_discarded_media() -> None:
 
     assert cleared["sglang"]["discarded_ms"] == 10.0
     assert drained_media(drained) == (20.0, 10.0, 10.0, 0.0)
+
+
+def test_clear_discards_audio_held_by_the_adapter() -> None:
+    adapter = ScriptedAdapter(is_holding_input=True)
+    with build_test_client(adapter).websocket_connect("/v1/realtime") as websocket:
+        open_session(websocket)
+        append_audio(websocket, b"\1" * UNIT_BYTES, 0)
+        receive_until(websocket, "sglang.unit.done")
+        send_event(websocket, "input_audio_buffer.clear")
+        cleared = websocket.receive_json()
+        send_event(websocket, "sglang.input_audio.end")
+        drained = receive_until(websocket, "sglang.input_audio.drained")[-1]
+
+    assert cleared["sglang"]["discarded_ms"] == 20.0
+    assert drained_media(drained) == (20.0, 0.0, 20.0, 0.0)
 
 
 def test_partial_adapter_consumption_is_reported_as_discarded_media() -> None:
