@@ -6,34 +6,26 @@ import binascii
 import json
 import logging
 import uuid
-from typing import Literal
 
 from pydantic import ValidationError
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from sglang_omni.serve.realtime.control import (
-    Accepted,
-    Cleared,
-    Closed,
-    Created,
-    Drained,
-    Ended,
-    Failure,
-    UnitCompleted,
-    Updated,
-)
+from sglang_omni.serve.realtime.control import ControlEvent, Failure
 from sglang_omni.serve.realtime.projection import project_control, project_output
 from sglang_omni.serve.realtime.runtime import SessionRuntime
 from sglang_omni.serve.realtime.schema import (
     CLIENT_EVENT,
     MAX_EVENT_ID_LENGTH,
     AudioAppendEvent,
-    JsonObject,
     SessionUpdateEvent,
 )
 from sglang_omni.serve.realtime.types import ProtocolError
 
 logger = logging.getLogger(__name__)
+
+
+def reject_nonfinite_number(constant: str) -> float:
+    raise ValueError(f"nonfinite JSON number {constant}")
 
 
 class SharedRealtimeSession:
@@ -43,26 +35,23 @@ class SharedRealtimeSession:
         self.session_id = runtime.session_id
 
     async def run(self) -> None:
-        self.runtime.created()
+        self.runtime.notify_created()
         reader = asyncio.create_task(self.read())
         sender = asyncio.create_task(self.send())
-        disconnected = False
+        is_disconnected = False
         try:
-            done, _ = await asyncio.wait(
+            finished_tasks, _ = await asyncio.wait(
                 (reader, sender), return_when=asyncio.FIRST_COMPLETED
             )
-            for task in done:
+            for task in finished_tasks:
                 try:
-                    result = task.result()
-                    if task is reader and result == "disconnect":
-                        disconnected = True
-                    else:
-                        pass
+                    has_client_left = task.result() is True
                 except WebSocketDisconnect:
-                    disconnected = True
+                    has_client_left = True
+                is_disconnected = is_disconnected or has_client_left
         finally:
             await self.runtime.close("disconnect")
-            if not disconnected and not sender.done():
+            if not is_disconnected and not sender.done():
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(sender), self.runtime.limits.cleanup_timeout_s
@@ -80,59 +69,45 @@ class SharedRealtimeSession:
 
     async def send(self) -> None:
         async for envelope in self.runtime.outputs():
-            if isinstance(
-                envelope.event,
-                (
-                    Accepted,
-                    Cleared,
-                    Closed,
-                    Created,
-                    Drained,
-                    Ended,
-                    Failure,
-                    UnitCompleted,
-                    Updated,
-                ),
-            ):
-                event = project_control(envelope.event)
+            if isinstance(envelope.event, ControlEvent):
+                server_event = project_control(envelope.event)
             else:
-                event = project_output(
-                    envelope.event,
-                    output_modalities=(
-                        list(envelope.output_modalities)
-                        if envelope.output_modalities is not None
-                        else None
-                    ),
+                server_event = project_output(
+                    envelope.event, output_modalities=envelope.output_modalities
                 )
-            event["event_id"] = "evt_" + uuid.uuid4().hex
+            server_event["event_id"] = "evt_" + uuid.uuid4().hex
             if envelope.unit is not None:
                 unit = envelope.unit
-                metadata = event.setdefault("sglang", {})
-                metadata.update(
+                server_event.setdefault("sglang", {}).update(
                     {
-                        "unit_id": f"unit_{unit.seq}",
-                        "chunk_seq": envelope.chunk_seq,
+                        "unit_id": unit.unit_id,
+                        "chunk_seq": envelope.chunk_index,
                         "media_time": dict(
-                            t_start_ms=self.runtime.ms(unit.start_sample),
-                            duration_ms=self.runtime.ms(unit.real_samples),
+                            t_start_ms=self.runtime.capabilities.input_duration_ms(
+                                unit.start_sample
+                            ),
+                            duration_ms=self.runtime.capabilities.input_duration_ms(
+                                unit.real_samples
+                            ),
                         ),
                     }
                 )
             else:
                 pass
             self.runtime.output_buffer.before_send(envelope)
-            await self.websocket.send_text(json.dumps(event, allow_nan=False))
+            await self.websocket.send_text(json.dumps(server_event, allow_nan=False))
             self.runtime.output_buffer.sent(envelope)
         await self.websocket.close()
 
-    async def read(self) -> Literal["disconnect"] | None:
+    async def read(self) -> bool:
+        """Returns whether the client disconnected."""
         while self.runtime.state != "CLOSED":
             message = await self.websocket.receive()
             if message["type"] == "websocket.disconnect":
-                return "disconnect"
+                return True
             else:
                 pass
-            event_id = None
+            event_id: str | None = None
             try:
                 if message.get("bytes") is not None:
                     raise ProtocolError(
@@ -141,23 +116,23 @@ class SharedRealtimeSession:
                 else:
                     pass
                 try:
-                    raw = json.loads(
+                    raw_event = json.loads(
                         message.get("text", ""),
-                        parse_constant=lambda _: (_ for _ in ()).throw(
-                            ValueError("nonfinite JSON number")
-                        ),
+                        parse_constant=reject_nonfinite_number,
                     )
                 except (ValueError, TypeError) as exc:
                     raise ProtocolError("invalid_request", "invalid JSON") from exc
-                event_id = raw.get("event_id") if isinstance(raw, dict) else None
+                client_event_id = (
+                    raw_event.get("event_id") if isinstance(raw_event, dict) else None
+                )
                 if (
-                    not isinstance(event_id, str)
-                    or not 0 < len(event_id) <= MAX_EVENT_ID_LENGTH
+                    isinstance(client_event_id, str)
+                    and 0 < len(client_event_id) <= MAX_EVENT_ID_LENGTH
                 ):
-                    event_id = None
+                    event_id = client_event_id
                 else:
                     pass
-                await self.dispatch(raw)
+                await self.dispatch(raw_event)
             except ProtocolError as exc:
                 try:
                     self.runtime.notify(
@@ -165,17 +140,16 @@ class SharedRealtimeSession:
                     )
                 except RuntimeError:
                     self.runtime.fail("outbound event budget exhausted")
-                    return None
+                    return False
             except Exception as exc:
                 logger.exception(f"Realtime session {self.session_id} dispatch failed")
                 self.runtime.fail(str(exc), event_id=event_id)
-                return None
+                return False
+        return False
 
-        return None
-
-    async def dispatch(self, raw: JsonObject) -> None:
+    async def dispatch(self, raw_event: object) -> None:
         try:
-            event = CLIENT_EVENT.validate_python(raw)
+            event = CLIENT_EVENT.validate_python(raw_event)
         except ValidationError as exc:
             error = exc.errors()[0]
             code = (
@@ -189,7 +163,8 @@ class SharedRealtimeSession:
         if isinstance(event, SessionUpdateEvent):
             await self.runtime.update(event.session, event.event_id)
         elif isinstance(event, AudioAppendEvent):
-            if len(event.audio) > (self.runtime.limits.max_input_bytes + 2) // 3 * 4:
+            max_encoded_audio_chars = (self.runtime.limits.max_input_bytes + 2) // 3 * 4
+            if len(event.audio) > max_encoded_audio_chars:
                 raise ProtocolError(
                     "buffer_overflow", "encoded audio exceeds input budget"
                 )

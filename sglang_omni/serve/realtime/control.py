@@ -29,7 +29,7 @@ class Updated:
 
 @dataclass(frozen=True)
 class Accepted:
-    seq: int
+    sequence: int
     accepted_end_ms: float
     client_event_id: str
 
@@ -66,7 +66,7 @@ class Closed:
 class Failure:
     code: str
     message: str
-    fatal: bool
+    is_fatal: bool
     client_event_id: str | None = None
     param: str | None = None
 

@@ -11,6 +11,7 @@ from sglang_omni.serve.realtime.control import (
     Closed,
     ControlEvent,
     Created,
+    Drained,
     Ended,
     Failure,
     UnitCompleted,
@@ -127,7 +128,7 @@ class ServerEvent(TypedDict, total=False):
 def project_output(
     event: OutputEvent,
     *,
-    output_modalities: list[str] | None = None,
+    output_modalities: tuple[str, ...] | None = None,
 ) -> ServerEvent:
     if isinstance(event, ResponseStarted):
         return dict(
@@ -144,7 +145,7 @@ def project_output(
             content: list[ResponseContent] = []
         else:
             content = [dict(type="output_text", text=event.text)]
-        if event.include_audio:
+        if event.has_audio:
             content.append(dict(type="output_audio", transcript=event.text))
         else:
             pass
@@ -168,44 +169,44 @@ def project_output(
             ),
         )
     elif isinstance(event, (TextDelta, TextFinished, AudioDelta, AudioFinished)):
-        audio = isinstance(event, (AudioDelta, AudioFinished))
-        done = isinstance(event, (TextFinished, AudioFinished))
-        if audio:
-            name = "output_audio"
-        elif output_modalities == ["audio"]:
-            name = "output_audio_transcript"
+        is_audio = isinstance(event, (AudioDelta, AudioFinished))
+        is_done = isinstance(event, (TextFinished, AudioFinished))
+        if is_audio:
+            content_name = "output_audio"
+        elif output_modalities == ("audio",):
+            content_name = "output_audio_transcript"
         else:
-            name = "output_text"
-        result: ServerEvent = dict(
-            type=f'response.{name}.{"done" if done else "delta"}',
+            content_name = "output_text"
+        server_event: ServerEvent = dict(
+            type=f'response.{content_name}.{"done" if is_done else "delta"}',
             response_id=event.response_id,
             item_id=event.item_id,
             output_index=0,
             content_index=0,
         )
         if isinstance(event, AudioDelta):
-            result["delta"] = base64.b64encode(event.pcm).decode("ascii")
-        elif isinstance(event, (TextDelta, TextFinished)):
-            if not done:
-                result["delta"] = event.text
-            elif name == "output_audio_transcript":
-                result["transcript"] = event.text
-            else:
-                result["text"] = event.text
+            server_event["delta"] = base64.b64encode(event.pcm).decode("ascii")
+        elif isinstance(event, TextDelta):
+            server_event["delta"] = event.text
+        elif isinstance(event, TextFinished) and (
+            content_name == "output_audio_transcript"
+        ):
+            server_event["transcript"] = event.text
+        elif isinstance(event, TextFinished):
+            server_event["text"] = event.text
         else:
             pass
-        return result
+        return server_event
     elif isinstance(event, TurnFailure):
         return dict(
             type="error",
-            error=dict(type=event.type, code=event.code, message=event.message),
+            error=dict(type=event.error_type, code=event.code, message=event.message),
         )
     else:
         raise TypeError(f"Unsupported typed output: {type(event)}")
 
 
 def project_control(event: ControlEvent) -> ServerEvent:
-
     if isinstance(event, UnitCompleted):
         return dict(type="sglang.unit.done", unit_id=event.unit_id)
     elif isinstance(event, Created):
@@ -238,9 +239,9 @@ def project_control(event: ControlEvent) -> ServerEvent:
     elif isinstance(event, Failure):
         return dict(
             type="error",
-            sglang=dict(fatal=event.fatal),
+            sglang=dict(fatal=event.is_fatal),
             error=dict(
-                type="server_error" if event.fatal else "invalid_request_error",
+                type="server_error" if event.is_fatal else "invalid_request_error",
                 code=event.code,
                 message=event.message,
                 event_id=event.client_event_id,
@@ -256,7 +257,7 @@ def project_control(event: ControlEvent) -> ServerEvent:
     elif isinstance(event, Accepted):
         return dict(
             type="sglang.input_audio.accepted",
-            seq=event.seq,
+            seq=event.sequence,
             accepted_end_ms=event.accepted_end_ms,
             client_event_id=event.client_event_id,
         )
@@ -273,7 +274,7 @@ def project_control(event: ControlEvent) -> ServerEvent:
             tail_policy=event.tail_policy,
             client_event_id=event.client_event_id,
         )
-    else:
+    elif isinstance(event, Drained):
         return dict(
             type="sglang.input_audio.drained",
             accepted_end_ms=event.accepted_end_ms,
@@ -282,3 +283,5 @@ def project_control(event: ControlEvent) -> ServerEvent:
             padding_ms=event.padding_ms,
             client_event_id=event.client_event_id,
         )
+    else:
+        raise TypeError(f"Unsupported control event: {type(event)}")

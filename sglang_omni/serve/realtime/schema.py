@@ -10,6 +10,7 @@ from typing_extensions import TypedDict
 JsonValue = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject = dict[str, JsonValue]
 SessionType = Literal["realtime", "transcription"]
+SessionState = Literal["CREATED", "OPEN", "CLOSING", "CLOSED"]
 MAX_EVENT_ID_LENGTH = 256
 Interaction = Literal["native"]
 TailPolicy = Literal["flush", "pad", "reject"]

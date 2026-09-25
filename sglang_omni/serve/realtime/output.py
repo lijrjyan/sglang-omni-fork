@@ -43,7 +43,7 @@ class AudioFinished(ResponseEvent):
 class ResponseFinished(ResponseEvent):
     item_id: str
     text: str
-    include_audio: bool
+    has_audio: bool
     status: ResponseStatus
     reason: str
     usage: dict[str, int | float | None] | None = None
@@ -51,7 +51,7 @@ class ResponseFinished(ResponseEvent):
 
 @dataclass(frozen=True)
 class TurnFailure:
-    type: str
+    error_type: str
     code: str
     message: str
 

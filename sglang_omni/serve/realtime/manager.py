@@ -16,6 +16,8 @@ from sglang_omni.serve.realtime.transcription_session import (
 )
 from sglang_omni.serve.realtime.types import AdapterFactory, Capabilities, RuntimeLimits
 
+logger = logging.getLogger(__name__)
+
 RealtimeConnection = (
     RealtimeSession | SharedRealtimeSession | RealtimeTranscriptionSession
 )
@@ -23,7 +25,6 @@ RealtimeConnection = (
 
 @dataclass(frozen=True)
 class RealtimeDeployment:
-
     capabilities: Capabilities
     adapter_factory: AdapterFactory
     limits: RuntimeLimits = field(default_factory=RuntimeLimits)
@@ -34,9 +35,6 @@ class RealtimeDeployment:
             raise ValueError("max_connections must be a positive integer")
         else:
             pass
-
-
-logger = logging.getLogger(__name__)
 
 
 class RealtimeSessionManager:
@@ -61,8 +59,8 @@ class RealtimeSessionManager:
     def open(
         self, websocket: WebSocket, *, intent: str = "conversation"
     ) -> RealtimeConnection:
-        intent = intent.strip().casefold()
-        if intent == "transcription":
+        normalized_intent = intent.strip().casefold()
+        if normalized_intent == "transcription":
             if self.transcription_config is None:
                 raise ValueError(
                     "This pipeline does not support realtime transcription."
@@ -76,7 +74,7 @@ class RealtimeSessionManager:
                 transcription_config=self.transcription_config,
                 strategy=self.transcription_config.strategy_cls(),
             )
-        elif intent != "conversation":
+        elif normalized_intent != "conversation":
             raise ValueError(
                 "Realtime intent must be 'conversation' or 'transcription'."
             )
@@ -97,6 +95,9 @@ class RealtimeSessionManager:
             )
             session = SharedRealtimeSession(websocket, runtime)
         self.sessions[session.session_id] = session
+        logger.info(
+            f"Realtime session opened: {session.session_id} intent={normalized_intent}"
+        )
         return session
 
     async def close(self, session_id: str) -> None:

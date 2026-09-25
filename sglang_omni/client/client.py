@@ -77,7 +77,7 @@ class Client:
         return self.coordinator.session_outputs(session_identity)
 
     async def close_session(self, session_identity: SessionIdentity) -> None:
-        return await self.coordinator.close_session(session_identity)
+        await self.coordinator.close_session(session_identity)
 
     # ------------------------------------------------------------------
     # Low-level generate (backward compatible)

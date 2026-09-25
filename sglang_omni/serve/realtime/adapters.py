@@ -23,6 +23,7 @@ from sglang_omni.serve.realtime.types import (
     OutputSink,
     RuntimeLimits,
     Unit,
+    samples_to_ms,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ class CoordinatorAdapter(InteractionAdapter):
         stages: list[str],
         request_builder: RequestBuilder,
         output_converter: OutputConverter,
-        input_rate: int | None = None,
+        input_sample_rate_hz: int | None = None,
         atomic_consumption: bool = False,
         limits: SessionLimits | None = None,
     ) -> None:
@@ -58,32 +59,36 @@ class CoordinatorAdapter(InteractionAdapter):
         self.stages = stages
         self.request_builder = request_builder
         self.output_converter = output_converter
-        self.input_rate = input_rate
+        self.input_sample_rate_hz = input_sample_rate_hz
         self.limits = limits or SessionLimits()
-        self.local_cleanup_timeout = self.limits.operation_timeout_s
+        self.cleanup_timeout_s = self.limits.operation_timeout_s
         self.session_identity: SessionIdentity | None = None
-        self.output_reader: asyncio.Task[None] | None = None
+        self.output_reader_task: asyncio.Task[None] | None = None
         self.active_unit: Unit | None = None
         self.unit_completion: asyncio.Future[int] | None = None
-        self.output_events: list[OutputEvent] = []
-        self.output_bytes = 0
+        self.unit_output_events: list[OutputEvent] = []
+        self.unit_output_bytes = 0
         self.output_sink: OutputSink | None = None
         self.reader_error: Exception | None = None
         self.is_closing = False
 
     def set_limits(self, limits: RuntimeLimits) -> None:
-        self.local_cleanup_timeout = limits.cleanup_timeout_s
+        self.cleanup_timeout_s = limits.cleanup_timeout_s
 
     async def open(
         self, session_id: str, config: SessionConfiguration, emit: OutputSink
     ) -> None:
-        input_rate = config["audio"]["input"]["format"]["rate"]
-        if self.input_rate is not None and self.input_rate != input_rate:
+        negotiated_sample_rate_hz = config["audio"]["input"]["format"]["rate"]
+        if (
+            self.input_sample_rate_hz is not None
+            and self.input_sample_rate_hz != negotiated_sample_rate_hz
+        ):
             raise ValueError(
-                f"adapter input_rate {self.input_rate} differs from negotiated rate {input_rate}"
+                f"adapter input sample rate {self.input_sample_rate_hz} differs from "
+                f"negotiated rate {negotiated_sample_rate_hz}"
             )
         else:
-            self.input_rate = input_rate
+            self.input_sample_rate_hz = negotiated_sample_rate_hz
         self.output_sink = emit
         self.session_identity = await self.client.open_session(
             self.request_builder(config),
@@ -91,21 +96,25 @@ class CoordinatorAdapter(InteractionAdapter):
             limits=self.limits,
             session_id=session_id,
         )
-        self.output_reader = asyncio.create_task(self.read())
+        self.output_reader_task = asyncio.create_task(self.read_session_outputs())
 
-    async def read(self) -> None:
+    def reset_unit_outputs(self) -> None:
+        self.unit_output_events.clear()
+        self.unit_output_bytes = 0
+
+    async def read_session_outputs(self) -> None:
         assert self.session_identity is not None and self.output_sink is not None
         try:
             async for output in self.client.session_outputs(self.session_identity):
-                if self.active_unit is None or output.input_seq != self.active_unit.seq:
+                if (
+                    self.active_unit is None
+                    or output.input_seq != self.active_unit.index
+                ):
                     continue
-                else:
-                    pass
-                if output.kind == "input_done":
-                    for event in self.output_events:
+                elif output.kind == "input_done":
+                    for event in self.unit_output_events:
                         await self.output_sink(event, self.active_unit)
-                    self.output_events.clear()
-                    self.output_bytes = 0
+                    self.reset_unit_outputs()
                     if (
                         self.unit_completion is not None
                         and not self.unit_completion.done()
@@ -115,16 +124,18 @@ class CoordinatorAdapter(InteractionAdapter):
                         pass
                 else:
                     for event in self.output_converter(output):
-                        size = len(repr(event).encode())
+                        event_size_bytes = len(repr(event).encode())
                         if (
-                            len(self.output_events) >= self.limits.max_output_chunks
-                            or self.output_bytes + size > self.limits.max_output_bytes
+                            len(self.unit_output_events)
+                            >= self.limits.max_output_chunks
+                            or self.unit_output_bytes + event_size_bytes
+                            > self.limits.max_output_bytes
                         ):
                             raise RuntimeError("native unit output budget exhausted")
                         else:
                             pass
-                        self.output_events.append(event)
-                        self.output_bytes += size
+                        self.unit_output_events.append(event)
+                        self.unit_output_bytes += event_size_bytes
             if not self.is_closing:
                 raise RuntimeError("session output stream closed")
             else:
@@ -140,30 +151,31 @@ class CoordinatorAdapter(InteractionAdapter):
                 )
 
     async def process(self, unit: Unit) -> int:
-        assert self.session_identity is not None and self.input_rate is not None
+        assert (
+            self.session_identity is not None and self.input_sample_rate_hz is not None
+        )
         if self.reader_error is not None:
             raise self.reader_error
         else:
             pass
         self.active_unit = unit
         self.unit_completion = asyncio.get_running_loop().create_future()
-        chunk = TimedChunk(
+        timed_chunk = TimedChunk(
             "audio",
-            unit.start_sample * 1000 / self.input_rate,
-            unit.real_samples * 1000 / self.input_rate,
-            unit.seq,
+            samples_to_ms(unit.start_sample, self.input_sample_rate_hz),
+            samples_to_ms(unit.real_samples, self.input_sample_rate_hz),
+            unit.index,
             unit.pcm,
             format="pcm16",
             eos=unit.eos,
         )
         try:
-            await self.client.append_session(self.session_identity, chunk)
+            await self.client.append_session(self.session_identity, timed_chunk)
             return await self.unit_completion
         finally:
             self.active_unit = None
             self.unit_completion = None
-            self.output_events.clear()
-            self.output_bytes = 0
+            self.reset_unit_outputs()
 
     async def close(self) -> None:
         self.is_closing = True
@@ -173,4 +185,4 @@ class CoordinatorAdapter(InteractionAdapter):
             else:
                 pass
         finally:
-            await cancel_local_tasks([self.output_reader], self.local_cleanup_timeout)
+            await cancel_local_tasks([self.output_reader_task], self.cleanup_timeout_s)

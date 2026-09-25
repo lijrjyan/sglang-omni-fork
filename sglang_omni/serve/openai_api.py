@@ -1335,6 +1335,12 @@ def build_generate_response(
     return GenerateResponse(text=result.text, audio=audio, meta_info=meta_info)
 
 
+def realtime_unavailable_response(message: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"code": "unavailable", "message": message}}, status_code=503
+    )
+
+
 def register_realtime(app: FastAPI) -> None:
     """Mount the OpenAI-compatible WebSocket Realtime endpoint."""
     from sglang_omni.serve.realtime import RealtimeSessionManager
@@ -1370,19 +1376,11 @@ def register_realtime(app: FastAPI) -> None:
         @app.get("/v1/realtime/capabilities", response_model=None)
         async def realtime_capabilities() -> CapabilityResponse | JSONResponse:
             if not client.health().get("running", False):
-                return JSONResponse(
-                    {
-                        "error": {
-                            "code": "unavailable",
-                            "message": "instance is not ready",
-                        }
-                    },
-                    status_code=503,
-                )
+                return realtime_unavailable_response("instance is not ready")
             else:
                 return {
                     "model": model_name,
-                    **deployment.capabilities.describe(),
+                    **deployment.capabilities.to_granted_capabilities(),
                     "limits": asdict(deployment.limits),
                 }
 
@@ -1395,15 +1393,7 @@ def register_realtime(app: FastAPI) -> None:
             deployment.max_connections
         ):
             await websocket.send_denial_response(
-                JSONResponse(
-                    {
-                        "error": {
-                            "code": "unavailable",
-                            "message": "connection capacity exhausted",
-                        }
-                    },
-                    status_code=503,
-                )
+                realtime_unavailable_response("connection capacity exhausted")
             )
         elif deployment is not None and (
             "session_id" in websocket.query_params
